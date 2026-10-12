@@ -5,7 +5,42 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：D1 骨架已写，待首次构建）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：D2 第一部分完成）
+
+### 仓库基线变更（非我操作，已核对）
+- 分支由 `master` 改为 **`main`**，历史被压缩为 `c6c711d chore: bootstrap LinkForge with docs, build skeleton and local environment`。
+- 新增 `f792999 test(arch): add package-info to keep module boundary rules effective`：为 4 个模块包各加 `package-info.java`，使 ArchUnit 规则**真正生效**（空包会让规则变成空跑）。**这个补充是必要的**——正是我此前报告中提到的「空跑通过」隐患。
+- 核对结果：8 份 docs 全部保留，DR-001 ~ DR-021 完整。
+
+### D2 第一部分已完成：Flyway V1 建表脚本 ✅
+| 项 | 结果 |
+|---|---|
+| 脚本位置 | `linkforge-app/src/main/resources/db/migration/V1__init_schema.sql` |
+| 表 | `short_link`、`link_stats_daily`、`id_segment`（3 张） |
+| 实跑验证 | ✅ 容器内 MySQL 8.4.11 执行通过，无语法错误 |
+| 引擎/字符集 | ✅ 3 张表均 `InnoDB` + `utf8mb4_0900_ai_ci` |
+| 索引 | ✅ `uk_short_code(short_code)`、`idx_status_code(status, short_code)`、`uk_link_date_referer(link_id, stat_date, referer_domain)`、`idx_stat_date(stat_date)` |
+| `ON UPDATE` 行为 | ✅ 实测：插入后 `updated_at = created_at`；更新 `status` 后 `updated_at` 前进 1 秒，`created_at` 不变 |
+| 禁用语句自查 | ✅ 可执行语句中 `DROP TABLE` / `TRUNCATE` / 无 WHERE 的 `DELETE` 均为 **0 处** |
+| 环境清理 | ✅ 验证用的 3 张空表已删除，`linkforge` 库当前表数 **0**，等 Flyway 首次迁移做真验证 |
+
+### 本轮加列（按用户确认，理由：现在改 V1 零成本，落库后再加要 ALTER）
+- `short_link`：新增 **`is_custom TINYINT NOT NULL DEFAULT 0`**（对外体现为 API 的 `custom` 字段）、**`updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`**（回答「何时被删」）。
+- `link_stats_daily`：新增 **`created_at`**、**`updated_at`**（排查落库延迟）。
+- 文档未删改：`docs/DATABASE.md` §4.1/§4.3 本来就写了这些字段，**建表与文档现已一致**。
+
+### ⚠️ 本轮修正：Mapper 位置（DR-021）
+- **决策**：MyBatis Mapper 接口与 XML 放 **`linkforge-core`**，不在 `redirect`。
+- **原因**：admin 删除短链要访问 `LinkRepository`；Mapper 放 `redirect` 会导致 admin 要么依赖 `redirect`（违反 DR-018），要么看不到实现（**Spring 装配失败**）。
+- **同时作废 DR-018 的「core 必须保持薄」**：改为「core 是共享抽象 + 共享持久化访问层」，仍禁止把**只属于某模块**的实现（缓存/限流/布隆/Web）放进 core。
+- `core` 将新增依赖：`mybatis-spring-boot-starter`、`mysql-connector-j`。
+- ⏳ 待办：`linkforge-core` 的 `package-info.java` 中「保持薄，不装具体实现」的 javadoc 需在数据访问层落地时同步修正。
+
+### 下一步（D2 剩余部分）
+1. `linkforge-app/application.yml`：数据源走环境变量（开发 `localhost:3307` / 容器 `mysql:3306`）、Flyway 开关 + `classpath:db/migration`。
+2. 补依赖：`flyway-mysql`（Flyway 10+ 拆出的 MySQL 支持模块，**缺它会报 Unsupported Database: MySQL**）、`mysql-connector-j`、`mybatis-spring-boot-starter`。
+3. 数据访问层骨架：`core` 的 `Link` 实体 + `LinkRepository` 接口 + Mapper 接口 + `LinkMapper.xml`。
+4. 交用户跑 `.\mvnw.cmd clean install` 并启动应用，验收 `flyway_schema_history` 与 `SHOW TABLES`。
 
 ### D1 已完成：5 模块 Maven 骨架
 - ✅ 模块划分由 4 改为 **5 模块**（新增 `linkforge-core`），决策记录 **DR-018**。

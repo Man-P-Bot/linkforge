@@ -369,3 +369,32 @@
   - 在第 4 周之前，「不需要分表」的结论**建立在未验证的假设上**，这一点必须在文档中保持显式（不得当成已验证事实）；
   - `docs/ROADMAP.md` 第 1 周 D7 的任务项需删除该度量动作，改挂到第 4 周。
 
+---
+
+## DR-021 数据访问实现（MyBatis Mapper）放 `linkforge-core`，并修正 DR-018 的「core 必须保持薄」
+
+- **决策**：
+  1. **数据访问框架选 MyBatis**（`mybatis-spring-boot-starter` 3.x），**不用 Spring Data JDBC**。理由：国内面试默认预期、SQL 完全可控、便于讲索引与执行计划。
+  2. **MyBatis Mapper 接口与 XML 放在 `linkforge-core`**，不在 `redirect`：
+
+     | 内容 | 位置 |
+     |---|---|
+     | `Link` 实体 | `linkforge-core/src/main/java/com/linkforge/core/domain/` |
+     | `LinkRepository` 接口 | `linkforge-core/src/main/java/com/linkforge/core/repository/` |
+     | MyBatis Mapper 接口 | `linkforge-core/src/main/java/com/linkforge/core/infrastructure/persistence/` |
+     | `LinkMapper.xml` | `linkforge-core/src/main/resources/mapper/` |
+
+  3. **`core` 新增依赖**：`mybatis-spring-boot-starter`、`mysql-connector-j`。`core` **不再**是「只依赖 `spring-boot-starter`」。
+  4. **⚠️ 修正 DR-018 中「`core` 必须保持薄」的表述**：该条**作废**，改为：**`core` 是共享抽象 + 共享持久化访问层**，允许装载被多模块共用的实体、仓储接口与数据访问实现；**仍然禁止**在 `core` 放缓存/限流/布隆/Web 等**只属于某一模块**的实现。
+
+- **变更原因（原「Mapper 放 redirect」的方案走不通）**：
+  「admin 删除短链」要改 `status`、查统计要查主表，**admin 必须能访问 `LinkRepository`**。原方案下两条路都堵死：
+  1. Mapper 实现在 `redirect` ⇒ `admin` 要看到实现就必须依赖 `redirect` ⇒ **违反 DR-018**；
+  2. `admin` 不依赖 `redirect` ⇒ **看不到 Mapper 实现** ⇒ Spring 装配时找不到 `LinkRepository` 的 Bean ⇒ **启动失败**。
+  ⇒ 数据访问实现必须落在**双方都能依赖、又不互相依赖**的模块，即 `core`。
+- **为什么让 `core` 变重而不要各写一份 Mapper**：`admin` 与 `redirect` 各写一份针对同一张表的 Mapper 是**重复代码**，而且两份 SQL 会随时间漂移（一处改了索引/字段，另一处不动），比 `core` 变重更糟。**DR-018 的核心是 `redirect` 与 `admin` 互不依赖，不是 `core` 必须薄**——隔离的目标是防止跳转链路与后台互相拖累，而不是限制共享层的体积。
+- **代价与影响**：
+  - `core` 及其下游（`redirect`、`stats`、`admin`）都会传递性获得 MyBatis。三者本都需要数据访问，**属预期**。
+  - ⚠️ **新的边界必须守住**：`core` 现在可以装持久化，但**不得**装 Web、缓存、限流、布隆的具体实现——那些是 `redirect` 的职责，放进来会让 `admin` 被迫拖入跳转链路的全部重量，等于绕过 DR-018 的双向隔离。
+  - `linkforge-core` 的 `package-info.java` 中「保持薄，不装具体实现」的描述**需要同步修正**（在数据访问层落地那一步一并改，避免留下过期 javadoc）。
+
