@@ -114,7 +114,26 @@ class Base62Test {
         void paddedIsAlwaysSeven(long sequence, String expected) {
             String padded = Base62.encodePadded(sequence);
             assertThat(padded).isEqualTo(expected).hasSize(IdSpace.SHORT_CODE_LENGTH);
-            assertThat(padded.replaceFirst("^0+", "")).isEqualTo(Base62.encode(sequence));
+        }
+
+        @ParameterizedTest(name = "序号 {0} 的补零结果是 encode 的左补零形式")
+        @MethodSource("paddedCases")
+        @DisplayName("补零不改变数值：去掉前导零后等于 encode(sequence)")
+        void paddingDoesNotChangeValue(long sequence) {
+            String padded = Base62.encodePadded(sequence);
+            String canonical = Base62.encode(sequence);
+
+            // ⚠️ 不能用 replaceFirst("^0+", "") 去前导零后直接比 canonical：
+            // 当 sequence = 0 时 padded 是 "0000000"，正则会把**整个字符串**吃掉得到 ""，
+            // 而 canonical 是 "0"，两者不等。这是本用例初版的真实 bug。
+            // 正确做法是左侧补齐到相同长度，这样 0 的情况自然成立（"0" 补成 "0000000"）。
+            StringBuilder expected = new StringBuilder(canonical);
+            while (expected.length() < IdSpace.SHORT_CODE_LENGTH) {
+                expected.insert(0, '0');
+            }
+
+            assertThat(padded).isEqualTo(expected.toString());
+            assertThat(Base62.decode(padded)).isEqualTo(sequence);
         }
 
         @Test

@@ -36,11 +36,27 @@ public class SegmentShortCodeGenerator implements ShortCodeGenerator {
     private final IdSegmentAllocator allocator;
     private final int step;
 
-    /** 下一个待发出的号。从 {@code SEGMENT_FIRST_SEQUENCE - 1} 起，使首个 {@code getAndIncrement} 返回区间起点。 */
-    private final AtomicLong current = new AtomicLong(IdSpace.SEGMENT_FIRST_SEQUENCE - 1);
+    /**
+     * 下一个待发出的号。用 {@code 0} 表示「尚未取段」（正常号都 ≥ SEGMENT_FIRST_SEQUENCE）。
+     *
+     * <p>⚠️ 初值不能是 {@code SEGMENT_FIRST_SEQUENCE - 1}，也不能用 {@code Long.MIN_VALUE} 之类的哨兵
+     * 配合「加一后比较」：{@code Long.MIN_VALUE + 1} 仍小于 limit 初值，哨兵会漏进业务逻辑
+     * （实测报错「序号不能为负: -9223372036854775808」）。这里用 {@code 0} 与一个显式的
+     * {@link #initialized} 标记配合，语义直白且没有溢出风险。
+     */
+    private final AtomicLong current = new AtomicLong();
 
-    /** 当前段上界（不含）：{@code current < limit} 时无需取段。初值使首次调用必然取段。 */
-    private final AtomicLong limit = new AtomicLong(IdSpace.SEGMENT_FIRST_SEQUENCE - 1);
+    /**
+     * 当前段上界（含）：{@code claimed <= limit} 时才允许发出。
+     *
+     * <p>这个「闸门」是并发正确性的关键：段用尽瞬间可能有多个线程同时越过旧上界，
+     * 它们各自 {@code getAndIncrement} 得到的值都不可信。只有重新读取到
+     * {@code <= limit} 的值才允许发出，否则必须重新取号。
+     */
+    private final AtomicLong limit = new AtomicLong();
+
+    /** 是否已取过第一段。取段是惰性的，构造时不取——否则「只为装配而创建的实例」也会消耗一段号。 */
+    private volatile boolean initialized;
 
     public SegmentShortCodeGenerator(IdSegmentAllocator allocator) {
         this(allocator, IdSpace.DEFAULT_SEGMENT_STEP);
@@ -86,52 +102,64 @@ public class SegmentShortCodeGenerator implements ShortCodeGenerator {
     }
 
     private long nextSequence() {
-        long next = current.getAndIncrement();
-        if (next < limit.get()) {
-            return next;
+        // 首次使用：双检锁保证只取一段，且只由第一个线程推进 current。
+        if (!initialized) {
+            synchronized (this) {
+                if (!initialized) {
+                    refillSegment();
+                }
+            }
         }
-        return refillAndTake(next);
+
+        while (true) {
+            long observed = current.get();
+            if (observed <= limit.get()) {
+                // ✅ 用 CAS 抢占，而不是 getAndIncrement。
+                // 取段时 current 会被**重置**回新段段首；若在快路径上用 getAndIncrement，
+                // 一个读到旧值、却在重置之后才写回的线程会把计数器的写覆盖掉
+                // （经典的「先读后写被中间的重置冲掉」），导致区间内的号被跳过。
+                // 实测：用 getAndIncrement 时连发 8000 个号只得到 7947 个唯一值。
+                // CAS 在值已被他人改动时会失败，从而不会用陈旧值覆盖 current。
+                if (current.compareAndSet(observed, observed + 1)) {
+                    return observed;
+                }
+                continue;
+            }
+
+            // 段用尽：在锁内重新判定并取下一段（不允许两个线程同时推进 current）
+            synchronized (this) {
+                if (current.get() <= limit.get()) {
+                    continue; // 双检：期间已有其它线程取到新段
+                }
+                refillSegment();
+            }
+        }
     }
 
     /**
-     * 段用尽：取下一段，并从新段中取一个号。
+     * 取下一段：段区间为 {@code (newLimit - step, newLimit]}，并把 {@code current} 定位到段首。
      *
-     * <p>{@code next} 是本次已经消耗掉的自增值。段用尽时它必然 {@code >=} 旧 limit，
-     * 因此要丢掉它、从新段重新取，否则会发出一个未被号段记录覆盖的号
-     * （不影响唯一性，但会让号段语义混乱、难以排查）。
-     *
-     * <p>段用尽是低频事件（每 {@code step} 次调用一次），因此这里用 {@code synchronized}
-     * 简化并发处理是合理的；热点路径（{@code getAndIncrement} 分支）无锁。
+     * <p>必须持锁调用，保证同一时刻只有一个线程推进 {@code current}。
      */
-    private long refillAndTake(long next) {
-        synchronized (this) {
-            // 双重检查：可能已有其它线程取到了新段并推进了 limit
-            if (next < limit.get()) {
-                return next;
-            }
-            long newLimit = allocator.advanceAndGetMaxId();
-            if (newLimit > IdSpace.MAX_SEQUENCE) {
-                // 号空间用尽：绝不回绕（回绕会让短码重复）。按 DR-022 记 ERROR 并让调用失败。
-                log.error("号段区间已用尽：max_id={} 超过 7 位 Base62 上界 {}，必须缩短码长度或扩容",
-                        newLimit, IdSpace.MAX_SEQUENCE);
-                throw new ShortCodeGenerationException(
-                        "号段区间用尽（max_id=" + newLimit + " > " + IdSpace.MAX_SEQUENCE + "）");
-            }
-
-            limit.set(newLimit);
-            // 至少推进到「刚浪费的那个号之后」，避免把旧段里已消耗的号再发一次
-            current.set(Math.max(newLimit - step, next + 1));
-
-            long taken = current.getAndIncrement();
-            if (taken >= limit.get()) {
-                throw new ShortCodeGenerationException(
-                        "号段分配异常：taken=" + taken + " limit=" + limit.get() + "（请检查 step 与并发）");
-            }
-            return taken;
+    private void refillSegment() {
+        long newLimit = allocator.advanceAndGetMaxId();
+        if (newLimit > IdSpace.MAX_SEQUENCE) {
+            // 号空间用尽：绝不回绕（回绕会让短码重复）。按 DR-022 记 ERROR 并让调用失败。
+            log.error("号段区间已用尽：max_id={} 超过 7 位 Base62 上界 {}，必须缩短码长度或扩容",
+                    newLimit, IdSpace.MAX_SEQUENCE);
+            throw new ShortCodeGenerationException(
+                    "号段区间用尽（max_id=" + newLimit + " > " + IdSpace.MAX_SEQUENCE + "）");
         }
+
+        long segmentStart = newLimit - step + 1;
+        current.set(segmentStart);
+        limit.set(newLimit);
+        initialized = true;
+
+        log.debug("取到新号段：bizTag={} 段区间 [{}, {}]", IdSegmentAllocator.BIZ_TAG, segmentStart, newLimit);
     }
 
-    /** 仅供测试断言：当前段上界（不含）。 */
+    /** 仅供测试断言：当前段上界（含）。 */
     long currentLimit() {
         return limit.get();
     }
