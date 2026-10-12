@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  IdSegmentMapper —— id_segment 表的 SQL（docs/DATABASE.md §4.4）
+
+  短码发号的降级路径：Redis 不可用时从这里取号段。
+  区间边界由 com.linkforge.core.domain.IdSpace 统一定义：
+    Redis      [100000, 1_000_000_000)
+    数据库号段  [1_000_000_000, 62^7)
+  因此本表初始 max_id = 999999999（发出的是 max_id + 1 = 1000000000），不是 100000。
+-->
+<mapper namespace="com.linkforge.core.infrastructure.persistence.IdSegmentMapper">
+
+    <!--
+      幂等插入：已存在则不覆盖。
+      ⚠️ 不能用 INSERT ... ON DUPLICATE KEY UPDATE max_id = VALUES(max_id)：
+      那会在每次启动时把 max_id 重置回初始值，导致已发出的号被重新发出（重复短码）。
+    -->
+    <insert id="insertIgnore">
+        INSERT IGNORE INTO id_segment (biz_tag, max_id, step)
+        VALUES (#{bizTag}, #{maxId}, #{step})
+    </insert>
+
+    <!--
+      原子取段：一条 UPDATE 内完成 max_id 自增，靠 InnoDB 行锁保证并发安全。
+      @return 推进后的 max_id（本次号段右端点）；受影响行数为 0 表示 biz_tag 行不存在。
+    -->
+    <update id="advanceAndGetMaxId">
+        UPDATE id_segment
+        SET max_id = max_id + step
+        WHERE biz_tag = #{bizTag}
+    </update>
+
+    <select id="selectMaxId" resultType="java.lang.Long">
+        SELECT max_id
+        FROM id_segment
+        WHERE biz_tag = #{bizTag}
+    </select>
+
+</mapper>

@@ -5,7 +5,54 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：D2 第一部分完成）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：D2 完成，D3 发号器已写待构建）
+
+### D3 已完成（待用户构建验证）
+| 内容 | 位置 |
+|---|---|
+| `IdSpace`（号空间不变量：区间、长度、上界） | `core/domain/` |
+| `Base62`（**自写编码表 `0-9A-Za-z`**，编解码 + 定长补零） | `core/domain/` |
+| `ShortCodeGenerator` 接口 + `ShortCodeGenerationException` | `core/repository/` |
+| `IdSegmentMapper` + `IdSegmentMapper.xml` | `core/infrastructure/persistence/` + `core/resources/mapper/` |
+| `RedisShortCodeGenerator`（主路径，`INCR` + `SETNX` 初始化） | `redirect/infrastructure/id/` |
+| `IdSegmentAllocator`（**独立 Bean 保证 `@Transactional` 生效**） | `redirect/infrastructure/id/` |
+| `SegmentShortCodeGenerator`（降级路径，`getAndIncrement` 先取后判） | `redirect/infrastructure/id/` |
+| `FallbackShortCodeGenerator`（单向降级 + 降级计数） | `redirect/infrastructure/id/` |
+| `ShortCodeGeneratorConfig`（装配 + 启动自检） | `redirect/infrastructure/id/` |
+| `V2__init_id_segment.sql`（`max_id = 999999999`） | `linkforge-app/src/main/resources/db/migration/` |
+| `Base62Test`（30+ 用例：编码表、进位、补零、双射、边界） | `core/src/test/` |
+| `ShortCodeGeneratorTest`（号段推进、并发、单向降级、区间不重叠） | `redirect/src/test/` |
+
+### D3 关键决策（DR-022）
+- **号空间区间划分**（取代原「共用同一号空间」）：
+  - Redis `[100_000, 1_000_000_000)` → 9.999 亿个号，按日 10 万条可用约 **74 年**
+  - 数据库号段 `[1_000_000_000, 62^7)` → 约 3.5 万亿
+  - 不重叠 ⇒ 降级期间**不需要任何跨存储同步**即可保证唯一性
+- **⚠️ 修掉了一个会重复发号的边界错**：原方案 `id_segment.max_id = 100000`，而号段发出的是 `max_id + 1`，会让号段从 **100001** 起，与 Redis 首个发出的号重合。现为 **999999999**，由 `IdSpace` 常量推导并由单测断言锁住。
+- **单向降级**：Redis 抖动后该实例永久走号段，不回切（回切必须先同步号段进度，否则必然重号）。重启实例即恢复。
+- **⚠️ 已知风险**：Redis 被清空（RDB 回退/`FLUSHDB`）会让 `INCR` 从头开始 → 短码可能重复。v1 三层处置：`SETNX` 启动初始化 + **`uk_short_code` 唯一索引兜底** + 新增指标 **`shortlink_id_conflict_total`** 让运维立即发现。**v2 根治：`short_link` 加 `seq` 列，启动取 `MAX(seq)` 作为 Redis 初值**。
+- **两条被写进代码注释的评审重点**：`@Transactional` 不能写在自调用方法上（故抽 `IdSegmentAllocator`）；自增必须「先取后判」（`getAndIncrement` 再比较），写成「先判后取」会让两个线程发出同一个号。
+- **Base62 编码表自写**：JDK 的 `toString(n, 62)` 用 `0-9a-zA-Z`（序号 10 → `"a"`），本项目用 `0-9A-Za-z`（序号 10 → `"A"`）。已用测试把两者差异显式钉住。
+- **删除了 `countActiveCreatedBefore`**（用户指出）：全仓零引用，是第 4 周「活跃短链比例」的预留，属提前引入。D3 发号器不需要它。
+
+### 待验证（交用户执行）
+```powershell
+.\mvnw.cmd clean install     # 期望 6 模块 BUILD SUCCESS，Base62Test + ShortCodeGeneratorTest 全绿
+.\scripts\run-local.ps1      # 期望 Flyway 执行 V1 + V2，应用启动成功
+```
+启动后验收：
+```powershell
+docker compose exec mysql mysql -uroot -p linkforge -e "SELECT version, description, success FROM flyway_schema_history;"
+docker compose exec mysql mysql -uroot -p linkforge -e "SELECT * FROM id_segment;"
+# 期望：max_id = 999999999，step = 1000
+```
+
+### ⚠️ 你的 `.env` 需要补一行（否则 `run-local.ps1` 会按设计拦住）
+```
+SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+```
+
+### D2 已完成：Flyway V1 + 数据访问层骨架
 
 ### 仓库基线变更（非我操作，已核对）
 - 分支由 `master` 改为 **`main`**，历史被压缩为 `c6c711d chore: bootstrap LinkForge with docs, build skeleton and local environment`。

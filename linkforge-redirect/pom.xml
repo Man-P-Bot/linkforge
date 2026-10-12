@@ -33,5 +33,21 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
+
+    <!--
+      Redis 客户端：发号器主路径用 Redis INCR（docs/DECISIONS.md DR-011），
+      第 2 周起的跳转缓存也用它。只有 redirect 用 Redis，因此依赖加在本模块而不是 core。
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
+    <!-- 单测：发号器边界用例 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>
