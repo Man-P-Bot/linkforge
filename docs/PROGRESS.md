@@ -37,10 +37,31 @@
 - ⏳ 待办：`linkforge-core` 的 `package-info.java` 中「保持薄，不装具体实现」的 javadoc 需在数据访问层落地时同步修正。
 
 ### 下一步（D2 剩余部分）
-1. `linkforge-app/application.yml`：数据源走环境变量（开发 `localhost:3307` / 容器 `mysql:3306`）、Flyway 开关 + `classpath:db/migration`。
-2. 补依赖：`flyway-mysql`（Flyway 10+ 拆出的 MySQL 支持模块，**缺它会报 Unsupported Database: MySQL**）、`mysql-connector-j`、`mybatis-spring-boot-starter`。
-3. 数据访问层骨架：`core` 的 `Link` 实体 + `LinkRepository` 接口 + Mapper 接口 + `LinkMapper.xml`。
-4. 交用户跑 `.\mvnw.cmd clean install` 并启动应用，验收 `flyway_schema_history` 与 `SHOW TABLES`。
+1. ✅ `linkforge-app/application.yml`：数据源统一由 **`SPRING_DATASOURCE_URL`** 覆盖（**不分 profile**），Flyway 开关 + `classpath:db/migration`。
+2. ✅ 补依赖：`flyway-mysql`、`mysql-connector-j`、`mybatis-spring-boot-starter:3.0.5`。
+3. ✅ 数据访问层骨架：`core` 的 `Link` / `LinkStatus` / `LinkRepository` / `LinkMapper` / `LinkStatusTypeHandler` / `LinkMapper.xml`。
+4. ✅ 修正 `core` 的 `package-info.java` 过期 javadoc；`.env.example` 补 `SPRING_DATASOURCE_URL`。
+5. ⏸ **交用户跑 `.\mvnw.cmd clean install` 并启动应用**，验收 `flyway_schema_history` 与 `SHOW TABLES`。
+
+### 本步新增文件（D2 第 1~4 步）
+| 文件 | 说明 |
+|---|---|
+| `linkforge-app/src/main/resources/application.yml` | 数据源走 `SPRING_DATASOURCE_URL`；Flyway `classpath:db/migration`；MyBatis `classpath*:mapper/*.xml` |
+| `linkforge-core/src/main/java/com/linkforge/core/domain/Link.java` | 不可变实体，8 个字段与 `short_link` 一一对应，无 setter |
+| `linkforge-core/src/main/java/com/linkforge/core/domain/LinkStatus.java` | `ACTIVE(0)` / `DELETED(1)`；`fromCode` 遇未知值**抛异常不静默降级** |
+| `linkforge-core/src/main/java/com/linkforge/core/repository/LinkRepository.java` | 仓储接口，5 个方法 |
+| `linkforge-core/src/main/java/com/linkforge/core/infrastructure/persistence/LinkMapper.java` | MyBatis 接口，`@Mapper` 显式标注 |
+| `linkforge-core/src/main/java/com/linkforge/core/infrastructure/persistence/LinkStatusTypeHandler.java` | `LinkStatus` ↔ `TINYINT` 转换（内置 `EnumTypeHandler` 按 name 存字符串，与本表不匹配） |
+| `linkforge-core/src/main/resources/mapper/LinkMapper.xml` | 6 条语句，注释写明各自走哪个索引 |
+
+### 本步关键决策点
+- **数据源单一来源**：`application.yml` 只写 `${SPRING_DATASOURCE_URL}`，**不设默认值**、**不分 profile**。理由：12-Factor；缺失时启动即失败，避免静默连错库。
+- **Mapper 放 core**（DR-021）：admin 与 redirect 都要访问 `LinkRepository`，放任一侧都会破坏隔离或导致装配失败。
+- **`LinkStatusTypeHandler` 必须自写**：MyBatis 默认 `EnumTypeHandler` 按 `name()` 存字符串，而本表 `status` 是 `TINYINT`（DATABASE.md §4.1 刻意不用 ENUM 列），不写会在运行时报类型错误。
+- **`fromCode` 遇未知取值抛异常**：静默当成 `ACTIVE` 会让已删除的短链重新可跳转，属数据正确性问题，必须早失败。
+- **布隆重建 SQL 只取 `short_code` 一列**：走覆盖索引 `idx_status_code(status, short_code)`，`EXPLAIN` 的 `Extra` 应为 `Using index`，避免读取 2048 字节的 `target_url`。
+- **`updateStatusToDeleted` 带 `AND status = 0`**：让重复删除天然影响 0 行，作为「404 vs alreadyDeleted」的判定依据。
+- **`markDeleted` 只改库、不删缓存**：删缓存是 Cache Aside 第二步，必须在事务提交后由上层执行（ARCHITECTURE §10）。
 
 ### D1 已完成：5 模块 Maven 骨架
 - ✅ 模块划分由 4 改为 **5 模块**（新增 `linkforge-core`），决策记录 **DR-018**。

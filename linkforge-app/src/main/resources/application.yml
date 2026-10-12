@@ -1,0 +1,44 @@
+# =============================================================================
+# LinkForge 应用配置
+#
+# 配置原则（12-Factor）：**所有与环境相关的值都从环境变量读取**，本文件不写死任何
+# 连接串、账号或密钥。变量清单见项目根目录的 .env.example。
+#
+# ⚠️ 数据源 URL 只有一个来源：环境变量 SPRING_DATASOURCE_URL（不分 profile）。
+#     开发（应用跑在宿主机）：jdbc:mysql://localhost:3307/linkforge?...
+#     容器（应用跑在 compose 内）：jdbc:mysql://mysql:3306/linkforge?...
+#     宿主机端口是 3307 而非 3306，因为本机 3306 被 MySQL80 占用（docs/DECISIONS.md DR-017）。
+# =============================================================================
+
+spring:
+  application:
+    name: linkforge
+
+  datasource:
+    # 无默认值：缺失时启动即失败，避免静默连到错误的库
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${MYSQL_USER}
+    password: ${MYSQL_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 迁移脚本在 linkforge-app/src/main/resources/db/migration
+    baseline-on-migrate: false
+
+mybatis:
+  # Mapper XML 在 linkforge-core/src/main/resources/mapper（DR-021）
+  mapper-locations: classpath*:mapper/*.xml
+  configuration:
+    # 数据库列是 snake_case，实体字段是 camelCase
+    map-underscore-to-camel-case: true
+    # 查询结果缺列时不要静默填 null，早暴露映射错误
+    call-setters-on-nulls: true
+  type-aliases-package: com.linkforge.core.domain
+
+logging:
+  level:
+    com.linkforge: INFO
+    # 第 1 周调 SQL 时临时改成 DEBUG 可打印语句与参数
+    com.linkforge.core.infrastructure.persistence: INFO

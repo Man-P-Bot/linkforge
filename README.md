@@ -40,6 +40,11 @@ docker compose exec redis redis-cli ping        # 期望 PONG
 > ⚠️ **MySQL 请连 3307**：宿主机 3306 已被本机 MySQL80 服务占用，容器端口通过 `.env` 的
 > `MYSQL_PORT=3307` 避让；容器内部端口始终是 3306，compose 网络内应用直连 `mysql:3306`。
 > 详见 [docs/DECISIONS.md](docs/DECISIONS.md) DR-017。
+>
+> 应用的数据源**只认一个环境变量** `SPRING_DATASOURCE_URL`（不分 profile）：开发时 `.env` 里指向
+> `jdbc:mysql://localhost:3307/linkforge?...`，应用进容器后由 compose 覆盖为
+> `jdbc:mysql://mysql:3306/linkforge?...`。另外 `MYSQL_USER` / `MYSQL_PASSWORD` 也由环境变量注入，
+> 代码里不硬编码任何账号密码。
 
 ---
 

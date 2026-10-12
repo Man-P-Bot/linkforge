@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  LinkMapper —— short_link 表的 SQL（docs/DATABASE.md §4.1、§5）
+
+  为什么把 SQL 集中在 XML 而不是注解里：
+    本项目要讲清楚的核心之一是「哪条 SQL 走哪个索引」，XML 便于把索引意图直接写在语句旁边。
+    索引对应关系：
+      uk_short_code(short_code)              -> selectByShortCode
+      PRIMARY(id)                            -> selectById / updateStatusToDeleted
+      idx_status_code(status, short_code)    -> selectActiveShortCodesAfter（覆盖索引，不回表）
+-->
+<mapper namespace="com.linkforge.core.infrastructure.persistence.LinkMapper">
+
+    <!--
+      status 在库里是 TINYINT（0/1），Java 侧是 LinkStatus 枚举。
+      必须显式指定 typeHandler：MyBatis 内置的 EnumTypeHandler 按 name() 存字符串，与本表不匹配。
+    -->
+    <resultMap id="linkResultMap" type="com.linkforge.core.domain.Link">
+        <constructor>
+            <idArg column="id" javaType="java.lang.Long"/>
+            <arg column="short_code" javaType="java.lang.String"/>
+            <arg column="target_url" javaType="java.lang.String"/>
+            <arg column="status" javaType="com.linkforge.core.domain.LinkStatus"
+                 typeHandler="com.linkforge.core.infrastructure.persistence.LinkStatusTypeHandler"/>
+            <arg column="is_custom" javaType="boolean"/>
+            <arg column="created_at" javaType="java.time.LocalDateTime"/>
+            <arg column="updated_at" javaType="java.time.LocalDateTime"/>
+            <arg column="expire_at" javaType="java.time.LocalDateTime"/>
+        </constructor>
+    </resultMap>
+
+    <!--
+      不复用 SELECT * ：显式列出列名，避免以后新增列时（例如给 short_link 加字段）
+      构造函数映射悄悄错位。顺序必须与 Link 的构造函数参数顺序严格一致。
+    -->
+    <sql id="linkColumns">
+        id, short_code, target_url, status, is_custom, created_at, updated_at, expire_at
+    </sql>
+
+    <!-- 走唯一索引 uk_short_code。刻意不加 status 过滤：已删除/已过期也要返回，由上层判定 404 还是 410 -->
+    <select id="selectByShortCode" resultMap="linkResultMap">
+        SELECT
+        <include refid="linkColumns"/>
+        FROM short_link
+        WHERE short_code = #{shortCode}
+    </select>
+
+    <!-- 走主键 -->
+    <select id="selectById" resultMap="linkResultMap">
+        SELECT
+        <include refid="linkColumns"/>
+        FROM short_link
+        WHERE id = #{id}
+    </select>
+
+    <!--
+      插入：created_at / updated_at 交给数据库默认值（DEFAULT CURRENT_TIMESTAMP），
+      不在此处赋值——由数据库生成才能避免多实例时钟差异（docs/DATABASE.md §4.1）。
+      useGeneratedKeys 回填自增主键，供后续写统计表时作为 link_id 使用。
+      唯一索引 uk_short_code 是兜底：发号器保证正常路径不碰撞，真冲突时应作为异常暴露。
+    -->
+    <insert id="insertLink" parameterType="com.linkforge.core.domain.Link"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO short_link (short_code, target_url, status, is_custom, expire_at)
+        VALUES (#{shortCode},
+                #{targetUrl},
+                #{status, typeHandler=com.linkforge.core.infrastructure.persistence.LinkStatusTypeHandler},
+                #{custom},
+                #{expireAt})
+    </insert>
+
+    <!--
+      逻辑删除：只改 status，不做物理删除（docs/DATABASE.md §7.2）。
+      updated_at 由列定义上的 ON UPDATE CURRENT_TIMESTAMP 自动推进，无需显式赋值。
+      返回影响行数：0 表示记录不存在或已是删除态，上层据此区分 404 与 alreadyDeleted（docs/API.md §7.1）。
+      额外加 status = 0 条件，让「重复删除」天然影响 0 行而不是把已是 1 的值再写一遍。
+    -->
+    <update id="updateStatusToDeleted">
+        UPDATE short_link
+        SET status = 1
+        WHERE id = #{id}
+          AND status = 0
+    </update>
+
+    <!--
+      布隆过滤器重建（docs/ARCHITECTURE.md §7.1）：只取 short_code 一列，
+      走覆盖索引 idx_status_code(status, short_code) —— EXPLAIN 的 Extra 应为 Using index，
+      即不回表读取 2048 字节的 target_url。1000 万行的重建不能退化成全表扫。
+      用 id > afterId 游标推进，避免 LIMIT 大 OFFSET 的深分页代价。
+    -->
+    <select id="selectActiveShortCodesAfter" resultType="java.lang.String">
+        SELECT short_code
+        FROM short_link
+        WHERE status = 0
+          AND id > #{afterId}
+        ORDER BY id
+        LIMIT #{limit}
+    </select>
+
+    <!-- 后台/运维统计。同样只扫 status = 0 的索引前缀 -->
+    <select id="countActiveCreatedBefore" resultType="long">
+        SELECT COUNT(*)
+        FROM short_link
+        WHERE status = 0
+          AND created_at &lt; #{before}
+    </select>
+
+</mapper>

@@ -50,10 +50,18 @@
 
     <!-- 依赖版本（Boot 未管理的才需要显式声明） -->
     <archunit.version>1.3.0</archunit.version>
+    <mybatis-spring-boot.version>3.0.5</mybatis-spring-boot.version>
   </properties>
 
   <dependencyManagement>
     <dependencies>
+      <!-- MyBatis：Spring Boot 不管理其版本，必须显式声明（docs/DECISIONS.md DR-021） -->
+      <dependency>
+        <groupId>org.mybatis.spring.boot</groupId>
+        <artifactId>mybatis-spring-boot-starter</artifactId>
+        <version>${mybatis-spring-boot.version}</version>
+      </dependency>
+
       <!-- 本项目模块 -->
       <dependency>
         <groupId>com.linkforge</groupId>
