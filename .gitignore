@@ -1,0 +1,60 @@
+# --- Build output ---
+target/
+build/
+out/
+bin/
+*.class
+*.jar
+*.war
+
+# --- Maven wrapper local repository (in-workspace, never committed) ---
+.mvn-repo/
+
+# --- Local scratch / backups (never commit) ---
+.backup-*/
+*.bak
+*.orig
+*.rej
+
+# --- IDE / editor ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+
+# --- Logs / runtime ---
+*.log
+logs/
+*.pid
+*.hprof
+
+# --- Local config & secrets (never commit) ---
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+application-local.properties
+*-local.yml
+*-local.properties
+
+# --- Local infra data (bind mounts for MySQL/Redis) ---
+data/
+docker/mysql/data/
+docker/redis/data/
+*.rdb
+*.aof
+
+# --- Benchmark / report artifacts ---
+benchmark/results/
+benchmark/*.tmp
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.linkforge</groupId>
+    <artifactId>linkforge-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>linkforge-admin</artifactId>
+  <name>LinkForge :: Admin</name>
+  <description>后台：短链删除、统计查询、Token 鉴权（挂 /admin/api/v1）</description>
+
+  <!--
+    依赖规则（docs/DECISIONS.md DR-018）：
+      admin → core + stats   ✅
+      admin → redirect       ❌ 禁止（隔离必须双向：admin 不得把跳转链路的缓存/限流实现拉进后台）
+  -->
+  <dependencies>
+    <dependency>
+      <groupId>com.linkforge</groupId>
+      <artifactId>linkforge-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.linkforge</groupId>
+      <artifactId>linkforge-stats</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+  </dependencies>
+</project>

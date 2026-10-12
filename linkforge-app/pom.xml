@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.linkforge</groupId>
+    <artifactId>linkforge-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>linkforge-app</artifactId>
+  <name>LinkForge :: App</name>
+  <description>启动与装配：可执行 jar、配置、健康检查</description>
+
+  <!--
+    依赖规则（docs/DECISIONS.md DR-018）：
+      app → core + redirect + stats + admin   ✅（app 是唯一允许依赖全部模块的模块）
+  -->
+  <dependencies>
+    <dependency>
+      <groupId>com.linkforge</groupId>
+      <artifactId>linkforge-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.linkforge</groupId>
+      <artifactId>linkforge-redirect</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.linkforge</groupId>
+      <artifactId>linkforge-stats</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.linkforge</groupId>
+      <artifactId>linkforge-admin</artifactId>
+    </dependency>
+
+    <!-- 架构约束测试所需（版本由父 POM 的 dependencyManagement 管理） -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.tngtech.archunit</groupId>
+      <artifactId>archunit-junit5</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- 只有本模块产出可执行 jar，其它模块是普通 jar -->
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <mainClass>com.linkforge.app.LinkForgeApplication</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

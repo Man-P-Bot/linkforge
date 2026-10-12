@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LinkForge 构建用的 Maven settings（随仓库分发，由 .mvn/maven.config 通过 -s 指定）。
+
+  为什么需要它：
+    实测本机无法访问 Maven Central（repo.maven.apache.org）与 dlcdn.apache.org，
+    但阿里云仓库可达（见 docs/DECISIONS.md DR-016）。把镜像声明放在仓库内，
+    而不是依赖开发者各自的 ~/.m2/settings.xml，才能满足 PRD A-1
+    「干净环境按 README 即可构建」，不让构建成功依赖某个人的本机配置。
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              https://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <mirrors>
+    <mirror>
+      <id>aliyun-public</id>
+      <name>Aliyun Public Repository</name>
+      <url>https://maven.aliyun.com/repository/public</url>
+      <mirrorOf>central</mirrorOf>
+    </mirror>
+  </mirrors>
+
+</settings>
