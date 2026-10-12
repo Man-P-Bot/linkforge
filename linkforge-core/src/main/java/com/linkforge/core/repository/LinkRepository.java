@@ -1,7 +1,6 @@
 package com.linkforge.core.repository;
 
 import com.linkforge.core.domain.Link;
-import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -72,9 +71,4 @@ public interface LinkRepository {
      * @param afterId 游标：只取 {@code id > afterId} 的记录，配合主键有序推进
      */
     List<String> scanActiveShortCodes(long afterId, int limit);
-
-    /**
-     * 统计某个时间点之前创建的有效短链数量（后台/运维用）。
-     */
-    long countActiveCreatedBefore(LocalDateTime before);
 }

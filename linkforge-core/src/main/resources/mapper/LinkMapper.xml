@@ -100,12 +100,4 @@
         LIMIT #{limit}
     </select>
 
-    <!-- 后台/运维统计。同样只扫 status = 0 的索引前缀 -->
-    <select id="countActiveCreatedBefore" resultType="long">
-        SELECT COUNT(*)
-        FROM short_link
-        WHERE status = 0
-          AND created_at &lt; #{before}
-    </select>
-
 </mapper>

@@ -35,7 +35,16 @@ docker compose exec redis redis-cli ping        # 期望 PONG
 
 # 4. 验证构建工具
 .\mvnw.cmd -v              # 期望 Apache Maven 3.9.12（JDK 17）
+
+# 5. 启动应用（从 .env 注入环境变量后运行）
+.\scripts\run-local.ps1
 ```
+
+> **启动为什么用脚本而不是直接 `mvnw spring-boot:run`**：Spring Boot 不会自动读取 `.env` 文件，
+> 而数据源只认环境变量 `SPRING_DATASOURCE_URL`（无默认值，缺失即启动失败）。
+> `scripts\run-local.ps1` 会解析 `.env`（跳过注释与空行、去掉值两侧引号、正确处理 URL 里的 `&`），
+> 注入**当前进程**环境变量后启动应用，脚本内不含任何密码。
+> 另可用 `-PrintEnv` 只打印解析结果（密码脱敏）用于排查。
 
 > ⚠️ **MySQL 请连 3307**：宿主机 3306 已被本机 MySQL80 服务占用，容器端口通过 `.env` 的
 > `MYSQL_PORT=3307` 避让；容器内部端口始终是 3306，compose 网络内应用直连 `mysql:3306`。

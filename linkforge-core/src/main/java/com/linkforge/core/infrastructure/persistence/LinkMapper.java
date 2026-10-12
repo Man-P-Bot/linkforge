@@ -1,7 +1,6 @@
 package com.linkforge.core.infrastructure.persistence;
 
 import com.linkforge.core.domain.Link;
-import java.time.LocalDateTime;
 import java.util.List;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
@@ -48,7 +47,4 @@ public interface LinkMapper {
      * 用 {@code id > afterId ORDER BY id LIMIT} 推进，避免大 OFFSET 的深分页代价。
      */
     List<String> selectActiveShortCodesAfter(@Param("afterId") long afterId, @Param("limit") int limit);
-
-    /** 统计指定时间点之前创建的有效短链数量。 */
-    long countActiveCreatedBefore(@Param("before") LocalDateTime before);
 }
