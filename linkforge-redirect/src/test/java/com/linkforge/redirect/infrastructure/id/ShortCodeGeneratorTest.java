@@ -291,11 +291,14 @@ class ShortCodeGeneratorTest {
     class RangeBoundaries {
 
         @Test
-        @DisplayName("Redis 区间长度 = 9.999 亿，按日 10 万条可用约 74 年")
+        @DisplayName("Redis 区间长度 = 9.999 亿；按日创建 10 万条可用约 27.4 年（同一口径，见 Base62Test）")
         void redisRangeCapacity() {
             long capacity = IdSpace.REDIS_RANGE_END - IdSpace.FIRST_SEQUENCE;
             assertThat(capacity).isEqualTo(999_900_000L);
-            assertThat(capacity / 100_000L / 365L).isGreaterThanOrEqualTo(27L); // 保守下界
+
+            long days = capacity / 100_000L;
+            assertThat(days).isEqualTo(9_999L);
+            assertThat(days / 365.0).isBetween(27.0, 28.0);
         }
 
         @Test

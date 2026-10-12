@@ -45,21 +45,70 @@ public class RedisShortCodeGenerator implements ShortCodeGenerator {
     }
 
     /**
-     * 确保序号 key 存在且位于本区间的起点。
+     * 确保序号 key 存在，且其值**不低于本区间起点**。
      *
-     * <p>用 {@code SETNX}（{@code setIfAbsent}）而不是无条件 {@code SET}：
-     * 后者会在应用重启时把计数器重置回起点，**直接造成大规模重复发号**。
-     * 已存在时什么都不做，让计数器继续向前。
+     * <p>三种情况分别处理（缺一不可）：
+     * <ol>
+     *   <li><b>key 不存在</b> → {@code SETNX} 初始化为 {@link IdSpace#REDIS_KEY_INIT_VALUE}。
+     *       用 {@code SETNX} 而非无条件 {@code SET}：后者会在每次重启时把计数器重置回起点，
+     *       导致大规模重复发号。</li>
+     *   <li><b>key 存在但值小于起点</b>（Redis 被清空过、RDB 恢复到旧快照、有人手工 {@code SET}
+     *       了异常值）→ <b>修正到起点并记 WARN</b>。这是原实现的漏洞：
+     *       {@code SETNX} 不覆盖已存在的 key，于是 {@code INCR} 会从一个很小的值继续，
+     *       发出的短码可能与历史短码重复。</li>
+     *   <li><b>key 存在且值 ≥ 起点</b> → 正常，不动。**绝不能重置**，否则会重发已发出的号。</li>
+     * </ol>
+     *
+     * <p>注意第 2 种修正只是**缩小**了回退窗口，并不能证明那些号没被发出去过——
+     * 真正的唯一性兜底始终是 {@code short_link.uk_short_code} 唯一索引 +
+     * {@code shortlink_id_conflict_total} 冲突指标（docs/DECISIONS.md DR-022）。
      */
     public void ensureInitialized() {
-        Boolean created = redisTemplate.opsForValue()
-                .setIfAbsent(SEQUENCE_KEY, Long.toString(IdSpace.REDIS_KEY_INIT_VALUE));
-        if (Boolean.TRUE.equals(created)) {
-            log.info("Redis 发号 key {} 不存在，已初始化为 {}（首个发出的号为 {}）",
-                    SEQUENCE_KEY, IdSpace.REDIS_KEY_INIT_VALUE, IdSpace.FIRST_SEQUENCE);
-        } else {
-            String current = redisTemplate.opsForValue().get(SEQUENCE_KEY);
-            log.info("Redis 发号 key {} 已存在，当前值 {}，继续递增", SEQUENCE_KEY, current);
+        String current = redisTemplate.opsForValue().get(SEQUENCE_KEY);
+
+        if (current == null) {
+            Boolean created = redisTemplate.opsForValue()
+                    .setIfAbsent(SEQUENCE_KEY, Long.toString(IdSpace.REDIS_KEY_INIT_VALUE));
+            if (Boolean.TRUE.equals(created)) {
+                log.info("Redis 发号 key {} 不存在，已初始化为 {}（首个发出的号为 {}）",
+                        SEQUENCE_KEY, IdSpace.REDIS_KEY_INIT_VALUE, IdSpace.FIRST_SEQUENCE);
+            } else {
+                // 极小概率：SETNX 期间被其它实例抢先创建。重新读一次即可，不影响正确性。
+                log.info("Redis 发号 key {} 已被其它实例初始化，当前值 {}",
+                        SEQUENCE_KEY, redisTemplate.opsForValue().get(SEQUENCE_KEY));
+            }
+            return;
+        }
+
+        Long value = parseSequence(current);
+        if (value == null) {
+            // 值不是数字（被误写成别的类型或脏数据）：直接修正，否则 INCR 会报错
+            log.warn("Redis 发号 key {} 的值不是整数（当前 \"{}\"），已修正为 {}",
+                    SEQUENCE_KEY, current, IdSpace.REDIS_KEY_INIT_VALUE);
+            redisTemplate.opsForValue().set(SEQUENCE_KEY, Long.toString(IdSpace.REDIS_KEY_INIT_VALUE));
+            return;
+        }
+
+        if (value < IdSpace.REDIS_KEY_INIT_VALUE) {
+            // ⚠️ 已知风险场景：Redis 数据被清空/回退后，计数器从小值重新开始，
+            // 会发出与历史短码重复的号。这里修正回起点并告警。
+            log.warn("Redis 发号 key {} 当前值 {} 小于区间起点 {}，疑似 Redis 数据被清空或回退，"
+                            + "已修正为 {}。注意：此修正无法证明这些号未被发出过，"
+                            + "请关注 shortlink_id_conflict_total 指标（见 DR-022）",
+                    SEQUENCE_KEY, value, IdSpace.REDIS_KEY_INIT_VALUE, IdSpace.REDIS_KEY_INIT_VALUE);
+            redisTemplate.opsForValue().set(SEQUENCE_KEY, Long.toString(IdSpace.REDIS_KEY_INIT_VALUE));
+            return;
+        }
+
+        log.info("Redis 发号 key {} 已存在，当前值 {}，继续递增", SEQUENCE_KEY, value);
+    }
+
+    /** 宽松解析：值不是合法 long 时返回 {@code null}，由调用方决定如何修正。 */
+    private Long parseSequence(String raw) {
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

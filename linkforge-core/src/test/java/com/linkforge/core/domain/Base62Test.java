@@ -3,11 +3,13 @@ package com.linkforge.core.domain;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.stream.Stream;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -62,10 +64,15 @@ class Base62Test {
         }
 
         @Test
-        @DisplayName("与 JDK Long.toString(n, 62) 的差异点被显式钉住：Base62.encode(10)==\"A\" 而 JDK 给 \"a\"")
-        void differsFromJdkRadixConversion() {
-            assertThat(Long.toString(10, 62)).isEqualTo("a");
-            assertThat(Base62.encode(10)).isEqualTo("A").isNotEqualTo(Long.toString(10, 62));
+        @DisplayName("JDK 根本不支持 base62：Long.toString(n, 62) 因基数超出 2~36 而降级为 10 进制")
+        void jdkHasNoBase62Support() {
+            // Character.MAX_RADIX == 36，所以 radix=62 会被 Long.toString 回退成 10 进制：
+            //   Long.toString(10, 62) == "10"（不是 "A"，也不是 "a"）
+            // 结论：**JDK 不能作为 base62 的对照实现**，本项目必须自己写编码表。
+            assertThat(Character.MAX_RADIX).isEqualTo(36);
+            assertThat(Long.toString(10, 62)).isEqualTo("10");
+            assertThat(Long.toString(10, 36)).isEqualTo("a"); // 36 进制才是合法的，且表为 0-9a-z
+            assertThat(Base62.encode(10)).isEqualTo("A");     // 本项目的表为 0-9A-Za-z
         }
     }
 
@@ -73,27 +80,36 @@ class Base62Test {
     @DisplayName("encodePadded：左补零到固定 7 位")
     class EncodePadded {
 
+        /**
+         * 用 {@code @MethodSource} 而不是 {@code @CsvSource}：
+         * {@code @CsvSource} 会对目标参数类型做隐式转换，像 {@code "0000000"} 这样的
+         * 全零/带前导零的期望值会被按数字解析成 {@code 0}，导致断言拿到错误期望值。
+         * 这里显式构造 {@code Arguments}，两个参数的类型都不再经过隐式转换。
+         */
+        static Stream<Arguments> paddedCases() {
+            return Stream.of(
+                    Arguments.of(0L, "0000000"),
+                    Arguments.of(1L, "0000001"),
+                    Arguments.of(9L, "0000009"),
+                    Arguments.of(10L, "000000A"),
+                    Arguments.of(35L, "000000Z"),
+                    Arguments.of(36L, "000000a"),
+                    Arguments.of(61L, "000000z"),
+                    Arguments.of(62L, "0000010"),
+                    Arguments.of(63L, "0000011"),
+                    Arguments.of(3843L, "00000zz"),
+                    Arguments.of(3844L, "0000100"),
+                    Arguments.of(99999L, "0000Q0t"),
+                    Arguments.of(100000L, "0000Q0u"),
+                    Arguments.of(100001L, "0000Q0v"),
+                    Arguments.of(1000000L, "0004C92"),
+                    Arguments.of(999999999L, "015ftgF"),
+                    Arguments.of(1000000000L, "015ftgG"),
+                    Arguments.of(IdSpace.MAX_SEQUENCE, "zzzzzzz"));
+        }
+
         @ParameterizedTest(name = "序号 {0} 补零后 -> \"{1}\"")
-        @CsvSource({
-                "0,        0000000",
-                "1,        0000001",
-                "9,        0000009",
-                "10,       000000A",
-                "35,       000000Z",
-                "36,       000000a",
-                "61,       000000z",
-                "62,       0000010",
-                "63,       0000011",
-                "3843,     00000zz",
-                "3844,     0000100",
-                "99999,    0000Q0t",
-                "100000,   0000Q0u",
-                "100001,   0000Q0v",
-                "1000000,  0004C92",
-                "999999999,015ftgF",
-                "1000000000,015ftgG",
-                "3521614606207,zzzzzzz",
-        })
+        @MethodSource("paddedCases")
         @DisplayName("补零后长度恒为 7，且右侧字符与最短编码一致")
         void paddedIsAlwaysSeven(long sequence, String expected) {
             String padded = Base62.encodePadded(sequence);
@@ -246,14 +262,35 @@ class Base62Test {
         }
 
         @Test
-        @DisplayName("两个区间的容量都远大于练习场景需求")
+        @DisplayName("Redis 区间容量 = 9.999 亿个号；按日创建 10 万条可用约 27.4 年")
         void capacityIsSufficient() {
+            long capacity = IdSpace.REDIS_RANGE_END - IdSpace.FIRST_SEQUENCE;
+
+            // 容量：1_000_000_000 − 100_000
+            assertThat(capacity).isEqualTo(999_900_000L);
+
+            // 年数推导（唯一一处口径，避免测试与文档各算各的）：
+            //   容量 / 日创建量 / 每年天数 = 999_900_000 / 100_000 / 365 = 27.39 年
+            // ⚠️ 曾误写为「约 74 年」——那是把容量当成 27 亿左右算出来的，
+            //    或把日创建量当成约 3.7 万条。74 年对应的日创建量是 37,020 条，
+            //    与「日创建 10 万条」的假设不符。以本断言为准。
+            long days = capacity / 100_000L;
+            assertThat(days).isEqualTo(9_999L);
+            assertThat(days / 365L).isEqualTo(27L);
+            assertThat(days / 365.0).isBetween(27.0, 28.0);
+
+            // 口径留痕：27 年对练习项目已远超需求，不构成缩短码长度的理由
+            assertThat(days / 365.0).isGreaterThan(25.0);
+        }
+
+        @Test
+        @DisplayName("数据库号段区间约 3.52 万亿，约是 Redis 区间的 3521 倍")
+        void segmentRangeIsMuchLarger() {
+            long segmentCapacity = IdSpace.MAX_SEQUENCE - IdSpace.SEGMENT_FIRST_SEQUENCE + 1;
             long redisCapacity = IdSpace.REDIS_RANGE_END - IdSpace.FIRST_SEQUENCE;
-            // 按日创建 10 万条估算，可用年数
-            long years = redisCapacity / 100_000L / 365L;
-            assertThat(redisCapacity).isEqualTo(999_900_000L);
-            assertThat(years).isGreaterThan(70L);
-            assertThat(IdSpace.MAX_SEQUENCE - IdSpace.SEGMENT_FIRST_SEQUENCE).isGreaterThan(redisCapacity);
+
+            assertThat(segmentCapacity).isEqualTo(3_520_614_606_208L);
+            assertThat(segmentCapacity / redisCapacity).isGreaterThan(3_000L);
         }
     }
 }
