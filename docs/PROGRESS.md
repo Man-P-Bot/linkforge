@@ -65,10 +65,16 @@ docker compose exec mysql mysql -uroot -p linkforge -e "SELECT * FROM id_segment
 # 期望：max_id = 999999999，step = 1000
 ```
 
-### ⚠️ 你的 `.env` 需要补一行（否则 `run-local.ps1` 会按设计拦住）
+### ⚠️ `.env` 必须包含 `SPRING_DATASOURCE_URL`（否则 `run-local.ps1` 会按设计拦住）
 ```
-SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=utf8
 ```
+- **`allowPublicKeyRetrieval=true` 是必需的**：MySQL 8.4 默认认证插件是 `caching_sha2_password`，
+  JDBC 驱动首次连接需要向服务器索取 RSA 公钥来加密密码，默认被禁止，否则启动报
+  `Public Key Retrieval is not allowed`（SQL State 08001）。
+- ⚠️ **仅本地开发使用**。生产环境应改为 `useSSL=true` 并配置证书，**不要开 `allowPublicKeyRetrieval`**
+  （允许明文索取公钥会削弱中间人防护）。
+- 参数顺序保持 `useSSL=false` 在前、`allowPublicKeyRetrieval=true` 紧随其后，与 `.env.example` 一致。
 
 ### D2 已完成：Flyway V1 + 数据访问层骨架
 
