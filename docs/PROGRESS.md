@@ -5,7 +5,29 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D3 已完成并启动验证通过**，下一步 D4）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D3 完成**，正在做 D4）
+
+### D4 契约层修订（写代码前完成，本轮）
+| 内容 | 结论 |
+|---|---|
+| **错误码格式** | 改为 **`LINKFORGE-<HTTP状态码>-<两位序号>`**（DR-024），覆盖 400~599；原连写形式有两个问题：无法一眼看出 HTTP 状态、`4xxx` 段容纳不下 5xx（格式与实例自相矛盾） |
+| **400 段拆分** | 由 3 个扩为 **5 个**（DR-024）：`400-01` 通用参数 / **`400-02` 协议不允许**（安全边界，独立成码以便从错误码分布识别开放重定向探测） / `400-03` 短码格式 / `400-04` 保留字 / `400-05` `expireAt` 非将来。**判据：修复动作不同就拆** |
+| **保留字大小写** | **不敏感**（DR-025）。短码值大小写敏感，但保留字保护的是**路径**：HTTP 路径大小写归一化行为在不同实现/容器/代理下不一致，只拦小写会让 `Api` 在某些部署下撞 `/api` |
+| **`SHORTLINK_BASE_URL`** | 空串/全空白/纯斜杠/无 scheme/非 http(s) → **启动失败**；末尾斜杠归一化，拼接不得出现 `//`（DR-026） |
+| **时间时区链** | 传输 `OffsetDateTime` → 持久层 `LocalDateTime(UTC)` → 响应按可配置时区渲染；**D5 过期判定必须统一到 `Instant` 比较**（DR-027） |
+| **201 不加 `Location`** | DR-028：指向 `shortUrl` 语义混乱、指向 `/api/v1/links/{code}` 该接口 D5 才有（指向空处）；body 已有 `shortUrl`。D5 完成后可再评估 |
+
+### D4 实现强制约束（DR-027 落地，写代码时不得偏离）
+- `Link` 实体的时间字段用 **`LocalDateTime`（UTC）**。
+- `LinkRepositoryImpl` 的**入参与返回值都是 `LocalDateTime`（UTC）**，**不做任何转换**。
+- 转换**只发生在 Service 边界**：请求进来 `TimeConverter.toUtc`，响应出去 `TimeConverter.toOffset`。
+- `LinkCreationService` **构造器注入 `TimeConverter`**。
+- **仓储只认 UTC 的 `LocalDateTime`，Service 负责边界转换** —— 这条是硬约束，不允许 Mapper / DTO 各写一遍换算。
+
+### D4 单测补充要求
+- **`TimeConverter` 边界**：`null` 输入 → 返回 `null` **不抛异常**；`+05:30` 偏移换算正确；**同一瞬间不同偏移**（`2026-01-15T10:30:00+08:00` 与 `2026-01-15T02:30:00Z`）转 UTC 后**相等**。
+- **自定义短码并发冲突**：用 mock 让第一次 insert 成功、第二次抛 `DuplicateKeyException`；
+  断言**一个返回 201、另一个返回 409**，**不是两个都 500**。
 
 ### D3 启动验证结果（✅ 全部通过，用户实测）
 | 验收项 | 结果 |
@@ -112,7 +134,6 @@ SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPu
 - 参数顺序保持 `useSSL=false` 在前、`allowPublicKeyRetrieval=true` 紧随其后，与 `.env.example` 一致。
 
 ### D2 已完成：Flyway V1 + 数据访问层骨架
-
 ### 仓库基线变更（非我操作，已核对）
 - 分支由 `master` 改为 **`main`**，历史被压缩为 `c6c711d chore: bootstrap LinkForge with docs, build skeleton and local environment`。
 - 新增 `f792999 test(arch): add package-info to keep module boundary rules effective`：为 4 个模块包各加 `package-info.java`，使 ArchUnit 规则**真正生效**（空包会让规则变成空跑）。**这个补充是必要的**——正是我此前报告中提到的「空跑通过」隐患。
