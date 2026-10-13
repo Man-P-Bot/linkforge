@@ -106,6 +106,40 @@ insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` In
 | **DR-030** | `server.port` 必须显式声明（`.env` 的 `APP_PORT` 曾是「配了但不生效」的死变量）；附 `SERVER__PORT` 等环境变量优先级陷阱 |
 | **DR-031** | 仓储层集成测试：复用真实 MySQL + 独立 schema + `@EnabledIfEnvironmentVariable` 跳过 |
 | **DR-032** | 数据库会话时区强制为 UTC，消除 8 小时双重换算 |
+| **DR-033** | 含特殊字符的配置文件改写**禁止用 sed**（D4 实测踩坑：`&` 被当通配符，静默损坏 `.env`） |
+| **DR-034** | 数据库权限边界：本地可自建测试库，生产应用账户只给 DML + Flyway 独立账户 |
+| **DR-035** | `.env` 中的 root 凭据是待收紧项（v1 保留不动，v2 或第 5 周处理） |
+
+### 数据库权限边界（详见 DR-034）
+
+| 环境 | 应用账户权限 | DDL 执行者 |
+|---|---|---|
+| **本地开发** | `linkforge`：业务库 DML + `CREATE`/`DROP` 全局 + `linkforge_test.*` 的 ALL | 应用同账户 |
+| **生产 / CI** | 应用账户**只有 DML**（`SELECT`/`INSERT`/`UPDATE`/`DELETE`） | **Flyway 独立账户** |
+
+**为什么生产不给应用 DDL**：
+① 最小必要原则——应用运行期不需要 DDL，给了就等于把「破坏表结构」的能力一并交给潜在的注入/RCE 攻击面；
+② DML 与 DDL 分离才能回答「谁改了表结构」；
+③ Flyway 独立账户让「谁能改 schema」变成可配置的部署参数，而非「谁跑应用手里有什么权限」。
+
+**本地补权限命令**（⚠️ **仅本地手工执行一次**，禁止写进 Flyway 脚本或生产文档）：
+```sql
+GRANT CREATE, DROP ON *.* TO 'linkforge'@'%';
+GRANT ALL PRIVILEGES ON linkforge_test.* TO 'linkforge'@'%';
+FLUSH PRIVILEGES;
+```
+
+⚠️ **不能进迁移脚本的四个理由**：
+① `GRANT` 是管理语句，Flyway 是 schema 版本化机制，职责不同；
+② 迁移会在评审者干净环境执行，等于把本地便利强加给所有人；
+③ 需要 `GRANT OPTION`/管理员权限，迁移账户往往没有，写进去会直接失败；
+④ 权限是**环境配置**不是 **schema 结构**，schema 会变，权限不该跟着版本走。
+
+**本轮实际执行与决策意图的偏差（留档）**：先用 `linkforge` 试 `CREATE DATABASE` 失败
+（`ERROR 1044 Access denied`），随后改用 `.env` 里的 root 凭据建库并 GRANT。
+这偏离了「本地用 `linkforge` 自建」的意图；保留偏差的原因是
+`.env` 里放着 root 口令本身就是待收紧点（DR-035 已记入清单），
+若日后收紧，应改用上面的 `GRANT CREATE, DROP` 让 `linkforge` 自建库。
 
 ---
 
