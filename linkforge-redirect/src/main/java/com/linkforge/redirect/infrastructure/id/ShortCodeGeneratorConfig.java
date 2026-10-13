@@ -30,6 +30,21 @@ public class ShortCodeGeneratorConfig {
     @Value("${linkforge.id.segment-step:" + IdSpace.DEFAULT_SEGMENT_STEP + "}")
     private int segmentStep;
 
+    /**
+     * 两个发号器的引用，供启动初始化使用。
+     *
+     * <p>⚠️ 为什么用字段而不是 {@code @EventListener} 的方法参数：
+     * **{@code @EventListener} 的方法参数是「要监听的事件类型」，只能有一个**。
+     * 写成 {@code initializeIdSpaces(SegmentShortCodeGenerator, RedisShortCodeGenerator)}
+     * 会被 Spring 当成「监听两种事件」并直接启动失败：
+     * <pre>
+     *   Maximum one parameter is allowed for event listener method
+     * </pre>
+     * 需要初始化的 Bean 必须通过注入获得，不能塞进监听方法的参数里。
+     */
+    private SegmentShortCodeGenerator segmentGeneratorBean;
+    private RedisShortCodeGenerator redisGeneratorBean;
+
     @Bean
     public IdSegmentAllocator idSegmentAllocator(IdSegmentMapper idSegmentMapper) {
         return new IdSegmentAllocator(idSegmentMapper, IdSegmentAllocator.BIZ_TAG, segmentStep);
@@ -37,12 +52,14 @@ public class ShortCodeGeneratorConfig {
 
     @Bean
     public SegmentShortCodeGenerator segmentShortCodeGenerator(IdSegmentAllocator allocator) {
-        return new SegmentShortCodeGenerator(allocator, segmentStep);
+        this.segmentGeneratorBean = new SegmentShortCodeGenerator(allocator, segmentStep);
+        return this.segmentGeneratorBean;
     }
 
     @Bean
     public RedisShortCodeGenerator redisShortCodeGenerator(StringRedisTemplate redisTemplate) {
-        return new RedisShortCodeGenerator(redisTemplate);
+        this.redisGeneratorBean = new RedisShortCodeGenerator(redisTemplate);
+        return this.redisGeneratorBean;
     }
 
     /**
@@ -59,17 +76,19 @@ public class ShortCodeGeneratorConfig {
     /**
      * 启动后初始化，让失败暴露在启动阶段而不是第一次创建短链时。
      *
+     * <p><b>本方法必须无参数</b>（见 {@link #segmentGeneratorBean} 的说明），
+     * 要操作的对象通过字段引用取得。
+     *
      * <p>顺序有意为之：**先初始化降级路径（号段）再初始化 Redis**。
-     * 因为号段是兜底，必须保证它在 Redis 出问题时一定可用；
+     * 号段是兜底，必须保证它在 Redis 出问题时一定可用；
      * 而 Redis 初始化失败**不应阻止应用启动**——跳转链路在没有 Redis 时本就要能降级运行
      * （docs/ARCHITECTURE.md §12 降级矩阵）。
      */
     @EventListener(ApplicationReadyEvent.class)
-    public void initializeIdSpaces(SegmentShortCodeGenerator segmentGenerator,
-                                   RedisShortCodeGenerator redisGenerator) {
-        segmentGenerator.ensureInitialized();
+    public void initializeIdSpaces() {
+        segmentGeneratorBean.ensureInitialized();
         try {
-            redisGenerator.ensureInitialized();
+            redisGeneratorBean.ensureInitialized();
         } catch (RuntimeException e) {
             // ⚠️ 只记警告，不阻止启动：Redis 不可用时发号会自动降级到号段（DR-022），
             // 跳转链路也本就要能在无 Redis 时降级运行（docs/ARCHITECTURE.md §12）。
