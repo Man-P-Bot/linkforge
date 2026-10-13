@@ -45,6 +45,11 @@ application-local.properties
 *-local.yml
 *-local.properties
 
+# --- Agent working directory (session memory / scratch, not project files) ---
+# .workbuddy/ 下是 IDE 智能体的会话记忆与临时文件，与项目源码无关，
+# 提交进去只会污染仓库历史（且记忆内容可能随会话变化，导致无意义的 diff）。
+.workbuddy/
+
 # --- Local infra data (bind mounts for MySQL/Redis) ---
 data/
 docker/mysql/data/
