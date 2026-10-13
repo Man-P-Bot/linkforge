@@ -14,8 +14,10 @@ import org.apache.ibatis.annotations.Param;
  * <p>SQL 写在 {@code core/src/main/resources/mapper/LinkMapper.xml}，不写注解 SQL：
  * 表结构、索引与执行计划是本项目要讲清楚的重点，XML 里更便于写清「这条 SQL 走哪个索引」。
  *
- * <p>{@code @Mapper} 由 MyBatis 的自动扫描发现（应用启动类在 {@code com.linkforge.app}，
- * 默认扫描范围覆盖不到 {@code com.linkforge.core}），因此这里显式标注注解。
+ * <p>{@code @Mapper} 是双保险：真正让本接口被注册的是启动类
+ * {@code com.linkforge.app.LinkForgeApplication} 上的
+ * {@code @MapperScan("com.linkforge.core.infrastructure.persistence")}。
+ * 为什么必须显式扫描，见该类 javadoc（组件扫描与 Mapper 扫描是两套机制）。
  */
 @Mapper
 public interface LinkMapper {

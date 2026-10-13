@@ -397,6 +397,18 @@
   - `core` 及其下游（`redirect`、`stats`、`admin`）都会传递性获得 MyBatis。三者本都需要数据访问，**属预期**。
   - ⚠️ **新的边界必须守住**：`core` 现在可以装持久化，但**不得**装 Web、缓存、限流、布隆的具体实现——那些是 `redirect` 的职责，放进来会让 `admin` 被迫拖入跳转链路的全部重量，等于绕过 DR-018 的双向隔离。
   - `linkforge-core` 的 `package-info.java` 中「保持薄，不装具体实现」的描述**需要同步修正**（在数据访问层落地那一步一并改，避免留下过期 javadoc）。
+  - ⚠️ **Mapper 放 core 的真实代价（启动时踩到，已修）**：**Spring 组件扫描与 MyBatis Mapper 扫描是两套独立机制**。
+    `@SpringBootApplication(scanBasePackages = "com.linkforge")` 只影响 Spring 的组件扫描；
+    MyBatis 自动扫描用的是 Spring Boot 的「自动配置包」，其值来自 **`@SpringBootApplication` 所在类的包**
+    （即 `com.linkforge.app`），与 `scanBasePackages` **无关**。因此 core 下的 Mapper 不会被自动发现，启动报：
+    ```
+    No MyBatis mapper was found in '[com.linkforge.app]' package.
+    ... required a bean of type 'com.linkforge.core.infrastructure.persistence.IdSegmentMapper' that could not be found.
+    ```
+    **修法**：在 `LinkForgeApplication` 上显式声明
+    `@MapperScan("com.linkforge.core.infrastructure.persistence")`，并保留 `scanBasePackages`。
+    两个 Mapper 上的 `@Mapper` 注解保留作为双保险。
+    **这条是「Mapper 与启动类不同模块」这一布局的必然代价**：包路径不同源，就必须显式指定扫描范围。
 
 ---
 
