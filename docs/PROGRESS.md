@@ -5,9 +5,49 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D3 完成**，正在做 D4）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D4 代码完成**，D4 待启动验证）
 
-### D4 契约层修订（写代码前完成，本轮）
+### D4 已完成（创建接口，构建全绿待启动验证）
+`.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，**224 个测试 0 失败**
+（Core 114 + Redirect 107 + App 3），耗时 30.9s。
+
+| 内容 | 位置 |
+|---|---|
+| `ErrorCode`（11 个码，含 code + `int httpStatus`，**零 web 依赖**） | `core/error/` |
+| `LinkForgeException` | `core/error/` |
+| `TimeConverter`（唯一时区转换入口，DR-027） | `core/time/` |
+| `ShortLinkBaseUrl`（校验 + 归一化 + 拼接，DR-026） | `core/domain/` |
+| `ReservedCodes`（保留字黑名单，**大小写不敏感**，DR-025） | `core/domain/` |
+| `LinkRepositoryImpl`（**补齐 D2 遗留缺口**） | `core/infrastructure/persistence/` |
+| `CreateLinkRequest` / `CreateLinkResponse` | `redirect/api/dto/` |
+| `LinkController`（`POST /api/v1/links`，**201，无 Location 头**，DR-028） | `redirect/api/` |
+| `LinkValidator`（协议白名单 / 保留字 / expireAt 将来性） | `redirect/application/` |
+| `LinkCreationService`（校验 → 发号 → 落库 → 冲突重试 → 拼 shortUrl） | `redirect/application/` |
+| `GlobalExceptionHandler`（错误码 → HTTP 映射） | `redirect/error/` |
+| `RedirectConfig`（配置值对象 + `Clock` + 时区，**启动期校验配置**） | `redirect/config/` |
+| 测试：`TimeConverterTest` / `ShortLinkBaseUrlTest`（core）+ `LinkValidatorTest` / `LinkCreationServiceTest` / `LinkControllerTest`（redirect） | 各模块 `src/test/` |
+
+### D4 实现中发现并修掉的 4 个真实问题（均由实际运行发现）
+1. **⚠️ 校验顺序导致错误码与事实不符**（真 bug）：黑名单含 `favicon.ico`（含点），**不匹配** `^[a-zA-Z0-9]{4,8}$`。
+   原实现在一个方法里「先格式后保留字」，于是 `API`、`STATIC` 这类**保留字**因长度不足先被判为格式错，
+   返回 `400-03` 而非 `400-04` —— **掩盖了「调用方在猜系统路径」这个更重要的信号**。
+   修法：拆成 `isReserved` / `validateCustomCodeFormat` / `validateCustomCodeNotReserved` 三个独立方法，
+   `validateCustomCode` 内部改为**保留字优先**。
+2. **`//example.com` 被归错错误码**：它让 `URI` 解析直接抛 `URISyntaxException`，落到 `400-01`（格式错误），
+   而事实是**协议缺失**（安全语义，应为 `400-02`）。
+   修法：**先做 `http://`/`https://` 前缀字符串判断，再做 URI 解析**——从安全视角「没有白名单 scheme」
+   与「scheme 不在白名单」是同一类问题。
+3. **我的测试数据错了 3 处**（不是实现问题）：`promo2026` 是 **9 位**，超出 4~8 位规则（应改 `promo26`）；
+   `expireAt = 10:30+08:00` 恰好**等于**固定时钟的 `02:30Z`，属「不是将来」的边界；
+   `@WebMvcTest` 找不到 `@SpringBootConfiguration`（启动类在 app、测试在 redirect，包路径不同源），
+   需显式 `@ContextConfiguration`。
+4. **缺两个依赖**：`spring-boot-starter-validation`（`@NotBlank/@Valid` 不再随 web 传递引入）、
+   `spring-boot-starter-actuator`（Micrometer `Counter`，第 5 周 Prometheus 本来也要用）。
+
+### D4 契约层修订（写代码前完成）
+见下方「D4 契约层修订」表（错误码格式 `LINKFORGE-<状态码>-<序号>`、400 段拆 5 个、保留字大小写不敏感、BASE_URL 校验、时区链、201 不加 Location）。
+
+### D4 实现强制约束（DR-027 落地，写代码时不得偏离）
 | 内容 | 结论 |
 |---|---|
 | **错误码格式** | 改为 **`LINKFORGE-<HTTP状态码>-<两位序号>`**（DR-024），覆盖 400~599；原连写形式有两个问题：无法一眼看出 HTTP 状态、`4xxx` 段容纳不下 5xx（格式与实例自相矛盾） |
