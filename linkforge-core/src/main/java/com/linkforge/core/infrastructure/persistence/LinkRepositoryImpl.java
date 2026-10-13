@@ -22,7 +22,12 @@ import org.springframework.stereotype.Repository;
  * <h2>⚠️ 时间字段一律是 UTC 的 {@code LocalDateTime}</h2>
  * 入参与返回值都**不做任何时区转换**（DR-027）：转换只发生在 Service 边界
  * （`TimeConverter.toUtc` / `toOffset`）。在 Mapper 或本类里再换算一次，
- * 会与连接串上的 `serverTimezone` 叠加成双重换算，时间整体偏移数小时。
+ * 会与驱动层对 {@code TIMESTAMP} 的解释叠加成双重换算，时间整体偏移数小时。
+ * <p>
+ * 该约定的前提是**数据库会话时区为 UTC**（DR-032 的
+ * {@code connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}）：
+ * 正是它让「数据库自己生成的 {@code created_at}」也落在 UTC 上，
+ * 本层的「不做转换」才是安全的。
  */
 @Repository
 public class LinkRepositoryImpl implements LinkRepository {

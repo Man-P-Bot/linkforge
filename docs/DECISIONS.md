@@ -423,8 +423,9 @@
   ```
 - **决策**：**本地开发**的连接串加 `allowPublicKeyRetrieval=true`，紧跟 `useSSL=false` 之后：
   ```
-  jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+  jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&characterEncoding=utf8
   ```
+  （时区参数部分见 **DR-032**；此处只关心 `allowPublicKeyRetrieval`，两者互不冲突。）
 - **代价（必须显式承认）**：允许驱动**明文索取服务器公钥**，会削弱中间人（MITM）防护——
   攻击者若能在链路上冒充服务器，就能提供自己的公钥。因此该参数**仅限本地开发**。
 - **生产要求**：改为 **`useSSL=true` 并配置证书**，**不要开 `allowPublicKeyRetrieval`**。
@@ -557,8 +558,12 @@
   ```
 - **理由**：
   1. **入/出用 `OffsetDateTime` 而不是 `Instant`**：请求带的是偏移（`+08:00`），用 `OffsetDateTime` 能保留调用方原始意图，也便于按服务端时区回渲染；`Instant` 会丢失偏移信息。
-  2. **持久层用 `LocalDateTime`（UTC）而不是直接存 `Instant`/带偏移对象**：MySQL 列是 `TIMESTAMP`，且连接串已固定 `serverTimezone=Asia/Shanghai`（DR-023）——
-     驱动会按该时区解释 `TIMESTAMP`。若应用层再存一个带偏移的对象，就会出现**偏移被应用一次、又被驱动解释一次**的双重换算，时间整体偏移数小时。存 **UTC 的 `LocalDateTime`** 是唯一不产生歧义的组合。
+  2. **持久层用 `LocalDateTime`（UTC）而不是直接存 `Instant`/带偏移对象**：MySQL 列是 `TIMESTAMP`，若应用层存一个带偏移的对象，就会出现**偏移被应用一次、又被驱动解释一次**的双重换算，时间整体偏移数小时。存 **UTC 的 `LocalDateTime`** 是唯一不产生歧义的组合。
+     > ⚠️ **本条的前提是「数据库会话时区为 UTC」**，由 **DR-032** 的连接串参数
+     > （`connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true`）保证。
+     > 若会话时区是本地（如 `+08:00`），数据库**自己生成**的 `created_at` / `updated_at`
+     > 就是本地墙上时钟，被应用层当 UTC 解释时会**再多加 8 小时**——
+     > 这个分支在 D4 启动验证时才实测暴露出来，是 DR-027 最初未覆盖到的盲区。
   3. **`expire_at` 为 NULL 表示永久有效**（DATABASE §4.1），因此持久层不能改用 `Instant`（它无 null 语义优势，反而多一层包装）。
 - **代价与影响**：
   - 需要一处**集中的时间转换工具/TypeHandler**，不允许各处在 DTO / Service / Mapper 里各写一遍 `toLocalDateTime()` 与 `atOffset()`；
@@ -616,4 +621,157 @@
      - ✅ **取段必须惰性**（首次使用时才取）：构造时取段会让「只为装配而创建的实例」也消耗一段号，并让单元测试互相污染（实测某用例期望 999999999 却得到 1000000999）。
 
 - **影响**：`docs/DATABASE.md` D-4（号段步长最终取值）仍待第 1 周 D7 压测确定；`short_link.seq` 列与 `MAX(seq)` 初始化列入 v2 待办。
+
+---
+
+## DR-029 MyBatis 的 `boolean` 别名解析到包装类，基本类型必须用 `_boolean`
+
+- **决策**：`LinkMapper.xml` 的 `<constructor>` 映射中，`is_custom` 的 `javaType` **必须写 `_boolean`**，不能写 `boolean`。
+- **选项**：
+  1. 改 XML 别名为 `_boolean`（**选中**）；
+  2. 把 `Link` 的字段、构造器、getter 全改成包装类 `Boolean`；
+  3. 改用 setter 映射绕开构造器（放弃不可变对象）。
+- **结论**：**选项 1。`Link` 完全不动**（字段 `boolean`、构造器 `boolean`、getter `boolean` 全部保持基本类型）。
+- **理由**：
+  - **别名解析差异**：MyBatis 的 `TypeAliasRegistry` 里 `boolean` 注册的目标是 **`Boolean.class`（包装类）**，而 `_boolean` 才注册到 **`boolean.class`（基本类型）**。`<constructor>` 映射按 `javaType` 反射查找构造器，两者签名不匹配就找不到。
+  - **DB 侧不可能为 null**：`is_custom` 列是 `TINYINT NOT NULL DEFAULT 0`，用基本类型语义正确，不需要包装类表达 `null` 的能力。
+  - **改动面最小**：改 `Link` 会连带引出字段、getter 返回类型、`null` 检查、Service 层 `isCustom()` 调用的一串改动与潜在 NPE；改 XML 别名是**单点局部修复**，不触及任何业务代码。
+
+- **⚠️ 完整故障链路（D4 启动验证实测，224 个单元测试全绿也测不到）**：
+
+  ```
+  1. LinkMapper.xml  <arg column="is_custom" javaType="boolean"/>
+  2. MyBatis 用 TypeAliasRegistry 解析别名 "boolean"  ->  Boolean.class   ← 包装类
+  3. <constructor> 按该类型反射查找 Link 的构造器
+       实际查找签名：Link(Long, String, String, LinkStatus, Boolean, LocalDateTime, LocalDateTime, LocalDateTime)
+       实际存在的签名：Link(Long, String, String, LinkStatus, boolean,  LocalDateTime, LocalDateTime, LocalDateTime)
+       （Byte/short/int/long 同理，都必须写成 _byte/_short/_int/_long）
+  4. 签名不匹配 ->
+       org.apache.ibatis.reflection.ReflectionException: Error instantiating class
+       com.linkforge.core.domain.Link with invalid types (Long,String,String,LinkStatus,Boolean,...)
+       Caused by: java.lang.NoSuchMethodException: com.linkforge.core.domain.Link.<init>(..., java.lang.Boolean, ...)
+  5. 表现为：POST /api/v1/links 返回 500 LINKFORGE-500-01
+  ```
+
+  **报错信息里的参数列表是「MyBatis 按别名解析后要找的签名」，不是 `Link` 实际声明的签名** —— 这是本次定位耗时最长的一个误解点。排查时必须先确认「XML 写的别名解析到什么类型」，而不是默认 XML 里写什么就是什么类型。
+
+- **为什么 224 个测试全部漏过**：
+  - `LinkCreationServiceTest` / `LinkControllerTest` 全部用 **mock 仓储**，不经过真实 `LinkMapper`；
+  - `LinkControllerTest` 是 **`@WebMvcTest` 切片**，只加载 Web 层，连 `MyBatis` 配置都不装配；
+  - 该缺陷**只存在于「真实 MyBatis + 真实反射构造器 + 真实 TIMESTAMP 列读回」这条路径上**，纯 mock 的单元测试在结构上永远测不到。
+  - ⇒ 由 **DR-030** 的集成测试补上这个覆盖缺口。
+
+- **影响**：`LinkMapper.xml` 的所有 `<constructor>` 基本类型参数一律用下划线别名；新增 Mapper 时同样适用。本条已写入 `LinkMapper.xml` 的行内注释，防止后续误改回 `boolean`。
+
+---
+
+## DR-030 `server.port` 必须显式声明（修复「配了但不生效」的死变量）
+
+- **决策**：`linkforge-app/src/main/resources/application.yml` 显式声明 `server.port: ${APP_PORT:8080}`。
+- **结论**：**必须显式配置，不依赖 Spring Boot 的默认 8080。**
+- **理由**：
+  - `.env` / `.env.example` 中 `APP_PORT=8080` 此前**从未被任何配置消费**——配置层没有 `server.port`，这是一个「配了但不生效」的死变量（断链）。
+  - D3 的启动验证恰好在默认端口上通过（因为默认值恰好也是 8080），**掩盖了这个断链**，一直没被发现。
+  - 显式声明后，配置值与实际生效值之间不再有「巧合」，改 `APP_PORT` 就能真实生效。
+
+- **⚠️ 附注：Spring Boot 配置源的优先级（`SERVER__PORT` 这类环境变量的陷阱）**：
+  - Spring Boot 的**环境变量优先级高于 `application.yml`**。IDE / 容器编排工具常注入形如 `SERVER__PORT` 的环境变量（双下划线作层级分隔符，等价 `server.port`），本项目在 IDE 内运行时就被注入过 `SERVER__PORT=59900`，导致 Tomcat 去抢占 59900 而启动失败。
+  - 这类变量**无法靠改 `application.yml` 覆盖**——即使写了 `server.port`，环境变量依然赢。正确做法是**在启动进程内显式覆盖该环境变量**（本项目验证时用 `$env:SERVER__PORT = '8080'`），或用命令行参数 `--server.port=8080`（命令行参数优先级最高）。
+  - **这是开发环境的工具特性，不是应用缺陷**：在用户自己的终端 / CI / 容器里不会有该变量注入。因此**不为它改动生产配置**，仅记录此现象供后续排查同类问题时参考。
+
+- **影响**：`APP_PORT` 从死变量变为真实生效的配置项，与其他环境变量（`MYSQL_PORT`、`REDIS_PORT`）口径一致。
+
+---
+
+## DR-031 仓储层集成测试：复用真实 MySQL + `@EnabledIfEnvironmentVariable` 跳过
+
+- **决策**：新增真实 MyBatis 集成测试（`LinkRepositoryMyBatisTest`），复用**已运行的本地 MySQL 容器**的**独立库 `linkforge_test`**，并用 `@EnabledIfEnvironmentVariable` 使其在无 MySQL 环境自动跳过。
+- **选项**：
+  1. **Testcontainers**（`@Testcontainers` + `MySQLContainer`）：环境隔离最彻底，但需新增依赖 + 拉取镜像（数百 MB）；
+  2. **复用本地 MySQL + 独立 schema**（选中）。
+
+- **结论**：**选项 2 + `@EnabledIfEnvironmentVariable(named = "RUN_MYBATIS_IT", matches = "true")`。**
+- **理由（为什么选方案 2）**：
+  - **精准命中缺陷性质**：DR-029 的 bug 只在「真实 MyBatis + 真实反射构造器 + 真实 `TIMESTAMP` 列读回」这条路径上暴露，Testcontainers 提供的额外价值（环境隔离）对这个缺陷不是关键项，而**拉镜像的成本是实打实的阻塞**。
+  - **时区断言必须真实**：连接串强制数据库会话时区为 UTC（DR-032），只有真实 MySQL 才能验证「存 UTC、读回不被驱动二次换算」这件事。
+
+- **理由（为什么用 `@EnabledIfEnvironmentVariable` 而不是 `@Tag` + surefire 排除）**：
+  - **不引额外插件**：用 `@Tag` + `<excludedGroups>` 需要在父 POM 里配置 `maven-surefire-plugin` 的 `excludedGroups`，等于为一个断言机制引入构建配置；而 `@EnabledIfEnvironmentVariable` 是 **JUnit 5 自带**的 `@Disabled` 家族注解，零构建改动。
+  - **意图表达更准确**：`@Tag("integration")` 表达的是「这是什么类型」，跳过与否还要另配 POM；`@EnabledIfEnvironmentVariable` 表达的是「没有 MySQL 就别跑」，**条件与意图写在同一处**，读代码即知跳过规则。
+  - **粒度更细**：将来若有测试需要「只在这个 profile 下跑」，`@EnabledIfEnvironmentVariable` 可按变量精细控制，而 tag 是全局分组开关。
+  - **执行方式**：`.\mvnw.cmd clean install` 默认**跳过**；需要时 `RUN_MYBATIS_IT=true .\mvnw.cmd clean install`。
+
+- **⚠️ 类名必须是 `*Test` 而不是 `*IT`**（写代码时才发现的坑）：
+  - surefire 默认只拾取 `**/Test*.java` / `**/*Test.java` / `**/*Tests.java` / `**/*TestCase.java`；`**/*IT.java` 属于 **failsafe 插件**的职责范围。
+  - 若命名为 `LinkRepositoryMyBatisIT` 又不引入 failsafe 插件，这个测试会**永远不被执行**——构建照样全绿，但 DR-031 要求的覆盖缺口仍然敞着，等于写了一句空承诺。
+  - 因此命名收敛为 `LinkRepositoryMyBatisTest`，由 `@EnabledIfEnvironmentVariable` 单独控制跳过与否：**命名负责「被拾取」，注解负责「何时跳过」**，两件事分开做，缺一不可。
+
+- **测试覆盖范围**（必须包含）：
+  1. `insert` 后 `findByShortCode` 能正确回读 —— **DR-029 的直接回归测试**；
+  2. `createdAt` 时区正确性：写入前后对比 `Instant`，证明存的是 UTC、未被数据库会话时区二次换算（DR-032）；
+  3. `status` 往返：`LinkStatusTypeHandler` 真实读写 `TINYINT`；
+  4. **同时插入两条不同 `short_code`，读回后字段不串**（防 `<constructor>` 映射错位）；
+  5. **`is_custom` 为 `NULL` 时的行为**：`NOT NULL` 列不会真的存 null，但用 SQL 强制写入 `NULL` 的模拟场景会被列约束拒绝，因此该用例断言的是「DB 层拒绝 null」这一事实（`is_custom` 为 `NOT NULL DEFAULT 0`），而非 Java 侧的 null 处理——因为**该列在数据库层面就不存在 null 这一状态**，Java 侧用基本类型是安全的。
+
+- **隔离要求**：测试库必须是**独立的 `linkforge_test`**，不得触碰开发库 `linkforge`（避免测试数据污染 D5/D6 的验证基线）。建库 SQL 已提供给用户手动执行（`linkforge` 用户可能无 `CREATE DATABASE` 权限）。
+
+- **影响**：第 5 周 CI 需显式设置 `RUN_MYBATIS_IT=true` 并提供 MySQL 服务，否则这批测试会静默跳过——这是**有意设计**（干净环境不因缺依赖而构建失败），但需在 README 中写明。
+
+---
+
+## DR-032 数据库会话时区强制为 UTC（消除 8 小时双重换算）
+
+- **决策**：连接串**移除 `serverTimezone=Asia/Shanghai`**，改用 **`connectionTimeZone=UTC` + `forceConnectionTimeZoneToSession=true`**。
+  ```
+  jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&characterEncoding=utf8
+  ```
+- **结论**：数据库会话时区必须是 **UTC**，由 JDBC 参数在建连时强制生效。
+- **理由**：
+  1. **`serverTimeZone` 参数在 Connector/J 8.0.23+ 已废弃**，改用现代参数名 `connectionTimeZone`。
+  2. **`forceConnectionTimeZoneToSession=true` 是本条的关键**：它让驱动在建连后执行
+     `SET time_zone='+00:00'`，**覆盖掉服务器自身时区**。只写 `connectionTimeZone=UTC`
+     而不加这个参数，行为取决于服务器与驱动的协商，**不够确定**。
+  3. 会话时区为 UTC 后，`DEFAULT CURRENT_TIMESTAMP` 生成的就是 UTC，读回的 `LocalDateTime` 也是 UTC，
+     `TimeConverter` 可无条件按 UTC 处理。
+
+- **⚠️ 完整故障链路（D4 启动验证实测）**：
+
+  ```
+  1. 连接串：...&serverTimeZone=Asia/Shanghai&...
+  2. MySQL 会话时区 = Asia/Shanghai（@@session.time_zone = SYSTEM，随服务器 TZ）
+  3. INSERT 不写 created_at（DDL: DEFAULT CURRENT_TIMESTAMP）
+     => MySQL 按会话时区生成墙上时钟，库里存的是 2026-10-13 13:15:33（北京时间）
+  4. 读回：驱动按 serverTimezone=Asia/Shanghai 解释 TIMESTAMP
+     => LocalDateTime 13:15:33（应用以为这是 UTC）
+  5. TimeConverter.toOffset(x, +08:00) 当作 UTC 再加一次偏移
+     => 2026-10-13T21:15:33+08:00   ← 比真实时刻【晚 8 小时】
+  ```
+
+  **关键分歧点**：`created_at`/`updated_at` 是**数据库生成**的，不是应用写入的。
+  DR-027 假定的「持久层统一是 UTC」对**应用写入的 `expire_at`** 成立，
+  但对**数据库生成的列**不成立——这正是原设计漏掉的分支。
+  ⚠️ 由此得出一个反直觉但重要的结论：**驱动侧与数据库侧必须同为一个时区**，
+  否则「谁生成的值」不同，换算次数也不同，双重换算只会在其中一条路径上出现。
+  本项目的实测恰好印证：`expire_at`（应用写入）在旧配置下**碰巧通过**，
+  只有 `created_at`（数据库生成）失败——「一个通过一个失败」是最容易误判为偶发的特征。
+
+- **⚠️ 为什么不能用「在应用层把 `createdAt` 反推成 UTC」来修**：
+  那会让时区知识泄漏进领域对象，与 DR-027「转换只在 Service 边界」的意图相反；
+  且真正的根因（会话时区不一致）依然存在，D5 接入过期判定后还会再撞一次。
+  修正**数据来源的时区**比修正**读取时的解释**更根本。
+
+- **不需要数据迁移**：`TIMESTAMP` 内部存的是 UTC epoch，会话时区只影响显示与 `CURRENT_TIMESTAMP` 的生成，
+  改会话时区**不改变已有行的内部值**。旧的 `created_at` 在新会话下读回即是正确的 UTC。
+
+- **⚠️ 触发位置（改动一致性清单，共 4 处，与 DR-023 的 `allowPublicKeyRetrieval` 同级）**：
+  1. `.env`（本地，未跟踪）
+  2. `.env.example`（含「为什么不用 `serverTimezone`」的注释）
+  3. **`linkforge-app/src/test/resources/application-test.yml`** —— ⚠️ 测试连接串**必须与生产逐字符一致**，
+     否则「createdAt 时区断言」会因配置不同而失去意义（DR-031）
+  4. **`docker-compose.yml` 的应用服务（第 5 周添加，容器内 URL 用 `mysql:3306`）** —— ⚠️ 已加占位注释。
+     这类「漏改一个环境」的缺陷最难排查，本项目已踩过一次。
+
+- **回归防护**：由 DR-031 的 `createdAt_shouldNotBeShiftedByServerTimezone` 与
+  `expireAt_shouldRoundTripWithoutInstantShift` 两条用例锁住。改动连接串时区参数前，
+  先跑 `RUN_MYBATIS_IT=true .\mvnw.cmd clean install`——它们是这条决策唯一的自动化守卫。
 

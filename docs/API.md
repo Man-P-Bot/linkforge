@@ -80,7 +80,7 @@ OffsetDateTime（UTC）
 
 - 请求中的时间必须带时区偏移；**不带时区的时间一律视为非法参数**（返回 400，`LINKFORGE-400-01`）——接受「无时区时间」会把时区歧义转嫁给服务端。
 - 响应中的时间统一按服务端配置的时区渲染（默认 `+08:00`）。
-- ⚠️ **连接串已固定 `serverTimezone=Asia/Shanghai`**（见 DR-023）：驱动按该时区解释 `TIMESTAMP`，因此应用层必须**存 UTC 的 `LocalDateTime`**、不要存带偏移的对象，否则会出现「偏移被应用一次、又被驱动解释一次」的双重换算。
+- ⚠️ **连接串强制数据库会话时区为 UTC**（见 DR-032：`connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true`）：驱动建连时执行 `SET time_zone='+00:00'`，因此**数据库自己生成**的 `created_at`/`updated_at` 也是 UTC，应用层可无条件把持久层的 `LocalDateTime` 当 UTC 处理。若会话时区是本地（如 `+08:00`），数据库生成的 `created_at` 是本地墙上时钟，被当 UTC 解释后会**多出 8 小时**。同一原则也约束写入方向：必须**存 UTC 的 `LocalDateTime`**、不要存带偏移的对象，否则会出现「偏移被应用一次、又被驱动解释一次」的双重换算。
 - ⚠️ **过期判定（D5）必须在 `Instant`/`OffsetDateTime` 语义下比较**，不要拿「UTC 的 `LocalDateTime`」直接与本地 `LocalDateTime.now()` 比 —— 那样在非 UTC 部署环境下会得到错误结论。要么统一转 `Instant` 比较，要么统一用注入的 UTC 时间源。
 
 ### 3.3 统一响应结构

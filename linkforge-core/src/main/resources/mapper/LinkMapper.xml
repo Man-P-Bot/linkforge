@@ -25,7 +25,22 @@
             <arg column="target_url" javaType="java.lang.String"/>
             <arg column="status" javaType="com.linkforge.core.domain.LinkStatus"
                  typeHandler="com.linkforge.core.infrastructure.persistence.LinkStatusTypeHandler"/>
-            <arg column="is_custom" javaType="boolean"/>
+            <!--
+              ⚠️ 必须是 _boolean（基本类型），不能写 boolean（DR-029）。
+
+              MyBatis 的 TypeAliasRegistry 对这两个别名的解析目标不同：
+                boolean  -> Boolean.class   （包装类）
+                _boolean -> boolean.class   （基本类型）
+
+              `<constructor>` 映射是按 javaType 反射查找构造器的。写 boolean 时 MyBatis
+              会去找 Link(Long, String, String, LinkStatus, Boolean, ...) 这个签名，
+              而 Link 的第 5 个形参是基本类型 boolean，两边签名不同 ->
+              NoSuchMethodException: Link.<init>(..., java.lang.Boolean, ...)
+              该缺陷只在真实 MyBatis + 真实反射构造路径上暴露，mock 仓储的单元测试测不到。
+
+              DB 侧 is_custom 是 TINYINT NOT NULL DEFAULT 0，不会为 null，用基本类型是安全的。
+            -->
+            <arg column="is_custom" javaType="_boolean"/>
             <arg column="created_at" javaType="java.time.LocalDateTime"/>
             <arg column="updated_at" javaType="java.time.LocalDateTime"/>
             <arg column="expire_at" javaType="java.time.LocalDateTime"/>

@@ -20,9 +20,16 @@ import java.time.ZoneOffset;
  * </pre>
  *
  * <h2>⚠️ 为什么持久层必须存 UTC 的 LocalDateTime</h2>
- * 连接串已固定 {@code serverTimezone=Asia/Shanghai}（DR-023），驱动会按该时区解释 {@code TIMESTAMP}。
- * 若应用层再存一个带偏移的对象，就会出现**偏移被应用一次、又被驱动解释一次**的双重换算，
- * 时间整体偏移数小时。存 UTC 的 {@code LocalDateTime} 是唯一不产生歧义的组合。
+ * 连接串强制数据库会话时区为 UTC（DR-032 的
+ * {@code connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}），
+ * 因此 {@code TIMESTAMP} 的读写两端都是 UTC。若应用层再存一个带偏移的对象，
+ * 就会出现**偏移被应用一次、又被驱动解释一次**的双重换算，时间整体偏移数小时。
+ * 存 UTC 的 {@code LocalDateTime} 是唯一不产生歧义的组合。
+ * <p>
+ * ⚠️ 反向同样成立：数据库**自己生成**的 {@code created_at} / {@code updated_at}
+ * 走的是 {@code DEFAULT CURRENT_TIMESTAMP}，只有会话时区为 UTC 时它才等于 UTC。
+ * 否则读回的 {@code LocalDateTime} 是本地墙上时钟，经本类 {@code toOffset} 后会多出
+ * 8 小时（D4 启动验证实测到，集成测试已锁住）。
  *
  * <h2>⚠️ 为什么入/出用 OffsetDateTime 而不是 Instant</h2>
  * 请求带的是偏移（{@code +08:00}），{@code OffsetDateTime} 能保留调用方原始意图，

@@ -5,9 +5,113 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D4 代码完成**，D4 待启动验证）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D4 全部完成并通过启动验证**）
 
-### D4 已完成（创建接口，构建全绿待启动验证）
+### 构建与测试总数（实测）
+`.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，
+**237 个测试 0 失败**（Core 114 + Redirect 107 + App 16，其中 App 的 16 含集成测试 13 个，
+默认构建下集成测试被 `RUN_MYBATIS_IT` 跳过、不计入执行）。
+
+### D4 启动验证结果（✅ 全部通过，D4 正式完成）
+
+| 验收项 | 结果 |
+|---|---|
+| 应用启动 | ✅ Tomcat 监听 **8080**，`Started LinkForgeApplication in 3.804 seconds` |
+| 启动日志 | ✅ **无 ERROR** |
+| 号段发号初始化 | ✅ `biz_tag=short_code max_id=999999999 step=1000` |
+| Redis 发号初始化 | ✅ `shortlink:id:seq` 初始化为 **99999** |
+| Flyway | ✅ 2 条 migration 已校验，`Schema up to date` |
+| `clean install` | ✅ **BUILD SUCCESS**，6/6 模块 |
+| 集成测试 | ✅ `RUN_MYBATIS_IT=true` 下 **13/13 通过，0 skipped**（确认真的执行） |
+| API §12 五条 curl | ✅ 5/5 符合契约（详见下表） |
+
+**5 条 curl 实测**（`.env` 当前时刻 `13:37:31+08:00`）：
+
+| # | 用例 | 期望 | 实际 |
+|---|---|---|---|
+| 1 | 创建（自动码） | 201 + 7 位 | **201** `shortCode=0000Q0w`（7 位） |
+| 2 | 自定义短码 | 201 | **201** `promo27` `custom:true` |
+| 3 | 重复短码 | 409 + `LINKFORGE-409-01` | **409** `LINKFORGE-409-01` |
+| 4 | 协议非法 | 400 + `LINKFORGE-400-02` | **400** `LINKFORGE-400-02` |
+| 5 | 保留字 `API` | 400 + `LINKFORGE-400-04` | **400** `LINKFORGE-400-04` |
+
+**createdAt 时区验证（DR-032 的核心验收点）**：
+```
+真实当前时刻 : 2026-10-13T13:37:31+08:00   (UTC 05:37:31Z)
+响应 createdAt: 2026-10-13T13:37:32+08:00   (UTC 05:37:32Z)   ✅ 秒级吻合
+```
+偏移为 `+08:00`（非 `Z`），且**与真实时刻一致**——8 小时双重换算已消除。
+`expireAt` 写入 `2026-12-31T23:59:59+08:00` 也原样返回，往返无损。
+
+### D4 启动验证抓到的两个真实缺陷（均由实际运行发现，非推理）
+
+⚠️ **这两个缺陷在 224 个单元测试全绿的情况下被放过去了**，暴露的是测试结构本身的缺口。
+
+#### 缺陷 1：MyBatis `boolean` 别名解析到包装类 → 创建接口 500（DR-029）
+
+- **现象**：`POST /api/v1/links` 返回 500 `LINKFORGE-500-01`；数据库**其实已写入成功**，
+  报错发生在写完回查阶段。
+- **根因链路**：
+  ```
+  LinkMapper.xml  <arg column="is_custom" javaType="boolean"/>
+    → TypeAliasRegistry 把别名 "boolean" 解析为 Boolean.class（包装类）
+    → <constructor> 按该类型反射查找 Link 构造器
+       要找：Link(..., Boolean, ...)
+       实际：Link(..., boolean, ...)     ← 签名不匹配
+    → NoSuchMethodException → 500
+  ```
+  （注：`_boolean` 才解析为基本类型 `boolean`。）
+- **修法**：**只改 XML 别名为 `_boolean`**，`Link` 完全不动（DB 侧 `is_custom` 是 `NOT NULL`，用基本类型语义正确）。
+- **为什么 224 个测试没抓到**：单测全部 mock 仓储，`LinkControllerTest` 是 `@WebMvcTest` 切片，
+  **都不经过真实 MyBatis 反射构造器**——结构上测不到。
+- **附带修复**：第 3 条「重复短码」此前被 500 掩盖，修好后才正确返回 409。
+
+#### 缺陷 2：数据库会话时区导致 8 小时双重换算（DR-032）
+
+- **现象**：修复缺陷 1 后，201 成功但 `createdAt` 返回 `21:15:33+08:00`，
+  而真实时刻是 `13:15:33+08:00`——**晚 8 小时**。
+- **根因**：连接串 `serverTimezone=Asia/Shanghai` 让 MySQL 会话按本地时区工作，
+  于是**数据库自己生成**的 `created_at` 是本地墙上时钟（库中实测 `2026-10-13 13:15:33`），
+  应用读回后当 UTC 处理，`TimeConverter` 又加一次 `+08:00` → 多出 8 小时。
+- **关键分歧点**：`created_at`/`updated_at` 由**数据库生成**，`expire_at` 由**应用写入**。
+  DR-027 假定的「持久层统一是 UTC」对 `expire_at` 成立，对数据库生成的列**不成立**。
+  实测印证：旧配置下 `expire_at` 用例**碰巧通过**，只有 `created_at` 失败——
+  **「一个通过一个失败」正是双重换算最易被误判为偶发的特征。**
+- **修法**：移除 `serverTimezone`（Connector/J 8.0.23+ 已废弃），改用
+  `connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true`，让驱动建连时执行
+  `SET time_zone='+00:00'`。**不需要数据迁移**（`TIMESTAMP` 内部存 UTC epoch，改会话时区只改显示）。
+- **影响面**：`serverTimezone` 在仓库中共 15 处引用（4 处连接串 + 11 处文档/注释），已全部更新。
+
+#### 由此补上的测试能力（DR-031）
+
+新增真实 MyBatis 集成测试 `LinkRepositoryMyBatisTest`（**13 个用例**），
+复用本地 MySQL 容器的**独立库 `linkforge_test`**，覆盖：
+insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` Instant 不变、
+`status` TINYINT 往返、`markDeleted` 幂等、**两条记录字段不串**（防 resultMap 错位）、
+`is_custom` NOT NULL 约束、唯一索引兜底、布隆重建扫描与游标。
+
+- **跳过机制**：用 `@EnabledIfEnvironmentVariable(named="RUN_MYBATIS_IT", matches="true")`，
+  默认 `clean install` 跳过（干净环境无 MySQL 也不失败），显式设变量才执行。
+- ⚠️ **类名必须是 `*Test` 而非 `*IT`**：surefire 默认不拾取 `*IT.java`（那是 failsafe 的职责），
+  命名成 `IT` 会导致该测试**永远不执行**，DR-031 就成了空承诺。
+- ⚠️ 测试连接串**必须与生产逐字符一致**，否则时区断言失去意义。
+- ⚠️ `application-test.yml` 必须显式给 `SHORTLINK_BASE_URL`：`RedirectConfig` 是
+  `@Value(...)` 无默认值（DR-014/DR-026 的正确设计），选择**如实复现**该校验而非在测试里放宽。
+
+#### 本轮新增决策
+
+| 编号 | 主题 |
+|---|---|
+| **DR-029** | MyBatis `boolean` 别名解析到包装类，基本类型必须用 `_boolean` |
+| **DR-030** | `server.port` 必须显式声明（`.env` 的 `APP_PORT` 曾是「配了但不生效」的死变量）；附 `SERVER__PORT` 等环境变量优先级陷阱 |
+| **DR-031** | 仓储层集成测试：复用真实 MySQL + 独立 schema + `@EnabledIfEnvironmentVariable` 跳过 |
+| **DR-032** | 数据库会话时区强制为 UTC，消除 8 小时双重换算 |
+
+---
+
+## 第 1 周 — D1~D4 代码完成记录（历史）
+
+### D4 代码完成（启动验证前的状态）
 `.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，**224 个测试 0 失败**
 （Core 114 + Redirect 107 + App 3），耗时 30.9s。
 
@@ -164,11 +268,16 @@ docker compose exec mysql mysql -uroot -p linkforge -e "SELECT * FROM id_segment
 
 ### ⚠️ `.env` 必须包含 `SPRING_DATASOURCE_URL`（否则 `run-local.ps1` 会按设计拦住）
 ```
-SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&characterEncoding=utf8
 ```
 - **`allowPublicKeyRetrieval=true` 是必需的**：MySQL 8.4 默认认证插件是 `caching_sha2_password`，
   JDBC 驱动首次连接需要向服务器索取 RSA 公钥来加密密码，默认被禁止，否则启动报
   `Public Key Retrieval is not allowed`（SQL State 08001）。
+- ⚠️ **时区两个参数也不能少（DR-032）**：`connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true`
+  让驱动执行 `SET time_zone='+00:00'`，数据库会话时区为 UTC。
+  **不要用 `serverTimezone=Asia/Shanghai`**（Connector/J 8.0.23+ 已废弃该参数）：
+  会话时区为本地时，数据库自己生成的 `created_at` 是本地墙上时钟，
+  应用按 UTC 解释后会产生**正好 8 小时**的双重换算（D4 启动验证实测到）。
 - ⚠️ **仅本地开发使用**。生产环境应改为 `useSSL=true` 并配置证书，**不要开 `allowPublicKeyRetrieval`**
   （允许明文索取公钥会削弱中间人防护）。
 - 参数顺序保持 `useSSL=false` 在前、`allowPublicKeyRetrieval=true` 紧随其后，与 `.env.example` 一致。

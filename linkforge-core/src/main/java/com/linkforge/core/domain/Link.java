@@ -10,8 +10,10 @@ import java.time.LocalDateTime;
  * 这样「谁能改什么」在编译期就一目了然。
  *
  * <p>时间字段用 {@link LocalDateTime} 而不是 {@code Instant}：数据库列是 {@code TIMESTAMP}，
- * 连接串已固定 {@code serverTimezone=Asia/Shanghai}（见 application.yml 的说明），
- * 统一按同一时区解释，避免 java.util.Date 那种隐式时区转换。
+ * 且连接串强制数据库会话时区为 UTC（{@code connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}，
+ * 见 docs/DECISIONS.md DR-032），因此读回来的 {@code LocalDateTime} 本身就是 UTC，可直接使用。
+ * 若会话时区是本地（如 {@code +08:00}），数据库自己生成的 {@code created_at} 就会是本地墙上时钟，
+ * 被当 UTC 解释后会多出 8 小时——不要存带偏移的对象，否则会出现「偏移被应用一次、又被驱动解释一次」。
  * 注意 {@code created_at} 与 {@code updated_at} **由数据库生成**，插入时不需要赋值。
  */
 public final class Link {

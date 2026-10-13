@@ -26,6 +26,16 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:?MYSQL_DATABASE 未设置}
       MYSQL_USER: ${MYSQL_USER:?MYSQL_USER 未设置}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD 未设置}
+      # ⚠️ 这里设 TZ=Asia/Shanghai 是为了让容器日志与人工排查时看到本地时间，
+      #    但它**不影响**应用的时区正确性：应用侧由 JDBC 参数强制会话时区为 UTC
+      #    （connectionTimeZone=UTC + forceConnectionTimeZoneToSession=true，见 DR-032），
+      #    驱动建连时会执行 SET time_zone='+00:00' 覆盖会话时区。
+      #    因此 CURRENT_TIMESTAMP 默认值生成的是 UTC，不是 Asia/Shanghai。
+      #
+      # ⏳ 第 5 周加 app 服务时的占位提醒：容器内连接串必须写 mysql:3306（不是 3307），
+      #    且**同样要带** connectionTimeZone=UTC & forceConnectionTimeZoneToSession=true。
+      #    ⚠️ 漏掉这两个参数会让容器内的应用出现 8 小时时区错位，而宿主机跑却正常——
+      #    这类「换环境就坏」的缺陷最难排查，本项目已踩过一次（DR-032）。
       TZ: Asia/Shanghai
     ports:
       # 宿主机端口默认 3307：本机 3306 已被宿主机的 MySQL80 服务占用（见 docs/DECISIONS.md DR-017）。
