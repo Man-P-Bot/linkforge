@@ -50,17 +50,38 @@
 - `Content-Type: application/json; charset=utf-8`（所有带 body 的请求与响应）。
 - **跳转成功（302）无 body**（PRD：跳转只需把浏览器送走，不返回内容）。
 
-### 3.2 时间格式（DR-013）
+### 3.2 时间格式（DR-013、DR-027）
 
 | 项 | 约定 |
 |---|---|
 | 传输格式 | **ISO-8601 带时区**，格式 `yyyy-MM-dd'T'HH:mm:ssXXX` |
 | 示例 | `2026-01-15T10:30:00+08:00` |
-| 数据库存储 | **UTC** |
+| Java 类型（入/出） | **`OffsetDateTime`** —— 保留偏移量，不做隐式时区转换 |
+| 数据库存储 | **UTC**，列类型 `TIMESTAMP` |
+| Java 类型（持久层） | **`LocalDateTime`（UTC）** —— 与 `short_link.expire_at` / `created_at` 列对应 |
 | 精度 | 秒（与 PRD §7.3「过期时间精确到秒」一致） |
 
-- 请求中的时间必须带时区偏移；**不带时区的时间一律视为非法参数**（返回 400）——接受「无时区时间」会把时区歧义转嫁给服务端。
+**转换链（DR-027，D4 定稿，D5 过期判定直接复用）**：
+```
+请求 JSON "2026-01-15T10:30:00+08:00"
+   │  Jackson 反序列化
+   ▼
+OffsetDateTime（保留 +08:00 偏移）
+   │  写库：withOffsetSameInstant(ZoneOffset.UTC).toLocalDateTime()
+   ▼
+LocalDateTime（UTC）  ──►  MySQL TIMESTAMP 列
+   │  读库：LocalDateTime（UTC）.atOffset(ZoneOffset.UTC)
+   ▼
+OffsetDateTime（UTC）
+   │  响应：withOffsetSameInstant(服务端时区, 默认 +08:00)
+   ▼
+输出 JSON "2026-01-15T10:30:00+08:00"
+```
+
+- 请求中的时间必须带时区偏移；**不带时区的时间一律视为非法参数**（返回 400，`LINKFORGE-400-01`）——接受「无时区时间」会把时区歧义转嫁给服务端。
 - 响应中的时间统一按服务端配置的时区渲染（默认 `+08:00`）。
+- ⚠️ **连接串已固定 `serverTimezone=Asia/Shanghai`**（见 DR-023）：驱动按该时区解释 `TIMESTAMP`，因此应用层必须**存 UTC 的 `LocalDateTime`**、不要存带偏移的对象，否则会出现「偏移被应用一次、又被驱动解释一次」的双重换算。
+- ⚠️ **过期判定（D5）必须在 `Instant`/`OffsetDateTime` 语义下比较**，不要拿「UTC 的 `LocalDateTime`」直接与本地 `LocalDateTime.now()` 比 —— 那样在非 UTC 部署环境下会得到错误结论。要么统一转 `Instant` 比较，要么统一用注入的 UTC 时间源。
 
 ### 3.3 统一响应结构
 
@@ -77,7 +98,7 @@
 
 ```
 {
-  "code": "LINKFORGE-4001",
+  "code": "LINKFORGE-400-01",
   "message": "targetUrl must use http or https scheme",
   "timestamp": "2026-01-15T10:30:00+08:00",
   "details": { "field": "targetUrl", "rejectedValue": "javascript:alert(1)" }
@@ -100,7 +121,7 @@ HTTP/1.1 429 Too Many Requests
 Retry-After: 42
 Content-Type: application/json; charset=utf-8
 
-{ "code": "LINKFORGE-4029", "message": "rate limit exceeded", "retryAfter": 42 }
+{ "code": "LINKFORGE-429-01", "message": "rate limit exceeded", "retryAfter": 42 }
 ```
 
 - `Retry-After` 头与 body 中的 `retryAfter` **必须为同一数值**，避免调用方看到两个不同的等待时间。
@@ -167,11 +188,11 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 | 情况 | 状态码 | 错误码 | body |
 |---|---|---|---|
-| 短码格式非法 / 尾斜杠 | 400 | `LINKFORGE-4001` | 完整错误体 |
-| 短码不存在（含从未创建、已删除、布隆判不存在） | **404** | `LINKFORGE-4040` | 完整错误体 |
-| 短码已过期 | **410** | `LINKFORGE-4410` | 完整错误体 |
-| 触发限流 | **429** | `LINKFORGE-4029` | **极简体**（§3.4）+ `Retry-After` |
-| 依赖不可用（MySQL 挂且缓存未命中） | 503 | `LINKFORGE-5003` | 完整错误体 |
+| 短码格式非法 / 尾斜杠 | 400 | `LINKFORGE-400-01` | 完整错误体 |
+| 短码不存在（含从未创建、已删除、布隆判不存在） | **404** | `LINKFORGE-404-01` | 完整错误体 |
+| 短码已过期 | **410** | `LINKFORGE-410-01` | 完整错误体 |
+| 触发限流 | **429** | `LINKFORGE-429-01` | **极简体**（§3.4）+ `Retry-After` |
+| 依赖不可用（MySQL 挂且缓存未命中） | 503 | `LINKFORGE-503-01` | 完整错误体 |
 
 - **404 与 410 的区分是硬要求**（PRD US-4）：`status = DELETED` → 404（**优先判定，不看 `expire_at`**）；`expire_at` 已到 → 410（DATABASE §4.2）。
 - **跳转失败返回完整 JSON**（用户确认）：契约一致性优先；失败请求占比低，不构成性能负担，且便于压测统计失败路径。
@@ -204,11 +225,12 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 |---|---|
 | 格式 | `^[a-zA-Z0-9]{4,8}$`（**4~8 位**，比自动生成的 7 位更宽松，便于用户取有意义的名字） |
 | 大小写 | **敏感**（`Abc123` 与 `abc123` 是两个不同短码） |
-| 保留字黑名单 | **应用层校验**，命中返回 400。黑名单：`api, admin, actuator, health, favicon.ico, static, error` |
+| 保留字黑名单 | **应用层校验**，命中返回 400（`LINKFORGE-400-03`）。黑名单：`api, admin, actuator, health, favicon.ico, static, error`。⚠️ **比较大小写不敏感**（DR-025） |
 | 已占用 | 返回 **409**，**不静默覆盖** |
 | 与自动生成共用空间 | 自动生成的 7 位短码与自定义短码在同一唯一空间内判重（DATABASE §4.1） |
 
 - 保留字黑名单**同时**在启动时做断言（校验黑名单覆盖所有已注册系统路径前缀），避免 `/{code}` 吃掉 `/api/v1/links`（ARCHITECTURE §6.4）。
+- ⚠️ **大小写不敏感看似与「短码大小写敏感」矛盾，实为有意**（DR-025）：短码值大小写敏感（`Abc123` ≠ `abc123`），但**保留字保护的是一条路径而不是一个值**。HTTP 路径在不同实现/容器/代理下的大小写归一化行为并不一致，若只拦小写 `api`，`Api` 在某些部署下仍会撞上 `/api`——防线的有效性会依赖「部署环境恰好不归一化」，这是不可接受的假设。因此黑名单加载时统一转小写存入 `Set`，校验时把 `customCode` 转小写后比较。
 
 ### 5.3 成功响应 `201 Created`
 
@@ -233,13 +255,13 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 | 情况 | 状态码 | 错误码 |
 |---|---|---|
-| `targetUrl` 缺失 / 超长 / 协议非 http(s) | 400 | `LINKFORGE-4001` |
-| `customCode` 格式不符（正则不匹配） | 400 | `LINKFORGE-4002` |
-| `customCode` 命中保留字黑名单 | 400 | `LINKFORGE-4003` |
-| `expireAt` 格式非法或不是将来时间 | 400 | `LINKFORGE-4001` |
-| `customCode` 已被占用 | **409** | `LINKFORGE-4090` |
-| 发号器不可用（Redis 与数据库号段同时失败） | 503 | `LINKFORGE-5003` |
-| 触发限流（每分钟 10 次） | 429 | `LINKFORGE-4029` + `Retry-After` |
+| `targetUrl` 缺失 / 超长 / 协议非 http(s) | 400 | `LINKFORGE-400-01` |
+| `customCode` 格式不符（正则不匹配） | 400 | `LINKFORGE-400-02` |
+| `customCode` 命中保留字黑名单 | 400 | `LINKFORGE-400-03` |
+| `expireAt` 格式非法或不是将来时间 | 400 | `LINKFORGE-400-01` |
+| `customCode` 已被占用 | **409** | `LINKFORGE-409-01` |
+| 发号器不可用（Redis 与数据库号段同时失败） | 503 | `LINKFORGE-503-01` |
+| 触发限流（每分钟 10 次） | 429 | `LINKFORGE-429-01` + `Retry-After` |
 
 ### 5.5 明确不做的行为
 
@@ -282,10 +304,10 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 | 情况 | 状态码 | 错误码 |
 |---|---|---|
-| 短码格式非法 / 尾斜杠 | 400 | `LINKFORGE-4001` |
-| 短码不存在或已删除 | 404 | `LINKFORGE-4040` |
-| 短码已过期 | 410 | `LINKFORGE-4410` |
-| 限流 | 429 | `LINKFORGE-4029` |
+| 短码格式非法 / 尾斜杠 | 400 | `LINKFORGE-400-01` |
+| 短码不存在或已删除 | 404 | `LINKFORGE-404-01` |
+| 短码已过期 | 410 | `LINKFORGE-410-01` |
+| 限流 | 429 | `LINKFORGE-429-01` |
 
 - **失效优先级与跳转接口完全一致**（先 `status` → 404，再 `expire_at` → 410），不允许两个接口给出不同状态码。
 
@@ -303,9 +325,9 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 |---|---|---|
 | 成功删除 | **200** | `{"data": {"shortCode": "abc1234", "alreadyDeleted": false}, ...}` |
 | 删除一个**已删除**的短码 | **200** | `{"data": {"shortCode": "abc1234", "alreadyDeleted": true}, ...}` |
-| 短码**从未存在** | **404** | `LINKFORGE-4040` |
+| 短码**从未存在** | **404** | `LINKFORGE-404-01` |
 | 短码**已过期** | 200 | 视为可删除，返回 `alreadyDeleted: false` |
-| 缺 Token / Token 错误 | **401** | `LINKFORGE-4010` |
+| 缺 Token / Token 错误 | **401** | `LINKFORGE-401-01` |
 
 - **为什么区分「已删除」(200) 与「不存在」(404)**：两者语义不同——「已经删过了」是重复执行同一意图（幂等成功），而「这个码从来没存在过」通常是调用方**拼错了短码**。都返回 200 会让拼写错误无法被发现。
 - **幂等性**：重复调用删除返回 200，不报错（PRD US-6 验收）。
@@ -332,7 +354,7 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 - **默认最近 7 天**（`from` 与 `to` 均缺省时）。
 - **最大 90 天**（与统计保留期一致）。
-- **超出 90 天返回 400**（`LINKFORGE-4001`），**不做静默截断**——静默截断会让调用方以为自己拿到了完整数据。
+- **超出 90 天返回 400**（`LINKFORGE-400-01`），**不做静默截断**——静默截断会让调用方以为自己拿到了完整数据。
 - `from > to` 返回 400。
 
 **成功响应 `200 OK`**：
@@ -366,10 +388,10 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 | 情况 | 状态码 | 错误码 |
 |---|---|---|
-| 日期格式非法 / 范围超 90 天 / `from > to` | 400 | `LINKFORGE-4001` |
-| 短码不存在或已删除 | 404 | `LINKFORGE-4040` |
-| 缺 Token / Token 错误 | 401 | `LINKFORGE-4010` |
-| 限流 | 429 | `LINKFORGE-4029` |
+| 日期格式非法 / 范围超 90 天 / `from > to` | 400 | `LINKFORGE-400-01` |
+| 短码不存在或已删除 | 404 | `LINKFORGE-404-01` |
+| 缺 Token / Token 错误 | 401 | `LINKFORGE-401-01` |
+| 限流 | 429 | `LINKFORGE-429-01` |
 
 > ⚠️ **区间 UV 的口径必须写清楚**：HyperLogLog 是按「短码 + 日期」分 key 的（DATABASE §6.2），因此**无法跨天做精确区间去重**。区间 UV 合计是「各天估算值之和」，会比真实区间去重值**偏大**。这是设计的已知边界，必须写进文档与面试口径，不能假装它是精确区间 UV。
 
@@ -384,25 +406,45 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 ## 8. 错误码表（A-4，本文档核心交付物）
 
-**格式：`LINKFORGE-<HTTP状态码><序号>`**，例如 `LINKFORGE-4001` = 400 段的第 1 个错误码。
+**格式：`LINKFORGE-<HTTP状态码(3位)>-<两位序号>`**，序号从 `01` 起。
+
+```
+LINKFORGE-400-01
+   │       │   └── 该状态码下的第 1 个错误
+   │       └────── HTTP 状态码（3 位，与响应的 HTTP 状态**必然一致**）
+   └────────────── 固定前缀
+```
+
+**为什么用连字符分隔而不是把状态码与序号连写**：连写形式（如 `LINKFORGE-4001`）无法一眼区分
+「400 段的第 1 个」与「401 段的第 0 个」，且 `LINKFORGE-4410`（410 段）这类编号需要读者做心算。
+分隔后**状态码段与响应的 HTTP 状态直接对应**，调用方与排查者都不需要对照表。
+⚠️ 这个格式**覆盖 4xx 与 5xx**（`400`~`599`），5xx 用 `5xx` 段，不再限制在 `4xxx`。
 
 | 错误码 | HTTP | 含义 | 触发条件 |
 |---|---|---|---|
-| `LINKFORGE-4001` | 400 | 参数错误 | `targetUrl` 缺失/超长/协议非 http(s)；时间格式非法或非将来时间；日期范围非法；短码路径字符非法或带尾斜杠 |
-| `LINKFORGE-4002` | 400 | 自定义短码格式非法 | 不匹配 `^[a-zA-Z0-9]{4,8}$` |
-| `LINKFORGE-4003` | 400 | 自定义短码命中保留字 | 值为 `api`/`admin`/`actuator`/`health`/`favicon.ico`/`static`/`error` |
-| `LINKFORGE-4010` | 401 | 未鉴权或 Token 无效 | 后台接口缺 `Authorization` 头、格式错误、Token 不匹配 |
-| `LINKFORGE-4090` | 409 | 短码冲突 | 自定义短码已被占用（**不静默覆盖**） |
-| `LINKFORGE-4029` | 429 | 触发限流 | 超过该接口的 IP/Token 阈值；**响应含 `Retry-After`** |
-| `LINKFORGE-4040` | 404 | 短码不存在 | 从未创建 / **已删除（`status = DELETED`）** / 布隆判不存在 |
-| `LINKFORGE-4410` | 410 | 短码已过期 | `status = ACTIVE` 但 `expire_at <= now` |
-| `LINKFORGE-5003` | 503 | 依赖不可用 | MySQL 不可用且缓存未命中；发号器（Redis 与数据库号段）均不可用 |
+| `LINKFORGE-400-01` | 400 | 参数错误 | `targetUrl` 缺失/超长/协议非 http(s)；时间格式非法或非将来时间；日期范围非法；短码路径字符非法或带尾斜杠 |
+| `LINKFORGE-400-02` | 400 | 自定义短码格式非法 | 不匹配 `^[a-zA-Z0-9]{4,8}$` |
+| `LINKFORGE-400-03` | 400 | 自定义短码命中保留字 | 值为 `api`/`admin`/`actuator`/`health`/`favicon.ico`/`static`/`error`（**大小写不敏感**，见 §5.2） |
+| `LINKFORGE-401-01` | 401 | 未鉴权或 Token 无效 | 后台接口缺 `Authorization` 头、格式错误、Token 不匹配 |
+| `LINKFORGE-404-01` | 404 | 短码不存在 | 从未创建 / **已删除（`status = DELETED`）** / 布隆判不存在 |
+| `LINKFORGE-409-01` | 409 | 短码冲突 | 自定义短码已被占用（**不静默覆盖**） |
+| `LINKFORGE-410-01` | 410 | 短码已过期 | `status = ACTIVE` 但 `expire_at <= now` |
+| `LINKFORGE-429-01` | 429 | 触发限流 | 超过该接口的 IP/Token 阈值；**响应含 `Retry-After`** |
+| `LINKFORGE-503-01` | 503 | 依赖不可用 | MySQL 不可用且缓存未命中；发号器（Redis 与数据库号段）均不可用 |
 
-**错误码规则（面向未来，避免编号混乱）**：
+**错误码规则（写死，面向未来避免编号混乱；权威记录见 `docs/DECISIONS.md` DR-024）**：
 
-- 编号段与 HTTP 状态码**绑定**：`4xxx` 段对应 400、`4010` 对应 401、`4090` 对应 409、`4029` 对应 429、`4040` 对应 404、`4410` 对应 410、`5003` 对应 503。
-- **错误码一旦发布不得复用或改义**；废弃只标记不删除。
-- **新增错误码只允许追加**，且必须同步更新本节与 §9 映射表。
+1. **编号规则**：`LINKFORGE-` + **HTTP 状态码（3 位）** + `-` + **两位序号**（`01`~`99`，从 `01` 起）。
+2. **状态码段与 HTTP 响应状态必然一致**：错误码里的状态码**就是**响应的 HTTP 状态，
+   不允许出现「码里写 400、实际返回 422」这类不一致。这条由 `ErrorCode` 枚举同时持有
+   `code` 与 `httpStatus` 两个字段来保证（见 D4 设计）。
+3. **4xx 用 `4xx` 段、5xx 用 `5xx` 段**，全格式覆盖 `400`~`599`。
+4. **序号按「同一状态码内的新增顺序」递增**，不复用、不回收。
+5. **错误码一旦发布不得复用或改义**；废弃只在表中标记 `已废弃`，**不删除行**。
+6. **新增错误码只允许追加**，且必须同步更新本节与 §9 映射表。
+7. ⚠️ **本格式于 D4 前修订**：初版曾用连写形式（`LINKFORGE-4001`、`LINKFORGE-4410`、`LINKFORGE-5003`），
+   存在「无法一眼看出 HTTP 状态」与「4xxx 段容纳不下 5xx」两个问题。
+   **当前项目尚未发布任何接口**，因此这是一次**兼容性无损的格式修订**，不涉及契约破坏。
 
 ---
 
@@ -410,16 +452,19 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 
 | HTTP | 语义（唯一含义） | 错误码 | 为什么是它 |
 |---|---|---|---|
-| 200 | 意图已达成 | `LINKFORGE-4090` 之外的成功场景；删除时的 `alreadyDeleted` 也走 200 | 幂等重试不应表现为失败 |
-| 201 | 资源已创建 | 创建成功 | 创建是新资源产生，语义上比 200 更准确 |
-| 302 | 临时重定向 | 跳转成功 | 不用 301：避免浏览器永久缓存导致统计失真（PRD D-3） |
-| 400 | **请求格式或参数错误** | `4001`/`4002`/`4003` | 调用方可以自己修的问题 |
-| 401 | **未鉴权** | `4010` | 后台接口唯一入口守卫 |
-| 404 | **资源不存在** | `4040` | 含「已删除」，因为删除后对外**就是不存在** |
-| 409 | **状态冲突** | `4090` | 短码被占用，需要换一个码 |
-| 410 | **曾经存在但已失效** | `4410` | **与 404 必须区分**（PRD US-4）：410 告诉调用方「这个码曾经有效」，对排查过期配置有直接价值 |
-| 429 | **限流** | `4029` | 唯一携带 `Retry-After`、唯一使用极简 body |
-| 503 | 依赖不可用 | `5003` | 服务端问题，重试可能成功 |
+| 200 | 意图已达成 | 无错误码（成功） | 幂等重试不应表现为失败：删除已删除的短码也走 200 |
+| 201 | 资源已创建 | 无错误码（成功） | 创建是新资源产生，语义上比 200 更准确 |
+| 302 | 临时重定向 | 无错误码（成功） | 不用 301：避免浏览器永久缓存导致统计失真（PRD D-3） |
+| 400 | **请求格式或参数错误** | `LINKFORGE-400-01` / `-02` / `-03` | 调用方可以自己修的问题 |
+| 401 | **未鉴权** | `LINKFORGE-401-01` | 后台接口唯一入口守卫 |
+| 404 | **资源不存在** | `LINKFORGE-404-01` | 含「已删除」，因为删除后对外**就是不存在** |
+| 409 | **状态冲突** | `LINKFORGE-409-01` | 短码被占用，需要换一个码 |
+| 410 | **曾经存在但已失效** | `LINKFORGE-410-01` | **与 404 必须区分**（PRD US-4）：410 告诉调用方「这个码曾经有效」，对排查过期配置有直接价值 |
+| 429 | **限流** | `LINKFORGE-429-01` | 唯一携带 `Retry-After`、唯一使用极简 body |
+| 503 | 依赖不可用 | `LINKFORGE-503-01` | 服务端问题，重试可能成功 |
+
+**阅读方式**：错误码的中间段**就是**该响应必须使用的 HTTP 状态（规则 2）。
+上表第 3 列因此只需要写序号段就能验证一致性——若某处实现成「返回 200 却带 `LINKFORGE-400-01`」，即为契约违规。
 
 **为什么 404 与 410 必须区分**（面试口径）：两者对调用方的含义完全不同——404 表示「你搞错了短码」，410 表示「短码没错，但已过期或失效」。合并成一个码，调用方就无法区分「链接被删了」和「链接写错了」，运营排查成本显著上升。
 
@@ -452,6 +497,8 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 | `STATS_DEFAULT_RANGE_DAYS` | ❌ | `7` | 统计查询默认范围 |
 
 - **`SHORTLINK_BASE_URL` 为什么必填**：默认值看似方便，但一旦在生产忘记设置，就会给用户返回 `http://localhost:8080/...` 这种**对外不可用的短链**——错误发生在用户点击时，排查成本极高。**启动即失败**是更安全的选择。
+- **启动期校验（DR-026）**：除「缺失即失败」外，**空字符串 / 全空白 / 纯斜杠 / 无 scheme / scheme 非 http(s)** 一律**启动失败**，不允许带病启动。
+- **末尾斜杠归一化（DR-026）**：`http://localhost:8080/` 与 `http://localhost:8080` 必须产出同一结果，拼接后**不得出现 `//`**。
 - **CORS 相关配置：v1 不提供**（§3.5）。
 
 ---
@@ -469,12 +516,12 @@ curl -s -X POST http://localhost:8080/api/v1/links \
   -H "Content-Type: application/json" \
   -d '{"targetUrl":"https://example.com/promo","customCode":"promo2026","expireAt":"2026-12-31T23:59:59+08:00"}'
 
-# 3. 短码已被占用（期望 409 + LINKFORGE-4090）
+# 3. 短码已被占用（期望 409 + LINKFORGE-409-01）
 curl -s -X POST http://localhost:8080/api/v1/links \
   -H "Content-Type: application/json" \
   -d '{"targetUrl":"https://example.com/other","customCode":"promo2026"}'
 
-# 4. 协议非法（期望 400 + LINKFORGE-4001）
+# 4. 协议非法（期望 400 + LINKFORGE-400-01）
 curl -s -X POST http://localhost:8080/api/v1/links \
   -H "Content-Type: application/json" \
   -d '{"targetUrl":"javascript:alert(1)"}'
@@ -482,10 +529,10 @@ curl -s -X POST http://localhost:8080/api/v1/links \
 # 5. 跳转（期望 302，Location 指向目标，Cache-Control: no-store）
 curl -s -I http://localhost:8080/abc1234
 
-# 6. 不存在（期望 404 + LINKFORGE-4040）
+# 6. 不存在（期望 404 + LINKFORGE-404-01）
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/zzzzzzz
 
-# 7. 格式非法（期望 400 + LINKFORGE-4001）
+# 7. 格式非法（期望 400 + LINKFORGE-400-01）
 curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/abc_123"
 
 # 8. 尾斜杠（期望 400，不做重定向）
@@ -513,7 +560,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/abc1234
 curl -s "http://localhost:8080/admin/api/v1/links/promo2026/stats?from=2026-01-09&to=2026-01-15" \
   -H "Authorization: Bearer $ADMIN_API_TOKEN"
 
-# 15. 统计范围超 90 天（期望 400 + LINKFORGE-4001）
+# 15. 统计范围超 90 天（期望 400 + LINKFORGE-400-01）
 curl -s -o /dev/null -w "%{http_code}\n" \
   "http://localhost:8080/admin/api/v1/links/promo2026/stats?from=2020-01-01&to=2026-01-15" \
   -H "Authorization: Bearer $ADMIN_API_TOKEN"
