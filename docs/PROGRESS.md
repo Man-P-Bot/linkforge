@@ -5,7 +5,42 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：D2 完成，D3 发号器已写待构建）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D3 已完成并启动验证通过**，下一步 D4）
+
+### D3 启动验证结果（✅ 全部通过，用户实测）
+| 验收项 | 结果 |
+|---|---|
+| 应用启动 | ✅ 成功，Tomcat 监听 **8080** |
+| 号段发号初始化 | ✅ `biz_tag=short_code max_id=999999999 step=1000，下一段从 1000000000 起` |
+| Redis 发号初始化 | ✅ `shortlink:id:seq` 初始化为 **99999**（首个发出的号为 100000） |
+| Flyway | ✅ `flyway_schema_history` 中 **V1、V2 两条 success=1** |
+| `id_segment` 表 | ✅ `short_code / 999999999 / 1000` |
+| Redis key | ✅ `shortlink:id:seq` = **99999** |
+| 启动日志 | ✅ **无 WARN** |
+
+### D3 收尾补充（本轮）
+- ✅ **Redis 连接配置化**：`application.yml` 加 `spring.data.redis.host=${REDIS_HOST:localhost}`、
+  `port=${REDIS_PORT:6379}`、`timeout: 50ms`（对齐 ARCHITECTURE §11.3 的 Redis 超时基线）。
+- ✅ `.env` / `.env.example` 补 `REDIS_HOST=localhost`；**第 5 周 compose 内需设为 `redis`**
+  （`localhost` 在容器内指向应用容器自身）。
+- ✅ **DR-023** 记录 `allowPublicKeyRetrieval`（背景、决策、安全代价、生产要求、4 处一致性清单）。
+
+### 构建与测试（实测）
+`.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，**102 个测试 0 失败**
+（Core 75 + Redirect 24 + App 3）。
+
+### D3 修复的缺陷汇总（全部由实际运行发现）
+1. `Base62Test` 第二条断言错：`"0000000".replaceFirst("^0+","")` 得 `""` 而非 `"0"`（实现本身正确）。
+2. 号段每次取段浪费一个号（`current` 与 `limit` 初值都为首号 − 1）。实测 8000 → 7939。
+3. **并发丢号**：快路径 `getAndIncrement` 与取段时的 `current` 重置冲突，陈旧值覆盖计数器。实测 8000 → 7947。
+   最终改为 **CAS 抢占 + 取段持锁 + 双检**，实测 **8000/8000 唯一**。
+4. `Long.MIN_VALUE` 哨兵配合「加一后比较」会漏进业务逻辑（报「序号不能为负」）。
+5. 取段改为惰性（构造时取段会让「只为装配的实例」也消耗一段号，并污染单测）。
+6. MyBatis Mapper 未被扫描（`scanBasePackages` 管不到 Mapper）→ 显式 `@MapperScan`。
+7. `@EventListener` 方法写了两个参数 → 改为无参 + 字段持有生成器。
+8. MySQL 8.4 连接缺 `allowPublicKeyRetrieval=true` → 见 DR-023。
+
+### D3 关键决策（DR-022）
 
 ### D3 已完成（待用户构建验证）
 | 内容 | 位置 |

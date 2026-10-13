@@ -412,6 +412,36 @@
 
 ---
 
+## DR-023 MySQL 8.4 JDBC 连接开启 allowPublicKeyRetrieval
+
+- **背景**：MySQL 8.4 默认认证插件是 `caching_sha2_password`。JDBC 驱动**首次**连接时需要用服务器的
+  RSA 公钥加密密码，而驱动默认**不允许自动获取该公钥**，于是连接被拒：
+  ```
+  Public Key Retrieval is not allowed
+  SQL State  : 08001
+  Error Code : 0
+  ```
+- **决策**：**本地开发**的连接串加 `allowPublicKeyRetrieval=true`，紧跟 `useSSL=false` 之后：
+  ```
+  jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+  ```
+- **代价（必须显式承认）**：允许驱动**明文索取服务器公钥**，会削弱中间人（MITM）防护——
+  攻击者若能在链路上冒充服务器，就能提供自己的公钥。因此该参数**仅限本地开发**。
+- **生产要求**：改为 **`useSSL=true` 并配置证书**，**不要开 `allowPublicKeyRetrieval`**。
+  生产环境要么用 TLS 加密链路（推荐），要么改用 `mysql_native_password`（不推荐，MySQL 8.4 已不鼓励）。
+- **触发位置（改动一致性清单，共 4 处）**：
+  1. `.env`（本地，未跟踪）
+  2. `.env.example`
+  3. **`docker-compose.yml` 的应用服务（第 5 周添加，容器内 URL 用 `mysql:3306`，同样要带该参数）**
+  4. `docs/` 中所有含具体 URL 的示例（当前为 `docs/PROGRESS.md`）
+  - ⚠️ `application.yml` 的注释里只有 `...?` 形式的占位示例，不含具体参数，无需改。
+- **关联输入源**：`application.yml` 的 Redis 配置同理从环境变量读取
+  （`REDIS_HOST` 默认 `localhost` / `REDIS_PORT` 默认 `6379`，`timeout: 50ms` 对齐
+  `docs/ARCHITECTURE.md` §11.3）。**容器内 `REDIS_HOST` 必须设为 `redis`**——
+  `localhost` 在容器内指向应用容器自身。
+
+---
+
 ## DR-022 短码发号：号空间区间划分、单向降级与已知回退风险
 
 - **决策**：
