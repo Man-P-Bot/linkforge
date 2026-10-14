@@ -5,12 +5,67 @@
 
 ---
 
-## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D4 全部完成并通过启动验证**）
+## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D5 完成并通过启动验证**）
 
-### 构建与测试总数（实测）
+### D5 启动验证结果（✅ 全部通过，D5 正式完成）
+
+| 验收项 | 结果 |
+|---|---|
+| 容器状态 | ✅ `linkforge-mysql` / `linkforge-redis` 均 **healthy** |
+| 应用启动 | ✅ Tomcat **8080**，`Started LinkForgeApplication in 4.259 seconds` |
+| 启动日志 | ✅ **无 ERROR**（仅一条已知的 Flyway schema history 重建 WARN，见下） |
+| ① 创建短链 | ✅ `201`，`shortCode = 0000Q0u`（7 位 Base62），`createdAt = 2026-10-14T21:40:03+08:00` |
+| ② **跳转** | ✅ `302`，`Location: https://example.com/very/long/path`，`Cache-Control: no-store`，**body 0 字节** |
+| ③ 不存在的短码 | ✅ `404` + `LINKFORGE-404-01` |
+| ④ 非法字符（`abc_123`） | ✅ `400` + `LINKFORGE-400-01` |
+| ⑤ 尾斜杠（`0000Q0u/`） | ✅ `400` + `LINKFORGE-400-01`，**未重定向纠正** |
+
+**第 2 条的三项重点核对**（全部符合 API.md §4.2/§4.3）：
+- `Location` 是**目标绝对 URL**，以 `https://` 开头 —— 不是 `shortUrl`
+  （填 `shortUrl` 会让浏览器跳回自己，形成多余往返）；
+- `Cache-Control: no-store` 存在；
+- 响应**无 body**（`Content-Length: 0`，`size_download = 0`）。
+
+**失败路径的实测响应**（统一错误体，`timestamp` 按服务端时区 `+08:00` 渲染）：
+```
+GET /zzzzzzz   → 404 {"code":"LINKFORGE-404-01","message":"短码不存在: zzzzzzz",...}
+GET /abc_123   → 400 {"code":"LINKFORGE-400-01","message":"短码只能包含 Base62 字符（0-9A-Za-z）: \"abc_123\"",...}
+GET /0000Q0u/  → 400 {"code":"LINKFORGE-400-01","message":"短码路径不允许尾斜杠: \"/0000Q0u/\"",...}
+```
+
+**⚠️ 尾斜杠为什么需要显式注册 `/{code}/`**（DR-037，实测确认）：
+Spring 6 默认**不匹配尾斜杠**，若只注册 `GET /{code}`，`/0000Q0u/` 会落成
+「找不到处理器」的 404 —— 状态码看似对，但 body 不是统一错误体，属于契约违规。
+实测加了显式映射后才拿到 `400 + LINKFORGE-400-01`。
+
+**已知无害 WARN**：Flyway 报 `Detected 2 non-empty schema history table(s)`，
+原因是 D4 集成测试曾把 Flyway 元数据写进 `linkforge_test` 库。不影响业务，暂不处理。
+
+### D5 跳转接口（已完成）
+
+**已实现**：
+- `core` 新增 `LinkState`（跳转视角状态推导，含 `Instant` 语义过期判定）、
+  `ShortCodeFormat`（路径短码字符/长度/尾斜杠规则）；
+- `redirect` 新增 `RedirectController`（`GET /{code}` + `/{code}/`）、`RedirectService`、
+  `LinkValidator.validateForRedirect`；
+- 单测新增：`LinkStateTest`(7)、`ShortCodeFormatTest`(3)、`RedirectServiceTest`(12)、
+  `RedirectControllerTest`(7)、`LinkValidatorTest` 跳转用例(7)。
+
+**D5 的 5 个决策（全部采纳推荐值）**：
+1. **不带缓存** —— 每次直查 MySQL，这是 PRD A-3 要求的性能基线分母，不是「漏做」。
+2. **`LinkState` 放 core** —— 查询接口（第 4 周）必须给出完全一致的状态码，
+   规则只有一份才可能一致（API.md §6.3）。
+3. **长度不符按 404、非法字符与尾斜杠按 400**（API.md §4.1），且**字符检查先于长度检查**。
+4. **不做限流**（第 3 周）。
+5. **两个 Controller 独立**（`LinkController` / `RedirectController`）。
+
+**⚠️ 缓存接口刻意不在 D5 定义**（DR-036）：留到第 2 周与 `RedisRedirectCache` 一起写。
+D5 的 `RedirectService` 直接依赖 `LinkRepository`，第 2 周改这一处依赖即可（局部改动，非架构改动）。
+理由：为猜不准的需求提前建抽象往往要返工——KISS，现在只需要「查库 → 跳转」。
+
+### 构建与测试总数（实测，D5 后）
 `.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，
-**237 个测试 0 失败**（Core 114 + Redirect 107 + App 16，其中 App 的 16 含集成测试 13 个，
-默认构建下集成测试被 `RUN_MYBATIS_IT` 跳过、不计入执行）。
+**285 个测试 0 失败**（Core 124 + Redirect 145 + App 16）。
 
 ### D4 启动验证结果（✅ 全部通过，D4 正式完成）
 
@@ -108,7 +163,9 @@ insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` In
 | **DR-032** | 数据库会话时区强制为 UTC，消除 8 小时双重换算 |
 | **DR-033** | 含特殊字符的配置文件改写**禁止用 sed**（D4 实测踩坑：`&` 被当通配符，静默损坏 `.env`） |
 | **DR-034** | 数据库权限边界：本地可自建测试库，生产应用账户只给 DML + Flyway 独立账户 |
-| **DR-035** | `.env` 中的 root 凭据是待收紧项（v1 保留不动，v2 或第 5 周处理） |
+| **DR-035** | `.env` 中的 root 凭据是待收紧项（v1 保留不动，v2 或第 5 周处理）；**已补记当前状态表**：本地放宽 / 生产只 DML / D5 后评估是否收紧 |
+| **DR-036** | D5 不引入跳转缓存，且**不预建缓存接口**（第 2 周与 `RedisRedirectCache` 一起写） |
+| **DR-037** | 路径短码「字符/尾斜杠 → 400、长度不符 → 404」及**字符检查先于长度检查**的判定顺序 |
 
 ### 数据库权限边界（详见 DR-034）
 

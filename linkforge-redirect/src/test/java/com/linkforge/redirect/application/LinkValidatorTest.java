@@ -177,6 +177,72 @@ class LinkValidatorTest {
     }
 
     @Nested
+    @DisplayName("跳转路径参数 {code}：字符 400 / 长度 404（docs/API.md §4.1）")
+    class RedirectCode {
+
+        @ParameterizedTest
+        @ValueSource(strings = {"abc1234", "0000Q0u", "aBc1234", "zzzzzzz"})
+        @DisplayName("7 位 Base62 通过")
+        void acceptsSevenCharBase62(String code) {
+            assertThatCode(() -> validator.validateForRedirect(code)).doesNotThrowAnyException();
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {"abc_123", "abc-123", "abc.123", "abc 123", "中文短码", "abc%2F"})
+        @DisplayName("⭐ 非 Base62 字符 → 400-01（格式错误，调用方能立刻发现拼接 bug）")
+        void illegalCharsAre400(String code) {
+            assertThatThrownBy(() -> validator.validateForRedirect(code))
+                    .isInstanceOf(LinkForgeException.class)
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {"abc123", "abc12345", "promo", "abcde"})
+        @DisplayName("⭐ 长度不是 7 位 → 404-01（不是 400：一定查不到，不是「参数非法」）")
+        void wrongLengthIs404(String code) {
+            assertThatThrownBy(() -> validator.validateForRedirect(code))
+                    .isInstanceOf(LinkForgeException.class)
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.LINK_NOT_FOUND);
+        }
+
+        @Test
+        @DisplayName("⭐ 尾斜杠 → 400-01（不做重定向纠正）")
+        void trailingSlashIs400() {
+            assertThatThrownBy(() -> validator.validateForRedirect("abc1234/"))
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {"", "   "})
+        @DisplayName("空 / 全空白 → 400-01")
+        void blankIs400(String code) {
+            assertThatThrownBy(() -> validator.validateForRedirect(code))
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+
+        @Test
+        @DisplayName("null → 400-01")
+        void nullIs400() {
+            assertThatThrownBy(() -> validator.validateForRedirect(null))
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+
+        @Test
+        @DisplayName("⭐ 顺序不可换：4 位且含非法字符 → 400 而不是 404")
+        void charCheckPrecedesLengthCheck() {
+            // 若先判长度，"abc_" 会被归为「不存在」，调用方将反复重试同一个拼接 bug 的请求
+            assertThatThrownBy(() -> validator.validateForRedirect("abc_"))
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+    }
+
+    @Nested
     @DisplayName("expireAt：必须是将来")
     class ExpireAt {
 

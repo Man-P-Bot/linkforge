@@ -1,6 +1,8 @@
 package com.linkforge.redirect.application;
 
+import com.linkforge.core.domain.IdSpace;
 import com.linkforge.core.domain.ReservedCodes;
+import com.linkforge.core.domain.ShortCodeFormat;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import java.net.URI;
@@ -156,6 +158,52 @@ public class LinkValidator {
     public void validateCustomCode(String customCode) {
         validateCustomCodeNotReserved(customCode);
         validateCustomCodeFormat(customCode);
+    }
+
+    // ---------------------------------------------------------------------
+    // 跳转路径参数 {code}
+    // ---------------------------------------------------------------------
+
+    /**
+     * 校验跳转接口的路径参数 {@code {code}}（docs/API.md §4.1）。
+     *
+     * <h2>⚠️ 判定顺序不可调换</h2>
+     * <pre>
+     *   空 / 尾斜杠        → 400-01（请求格式错误）
+     *   含非 Base62 字符   → 400-01（请求格式错误）
+     *   长度不是 7 位      → 404-01（一定查不到，不是「参数非法」）
+     * </pre>
+     * 字符检查必须在长度检查<b>之前</b>：{@code abc_} 是 4 位，若先判长度会返回 404，
+     * 调用方会以为自己只是「没这条链接」，从而反复重试同一个拼接 bug 的请求；
+     * 返回 400 才能立刻暴露「你用的字符集不对」。
+     *
+     * <p>尾斜杠也归入 400 而<b>不</b>重定向纠正：自动纠正会让一个短码对应多个可访问 URL，
+     * 破坏一一对应关系，也让缓存与统计出现双份记录（API.md §4.1）。
+     *
+     * <p>⚠️ <b>自定义短码（4~8 位）在这里会被判为 404</b>，这是契约的既定行为而非遗漏：
+     * 跳转接口按默认短码长度定位，自定义短码是否可跳转属于待确认项，
+     * 在契约改写之前不擅自放宽。
+     *
+     * @throws LinkForgeException {@link ErrorCode#INVALID_PARAMETER} 字符非法或带尾斜杠；
+     *                            {@link ErrorCode#LINK_NOT_FOUND} 长度不符
+     */
+    public void validateForRedirect(String rawCode) {
+        if (ShortCodeFormat.isBlank(rawCode)) {
+            throw new LinkForgeException(ErrorCode.INVALID_PARAMETER, "短码不能为空");
+        }
+        if (ShortCodeFormat.hasTrailingSlash(rawCode)) {
+            throw new LinkForgeException(ErrorCode.INVALID_PARAMETER,
+                    "短码路径不允许尾斜杠: \"" + rawCode + "\"");
+        }
+        if (!ShortCodeFormat.hasValidChars(rawCode)) {
+            throw new LinkForgeException(ErrorCode.INVALID_PARAMETER,
+                    "短码只能包含 Base62 字符（0-9A-Za-z）: \"" + rawCode + "\"");
+        }
+        if (!ShortCodeFormat.hasValidLength(rawCode)) {
+            // 长度不符不构成「参数非法」——7 位空间里不可能存在这种短码，因此按「不存在」处理
+            throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
+                    "短码长度必须为 " + IdSpace.SHORT_CODE_LENGTH + " 位: " + rawCode.length() + " 位");
+        }
     }
 
     // ---------------------------------------------------------------------
