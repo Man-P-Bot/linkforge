@@ -44,6 +44,17 @@
     </dependency>
 
     <!--
+      本地缓存（Caffeine）：跳转第1 层缓存（docs/ARCHITECTURE.md §10）。
+      不引 Spring Cache 抽象 —— 本项目只有跳转一个缓存点，
+      用 @Cacheable 的收益不足以抵消「注解不生效时静默退化成查库」的排查成本。
+      缓存读写要精确控制（NegativeHit 不下沉、异常不缓存），显式调用更可控。
+    -->
+    <dependency>
+      <groupId>com.github.ben-manes.caffeine</groupId>
+      <artifactId>caffeine</artifactId>
+    </dependency>
+
+    <!--
       字段级校验（@NotBlank/@Size/@Pattern/@Valid）。spring-boot-starter-web 不再传递
       引入校验实现，必须显式声明，否则 jakarta.validation.* 找不到。
     -->

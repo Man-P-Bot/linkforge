@@ -10,6 +10,9 @@ import com.linkforge.core.domain.Link;
 import com.linkforge.core.domain.LinkStatus;
 import com.linkforge.core.domain.ReservedCodes;
 import com.linkforge.core.error.ErrorCode;
+import com.linkforge.core.infrastructure.cache.CacheEntry;
+import com.linkforge.core.infrastructure.cache.CachedLink;
+import com.linkforge.core.infrastructure.cache.RedirectCacheService;
 import com.linkforge.core.repository.LinkRepository;
 import java.time.Clock;
 import java.time.Instant;
@@ -43,12 +46,45 @@ class RedirectServiceTest {
             Clock.fixed(NOW, ZoneOffset.UTC));
 
     private RedirectService service(Clock clock) {
-        return new RedirectService(linkRepository, linkValidator, clock);
+        return new RedirectService(linkRepository, linkValidator, ALWAYS_MISS, clock);
     }
 
     private RedirectService service() {
         return service(Clock.fixed(NOW, ZoneOffset.UTC));
     }
+
+    /**
+     * 恒定未命中的缓存替身。
+     *
+     * <p>刻意<b>不用 mock</b>：本类验证的是「查库 → 判定」这条纯逻辑路径，
+     * 缓存一律未命中才能保证每次都真的回源。若用 {@code @Mock} + 全局 stub，
+     * Mockito 的 strict 模式会对「某些用例没用上这个 stub」报错，
+     * 反而把注意力从被测逻辑上引开。
+     *
+     * <p>缓存自身的行为由 {@code TwoLevelRedirectCacheTest} 与
+     * {@code RedirectServiceCacheTest} 覆盖。
+     */
+    private static final RedirectCacheService ALWAYS_MISS = new RedirectCacheService() {
+        @Override
+        public Optional<CacheEntry> get(String shortCode) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void put(String shortCode, CachedLink link) {
+            // 不回填：本类每次都应回源
+        }
+
+        @Override
+        public void putEmpty(String shortCode) {
+            // 不回填
+        }
+
+        @Override
+        public void evict(String shortCode) {
+            // 无内容可失效
+        }
+    };
 
     private static Link link(LinkStatus status, LocalDateTime expireAtUtc) {
         return new Link(1L, "abc1234", "https://example.com/very/long/path", status, false,
