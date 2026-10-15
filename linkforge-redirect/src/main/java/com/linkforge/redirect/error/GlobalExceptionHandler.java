@@ -2,6 +2,7 @@ package com.linkforge.redirect.error;
 
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
+import com.linkforge.core.repository.ShortCodeGenerator.ShortCodeGenerationException;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.LinkedHashMap;
@@ -86,6 +87,28 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ErrorCode.INVALID_PARAMETER.httpStatus())
                 .body(errorBody(ErrorCode.INVALID_PARAMETER,
                         "请求体格式非法（时间必须带时区偏移，如 2026-01-15T10:30:00+08:00）", null));
+    }
+
+    /**
+     * 发号失败（DR-043）。
+     *
+     * <p>显式映射到 503 {@code LINKFORGE-503-01}，让基础设施异常不再漏到兜底 handler。
+     *
+     * <p>⚠️ <b>为什么必须单独映射，而不是让兜底 handler 处理</b>：
+     * 兜底 handler 返回 500，语义是「服务有 bug，需要人介入」；
+     * 503 的语义是「依赖暂时不可用，调用方可以重试且会自愈」。
+     * 号段发号失败通常是数据库暂时不可达——把它报成 500 会误导告警与排查方向
+     * （让人去查代码，而实际问题在依赖）。
+     *
+     * <p>本类之所以能引用它：{@code ShortCodeGenerationException} 定义在 core
+     * （纯契约，不依赖 web 栈），框架映射在这里，符合 DR-021 对 core 的零 web 依赖要求。
+     */
+    @ExceptionHandler(ShortCodeGenerationException.class)
+    public ResponseEntity<Map<String, Object>> handleShortCodeGeneration(ShortCodeGenerationException e) {
+        ErrorCode code = ErrorCode.DEPENDENCY_UNAVAILABLE;
+        log.error("发号失败（{}）：{}", code.code(), e.getMessage(), e);
+        return ResponseEntity.status(code.httpStatus())
+                .body(errorBody(code, code.defaultMessage(), null));
     }
 
     /** 兜底：未预期异常一律 500，**不泄露内部细节**。 */
