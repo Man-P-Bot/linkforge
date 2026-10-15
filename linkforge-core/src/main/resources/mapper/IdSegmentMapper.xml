@@ -24,16 +24,25 @@
     </insert>
 
     <!--
-      原子取段：一条 UPDATE 内完成 max_id 自增，靠 InnoDB 行锁保证并发安全。
-      @return 推进后的 max_id（本次号段右端点）；受影响行数为 0 表示 biz_tag 行不存在。
+      原子推进：只做 UPDATE，**不返回 max_id**。
+      ⚠️ 必须拆成 update + select 两条，原因见 DR-042：
+         MyBatis 的 <update> 返回的是**受影响行数**（本语句恒为 1），
+         不是 max_id。原先把它声明成返回 long 并直接赋给 newLimit，
+         于是 newLimit = 1，segmentStart = 1 - step + 1 = -998（负序号）。
+         调用方 IdSegmentAllocator 在同一 REQUIRES_NEW 事务内先 update 再 select，
+         InnoDB 行锁保证 select 读到的是自己那次 update 的结果。
     -->
-    <update id="advanceAndGetMaxId">
+    <update id="advanceMaxId">
         UPDATE id_segment
         SET max_id = max_id + step
         WHERE biz_tag = #{bizTag}
     </update>
 
-    <select id="selectMaxId" resultType="java.lang.Long">
+    <!--
+      读取推进后的 max_id。
+      ⚠️ 必须在推进的同一事务内调用（REQUIRES_NEW），否则读到的可能是别的实例推进后的值。
+    -->
+    <select id="selectMaxId" resultType="long">
         SELECT max_id
         FROM id_segment
         WHERE biz_tag = #{bizTag}

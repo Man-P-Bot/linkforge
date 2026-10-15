@@ -10,6 +10,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -75,13 +77,30 @@ class LinkRepositoryMyBatisTest {
     private static final String CODE_A = "ita0001";
     private static final String CODE_B = "ita0002";
 
+    /**
+     * 仅大小写不同的一对短码（DR-040 回归专用）。
+     *
+     * <p>刻意**不用** {@code CODE_A}/{@code CODE_B} 的变体：它们是全小写，
+     * 变体（{@code ITA0001}）在 ci 比较下会与原值撞码，清理逻辑会互相干扰。
+     * 这里用独立的、库中不会自然产生的大小写组合。
+     */
+    private static final String CODE_UPPER = "0Q1A";
+    private static final String CODE_LOWER = "0Q1a";
+
     private static final String URL_A = "https://example.com/it/alpha";
     private static final String URL_B = "https://example.com/it/beta?x=1";
+    private static final String URL_UPPER = "https://example.com/upper";
+    private static final String URL_LOWER = "https://example.com/lower";
 
     @BeforeEach
     void cleanUp() {
         // 测试库可能残留上一轮数据，先清干净保证断言可重复
         jdbcTemplate.update("DELETE FROM short_link WHERE short_code IN (?, ?)", CODE_A, CODE_B);
+        // ⚠️ 这里用**二进制比较**删除（V3 之后 short_code 已是 ascii_bin），
+        //    因此两条语句分别删。若排序规则仍是旧的 ci，
+        //    第一条 DELETE 会连带删掉 CODE_LOWER，导致本组测试失去意义。
+        jdbcTemplate.update("DELETE FROM short_link WHERE BINARY short_code IN (?, ?)",
+                CODE_UPPER, CODE_LOWER);
     }
 
     // ---------------------------------------------------------------------
@@ -337,5 +356,64 @@ class LinkRepositoryMyBatisTest {
         linkRepository.insert(new Link(null, CODE_B, URL_B, LinkStatus.ACTIVE, false, null, null, null));
 
         assertThat(linkRepository.scanActiveShortCodes(firstId, 100)).containsExactly(CODE_B);
+    }
+
+    // ---------------------------------------------------------------------
+    // 8. short_code 排序规则大小写敏感（DR-040）
+    // ---------------------------------------------------------------------
+
+    @Test
+    @DisplayName("⭐ 仅大小写不同的短码是两个不同记录（DR-040 回归）")
+    void shortCodesDifferingOnlyByCaseAreDistinct() {
+        // 修复前：short_code 是 utf8mb4_0900_ai_ci，`0Q1A` 与 `0Q1a` 是同一个值，
+        // 第二行 insert 抛 DuplicateKeyException，发号器最终返回 503。
+        // 实测 D6 造数时 66 个码就出现 24 组冲突（约 36%）。
+        linkRepository.insert(new Link(null, CODE_UPPER, URL_UPPER, LinkStatus.ACTIVE, false,
+                null, null, null));
+        linkRepository.insert(new Link(null, CODE_LOWER, URL_LOWER, LinkStatus.ACTIVE, false,
+                null, null, null));
+
+        assertThat(linkRepository.findByShortCode(CODE_UPPER).orElseThrow().targetUrl())
+                .as("大写短码必须查到自己的 targetUrl")
+                .isEqualTo(URL_UPPER);
+        assertThat(linkRepository.findByShortCode(CODE_LOWER).orElseThrow().targetUrl())
+                .as("小写短码必须查到自己的 targetUrl，不能被大写记录顶替")
+                .isEqualTo(URL_LOWER);
+    }
+
+    @Test
+    @DisplayName("⭐ 完全相同的短码仍被唯一索引拒绝（ascii_bin 不能放松唯一性）")
+    void identicalShortCode_shouldStillBeRejected() {
+        linkRepository.insert(new Link(null, CODE_UPPER, URL_UPPER, LinkStatus.ACTIVE, false,
+                null, null, null));
+
+        assertThatThrownBy(() -> linkRepository.insert(
+                new Link(null, CODE_UPPER, URL_LOWER, LinkStatus.ACTIVE, false, null, null, null)))
+                .as("改成大小写敏感不等于放弃唯一性：完全相同的码仍必须被拒绝")
+                .isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("⭐ short_code 的 WHERE 查询走 uk_short_code 索引（ascii_bin 不破坏索引可用性）")
+    void shortCodeLookup_shouldUseUniqueIndex() {
+        linkRepository.insert(new Link(null, CODE_UPPER, URL_UPPER, LinkStatus.ACTIVE, false,
+                null, null, null));
+
+        // EXPLAIN 的 type 必须是 ref/const（走索引），不能是 ALL（全表扫）
+        List<Map<String, Object>> plan = jdbcTemplate.queryForList(
+                "EXPLAIN SELECT * FROM short_link WHERE short_code = ?", CODE_UPPER);
+
+        assertThat(plan).as("EXPLAIN 应返回一行计划").hasSize(1);
+        String type = String.valueOf(plan.get(0).get("type"));
+        String key = plan.get(0).get("key") == null ? null : String.valueOf(plan.get(0).get("key"));
+        String rows = String.valueOf(plan.get(0).get("rows"));
+
+        assertThat(type)
+                .as("short_code 查询不应全表扫（target_url 是 2048 字节的列，全表扫代价极高）")
+                .isIn("ref", "const", "eq_ref");
+        assertThat(key)
+                .as("应命中 uk_short_code 唯一索引")
+                .isEqualTo("uk_short_code");
+        assertThat(rows).as("唯一索引等值查询应只扫 1 行").isEqualTo("1");
     }
 }

@@ -1026,3 +1026,104 @@
 - **影响**：新增 `redirect/api/dto/ApiResponse`；`LinkController` 构造签名增加 `ZoneId`；
   `LinkControllerTest` 的 jsonPath 断言从 `$.xxx` 改为 `$.data.xxx`，
   并新增「顶层只有 data 与 timestamp」的结构测试。
+
+## DR-040 `short_code` 列使用 `ascii_bin` 排序规则
+
+- **背景**：V1 建表时 `short_code` 继承了表默认的 `utf8mb4_0900_ai_ci`（`_ci` = case-insensitive），
+  但短码空间是 Base62（`0-9A-Za-z`），**同时使用大小写字母**。
+  于是 `0Q1A`（序号 100016）与 `0Q1a`（序号 100042）在 ci 比较下是同一个值，
+  `uk_short_code` 判定冲突，发号器重试 3 次后返回 503（`LINKFORGE-503-01`）。
+- **实测**（2026-10-15D6 造数）：序号区间 100000~100065 共 66 个短码，
+  ci 去重后仅 42 个，**24 组冲突（约 36%）**。这不是边缘情况而是常态——
+  只要序号递增跨过大小写字母边界就必然踩到。
+  D4/D5 只造个位数短码，因此从未暴露。
+- **根因**：契约要求与 schema 不一致。API.md §5.2 明写「短码大小写敏感，
+  `Abc123` 与 `abc123` 是两个不同短码」，DR-025 也以此为前提；
+  但建表时用了库默认排序规则，没人核对过它是否满足契约。
+- **决策**：Flyway V3 把 `short_code` 改为 `CHARACTER SET ascii COLLATE ascii_bin`。
+- **为什么不选 `utf8mb4_0900_as_cs`**：它的大小写敏感语义是对的，但按 utf8mb4 存
+  **4 字节/字符**，对纯 ASCII 的短码是 4 倍浪费。
+  `ascii_bin` 是 1 字节/字符 + 二进制比较，语义精确且存储最优——
+  短码不该有任何 Unicode 语义（不区分重音、不做等价归一）。
+- **实测收益**：`idx_status_code(status, short_code)` 覆盖索引中，
+  `short_code` 从 32 字节/行降到 8 字节/行（`EXPLAIN` 的 `key_len` 从 34 变 10）。
+- **回归测试**（`LinkRepositoryMyBatisTest`）：
+  - `shortCodesDifferingOnlyByCaseAreDistinct` —— `0Q1A` / `0Q1a` 双双插入并各查回自己的 `targetUrl`
+  - `identicalShortCode_shouldStillBeRejected` —— 完全相同的码仍被唯一索引拒绝（防修复过头）
+  - `shortCodeLookup_shouldUseUniqueIndex` —— `EXPLAIN` 断言 `type=const` + `key=uk_short_code` + `rows=1`
+
+## DR-041 `referer_domain` 保持 `utf8mb4_0900_ai_ci`（不改成大小写敏感）
+
+- **背景**：D6 检查所有列的排序规则时，我（提出检查的人）曾按「唯一键组成部分应从严」
+  的直觉提出把 `link_stats_daily.referer_domain` 也改成大小写敏感。**该判断经论证后推翻。**
+- **理由**：
+  1. **DNS 规范本身大小写不敏感**——`EXAMPLE.COM` 与 `example.com` 是同一个域名，
+     这是协议规定的事实，不是数据库的选择。
+  2. **统计表的语义是聚合**。`uk_link_date_referer(link_id, stat_date, referer_domain)`
+     的目的是「同一天、同一短链、同一个来源站点」。
+     ci 让等价域名**合并**（正确归一）；改成敏感会让它们**分裂成两个来源**，
+     导致同一来源的 PV 被错误拆分——这是数据质量问题，不是安全问题。
+  3. **危害方向相反**。「唯一键从严」的直觉适合的是**需要精确区分**的字段
+     （如用户名），而域名是需要**归一**的字段。
+- **决策**：保持 `utf8mb4_0900_ai_ci` 不变。
+- **⚠️ 记录目的**：防止后续读者按「唯一键从严」的直觉把它改回去。
+  这类「看起来更严格、实际更错误」的改动，光看代码审不出来——
+  必须回到字段的业务语义上判断。
+- **同理**：`short_link.target_url` 也保持 `utf8mb4_0900_ai_ci`。
+  它存用户提交的原始 URL，**可能含中文路径与查询参数**，
+  改成 ascii_bin 会让含中文的 URL 直接插入失败。
+
+## DR-042 号段发号：Mapper 返回受影响行数，不返回 `max_id`
+
+- **决策**：`IdSegmentMapper` 拆成两条语句——
+  `advanceMaxId()` 返回**受影响行数**（`int`），
+  `advanceAndGetNewMaxId()` 在**同一 `REQUIRES_NEW` 事务**内先 update 再
+  `selectMaxId`，返回真正的 `max_id`。
+- **根因**：原实现把 `advanceAndGetMaxId` 声明成返回 `long`，但 MyBatis 的
+  `<update>` **一律返回受影响行数**（该语句恒为 1），不是 `max_id`。
+  于是号段右端点被算成 1，段首变成 `1 - 1000 + 1 = -998`（负序号），
+  抛 `IllegalArgumentException: 序号不能为负`，最终变成 **500**。
+- **⚠️ 为什么能长期潜伏**（本条最重要的教训）：
+  两重遮蔽叠加——① `SegmentShortCodeGeneratorTest` 把 `IdSegmentAllocator` mock 掉了，
+  mock 返回的是真 `max_id`，8 个单元测试全绿；
+  ② 该路径只在 **Redis 不可用时的降级分支**上执行，
+  而 D4/D5 的启动验证都是低并发，Redis 路径从未失败过。
+  **「测试全绿」与「路径从未被执行」是同时成立的。**
+- **为什么不合成一条 SQL**：MySQL 没有 `UPDATE ... RETURNING`，
+  常见技巧是 `SET max_id = LAST_INSERT_ID(max_id + step)` 再 `SELECT LAST_INSERT_ID()`。
+  但它依赖 MySQL 特有行为，且读的是**连接级**变量——
+  从连接池拿到的连接若不是同一条，结果就是错的。
+  降级发号是低频路径，多一条 SELECT 的开销可忽略，通用性与可读性更重要。
+- **为什么必须 `REQUIRES_NEW`**：取号段要独立于业务事务。
+  号段一旦取走，无论业务成功失败都**不还回去**（只跳号、不重号）；
+  若与业务事务共用，创建失败回滚时号段也回滚，
+  而进程内 `current` 已向前走，同一段号会被重复发出。
+- **防御性断言**：`refillSegment` 新增「段首不得小于 `SEGMENT_FIRST_SEQUENCE`」检查。
+  DR-042 正是绕过了这一步才让负序号漏到业务层——
+  补上之后同类错误会在发号器内部被拦住。
+- **回归测试**（`SegmentShortCodeGeneratorMysqlTest`，9 个）：
+  **刻意不 mock 任何一层**，也**刻意不加类级 `@Transactional`**
+  （那会让测试事务持有 `id_segment` 行锁，与 `REQUIRES_NEW` 自锁，
+  每个用例卡 50s `Lock wait timeout`——生产无此问题）。
+  覆盖：100 个号全正无重复、序号落在 `[10亿, +∞)` 不与 Redis 区间重叠、
+  100 个号只推进 1 段、跨段 2500 个号无重号、
+  区间用尽/段首为负/行不存在三种异常都抛 `ShortCodeGenerationException`、
+  以及直接断言 Mapper 的 `advanceMaxId` 返回 1 而非 `max_id`（锁定根因）。
+
+## DR-043 号段发号失败映射 503 而非 500
+
+- **决策**：
+  1. `SegmentShortCodeGenerator` 内部所有异常（负数、越界、SQL 异常）统一包装为
+     `ShortCodeGenerationException`；
+  2. `GlobalExceptionHandler` 为它单独注册 handler → **503 `LINKFORGE-503-01`**。
+- **理由**：500 与 503 语义不同，处置方式也不同——
+  500 = 「服务有 bug，需要人介入」；503 = 「依赖暂时不可用，调用方可以重试且会自愈」。
+  号段发号失败通常是数据库暂时不可达，把它报成 500 会**误导告警与排查方向**
+  （让人去查代码，而实际问题在依赖）。
+  D6 实测正是这样：负序号异常漏到兜底 handler，409 个请求返回 500，
+  而真正的根因（Mapper 返回值错误）在数据库侧。
+- **⚠️ 这类异常泄漏的通用教训**：基础设施层的异常若不显式映射，
+  就会被兜底 handler 一律报成 500，把「依赖问题」伪装成「代码问题」，
+  浪费排查时间。新增基础设施异常类型时，**必须同时确认它有明确的 HTTP 语义映射**。
+- **实现要点**：兜底 handler 只应在「确实没有更精确的映射」时兜底，
+  它不是「所有异常都该进这里」的许可。

@@ -52,7 +52,7 @@ class ShortCodeGeneratorTest {
         }
 
         @Override
-        public synchronized long advanceAndGetMaxId() {
+        public synchronized long advanceAndGetNewMaxId() {
             advanceCalls++;
             return maxId.addAndGet(step);
         }

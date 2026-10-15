@@ -29,19 +29,30 @@ public interface IdSegmentMapper {
                       @Param("step") int step);
 
     /**
-     * 原子推进号段并取走一整段，返回推进后的 {@code max_id}。
+     * 原子推进号段（{@code max_id = max_id + step}），靠 InnoDB 行锁保证多实例并发取段不重叠。
      *
-     * <p>{@code max_id = max_id + step} 在单条 UPDATE 内完成，依赖 InnoDB 行锁保证原子性，
-     * 因此多实例并发取段不会拿到重叠区间。
+     * <p><b>返回受影响行数，而不是 {@code max_id}</b>（DR-042）。
+     * 原实现把这一步声明成返回 {@code long} 并直接当 {@code max_id} 用，
+     * 但 MyBatis 的 {@code <update>} 一律返回受影响行数（本语句恒为 1），
+     * 于是号段右端点被算成 1，段首变成 {@code 1 - step + 1 = -998}，
+     * 负序号一路传到 {@code IdSpace.requireInRange} 抛
+     * {@code IllegalArgumentException: 序号不能为负}。
      *
-     * <p>⚠️ 调用方必须让本语句运行在**独立事务**并立即提交
-     * （见 {@code SegmentShortCodeGenerator}）：如果与业务事务共用，
-     * 创建短链失败回滚时号段也会跟着回滚，多实例下会重复分配同一段号。
+     * <p>该缺陷能长期潜伏，是因为它只在**降级路径**上出现（Redis 不可用时），
+     * 而 {@code SegmentShortCodeGeneratorTest} 把本 Mapper mock 掉了，
+     * 返回的是真正的 {@code max_id}。
      *
-     * @return 推进后的 max_id（即本次号段的右端点）
+     * @return 受影响行数；{@code 0} 表示 {@code biz_tag} 行不存在
      */
-    long advanceAndGetMaxId(@Param("bizTag") String bizTag);
+    int advanceMaxId(@Param("bizTag") String bizTag);
 
-    /** 只读当前 max_id，用于启动自检与排查。 */
+    /**
+     * 读取当前 {@code max_id}。
+     *
+     * <p>用于启动自检、排查，以及 {@link #advanceMaxId} 之后在**同一事务内**读回
+     * 推进结果（行锁保证读到的是自己那次 update 的值）。
+     *
+     * @return 当前 max_id；{@code null} 表示 {@code biz_tag} 行不存在
+     */
     Long selectMaxId(@Param("bizTag") String bizTag);
 }

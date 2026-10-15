@@ -97,11 +97,39 @@ public class SegmentShortCodeGenerator implements ShortCodeGenerator {
     @Override
     public String nextShortCode() {
         long sequence = nextSequence();
-        IdSpace.requireInRange(sequence);
+        // ⚠️ IdSpace.requireInRange 抛的是 IllegalArgumentException——那是**编程错误**
+        //   （号算错了），不是「服务暂时不可用」。但在降级路径上，号算错同样意味着
+        //   数据库这个依赖此刻给不出可用区间，对调用方而言是 503 而不是 500。
+        //   因此这里统一包装，让上层只需处理一种异常类型。
+        try {
+            IdSpace.requireInRange(sequence);
+        } catch (IllegalArgumentException e) {
+            throw new ShortCodeGenerationException(
+                    "号段发号越界：序号=" + sequence + " 不在合法区间内（" + e.getMessage() + "）", e);
+        }
         return Base62.encodePadded(sequence);
     }
 
+    /**
+     * 取下一个序号。
+     *
+     * <p>⚠️ 这里把**所有**异常都包装成 {@link ShortCodeGenerationException}（DR-043）：
+     * 号段发号依赖数据库，若取段失败（连接超时、SQL 异常、返回值异常），
+     * 对调用方而言都是「依赖不可用」= 503，而不是「服务有 bug」= 500。
+     * 两者的处置方式完全不同（503 可重试且会自愈，500 需要人介入），
+     * 让基础设施异常漏到兜底 handler 里报 500 会误导告警与排查方向。
+     */
     private long nextSequence() {
+        try {
+            return doNextSequence();
+        } catch (ShortCodeGenerationException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new ShortCodeGenerationException("号段发号失败：" + e.getMessage(), e);
+        }
+    }
+
+    private long doNextSequence() {
         // 首次使用：双检锁保证只取一段，且只由第一个线程推进 current。
         if (!initialized) {
             synchronized (this) {
@@ -142,7 +170,7 @@ public class SegmentShortCodeGenerator implements ShortCodeGenerator {
      * <p>必须持锁调用，保证同一时刻只有一个线程推进 {@code current}。
      */
     private void refillSegment() {
-        long newLimit = allocator.advanceAndGetMaxId();
+        long newLimit = allocator.advanceAndGetNewMaxId();
         if (newLimit > IdSpace.MAX_SEQUENCE) {
             // 号空间用尽：绝不回绕（回绕会让短码重复）。按 DR-022 记 ERROR 并让调用失败。
             log.error("号段区间已用尽：max_id={} 超过 7 位 Base62 上界 {}，必须缩短码长度或扩容",
@@ -151,7 +179,18 @@ public class SegmentShortCodeGenerator implements ShortCodeGenerator {
                     "号段区间用尽（max_id=" + newLimit + " > " + IdSpace.MAX_SEQUENCE + "）");
         }
 
+        // 防御性断言：段首必须为正，且不能小于号段区间的下界（DR-011 的区间划分）。
+        // DR-042 的负序号缺陷正是绕过了这一步才漏到业务层的——
+        // 这里补上，让同类错误在发号器内部就被拦住，而不是变成 500。
         long segmentStart = newLimit - step + 1;
+        if (segmentStart < IdSpace.SEGMENT_FIRST_SEQUENCE) {
+            log.error("号段异常：段首={} 小于号段区间下界 {}（newLimit={} step={}），发号器不可用",
+                    segmentStart, IdSpace.SEGMENT_FIRST_SEQUENCE, newLimit, step);
+            throw new ShortCodeGenerationException(
+                    "号段异常（段首=" + segmentStart + " < " + IdSpace.SEGMENT_FIRST_SEQUENCE
+                            + "），max_id=" + newLimit + " step=" + step);
+        }
+
         current.set(segmentStart);
         limit.set(newLimit);
         initialized = true;
