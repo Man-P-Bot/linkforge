@@ -63,3 +63,45 @@ docker exec linkforge-mysql mysql -ulinkforge -p"$MYSQL_PASSWORD" linkforge \
 docker exec linkforge-mysql mysql -ulinkforge -p"$MYSQL_PASSWORD" linkforge \
   -e "DELETE FROM short_link WHERE id > $BEFORE_ID;"
 ```
+---
+
+## 第2 周（缓存）压测口径补充
+
+**预热在有缓存时是必需项，不是可选项。**
+
+第 2 周没有加单飞（single-flight），冷启动时同一个短码的并发请求会各自回源。
+实测：1 万条数据预热 10s 产生 **32180 次回源**（每条约 3 次）。
+这些回源如果混进正式压测窗口，QPS 与 P99 都会被污染。
+
+实测确认：预热后正式压测窗口的 `shortlink.cache.miss` 增量**为 0**，命中率 100%。
+
+**指标从 actuator 读，不从日志数：**
+
+```bash
+# 三个指标（DR-045）
+curl -s http://localhost:8080/actuator/metrics/shortlink.cache.local.hit
+curl -s http://localhost:8080/actuator/metrics/shortlink.cache.redis.hit
+curl -s http://localhost:8080/actuator/metrics/shortlink.cache.miss
+```
+
+⚠️ **正式窗口的命中率要用「指标差值法」算**——预热阶段的计数会被算进去。
+每次压测前后各读一次指标，两次相减才是窗口内的真实命中数。
+
+⚠️ **压测前必须清空缓存并重启**保证冷启动：
+
+```bash
+docker exec linkforge-redis redis-cli --scan --pattern "shortlink:code:*" \
+  | xargs -r docker exec linkforge-redis redis-cli DEL
+docker compose restart app
+```
+
+不重启的话 Caffeine 里的内容还在，Redis 里被删的 key 会在下次访问时被本地缓存挡回去，
+测出来的就不是「两级缓存冷启动」而是「本地缓存热启动」。
+
+**Redis key 核对（DR-045）：**
+
+```bash
+docker exec linkforge-redis redis-cli --scan --pattern "shortlink:*"
+# shortlink:id:seq            发号器
+# shortlink:code:0000Q0u      跳转缓存（与 ARCHITECTURE.md §206 一致）
+```

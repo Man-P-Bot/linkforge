@@ -80,7 +80,7 @@ D5 的 `RedirectService` 直接依赖 `LinkRepository`，第 2 周改这一处�
 
 ### 构建与测试总数（实测，D6 缺陷修复后）
 `.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，
-**302 个测试 0 失败**（Core 124 + Redirect 150 + App 28）。
+**302 个测试 0 失败**（Core 124 + Redirect 150 + App 28）—— D6 收尾时的快照，第 2 周见下文 343。
 ⚠️ App 的 28 个中有 12 个是 **真实 MySQL 集成测试**，需带
 `RUN_MYBATIS_IT=true` 与 `TEST_MYSQL_PASSWORD` 才会执行（默认跳过）。
 
@@ -276,6 +276,11 @@ insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` In
 | **DR-042** | 号段取段拆成 `advanceMaxId`(返回受影响行数) + `selectMaxId`；**MyBatis `<update>` 不返回 `max_id`** |
 | **DR-043** | 号段发号失败映射 **503** 而非漏到兜底 handler 报 500 |
 | **DR-044** | 未匹配路由映射 **404**（`NoResourceFoundException`）而非漏到兜底 handler 报 500 |
+| **DR-045** | 跳转两级缓存：Caffeine → Redis → MySQL；key `shortlink:code:{shortCode}`；Redis 故障降级为回源 |
+| **DR-046** | Caffeine TTL 5 分钟**由业务不一致窗口决定，不由 Redis TTL 倒推**；maximumSize 10000 是数据量依赖 |
+| **DR-047** | 本地缓存只缓存 Hit——用泛型在**编译期**挡住 NegativeHit，防止刚创建的短码持续 404 达5 分钟 |
+| **DR-048** | 回源异常绝不进缓存；缓存命中也必须走状态判定；evict 顺序先本地后 Redis |
+| **DR-049** | 异常日志必须去重或限流，否则会淹没真实故障信号（第 2 周实证：610 万行 ERROR → 30 条 WARN） |
 
 ### 数据库权限边界（详见 DR-034）
 
@@ -677,3 +682,57 @@ SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPu
 - 已定稿：`docs/PRD.md`（v1.0）、`docs/ROADMAP.md`、`docs/ARCHITECTURE.md`、`docs/DATABASE.md`、`docs/API.md`。
 - 决策记录：`docs/DECISIONS.md` DR-001 ~ DR-017。
 - 关键修正留档：DR-011（短码生成改为发号器 + 固定 7 位，原「雪花 ID → Base62 → 6~8 位」数学上不成立）、DR-012（补活跃短链比例 1% 假设，修正容量估算不自洽）。
+
+---
+
+## D7（第 2 周）：Redis + Caffeine 两级缓存
+
+### 实测结果（与第1 周同口径：同1 万条数据、同 `-t4 -c100`、同 3 次 30s 取中位数）
+
+| 指标 | 第 1 周 | 第 2 周 | 变化 |
+|---|---|---|---|
+| 跳转 QPS | 13426.86 | **81289.94** | **+505.4%（6.05x）** |
+| P50 | 6.59ms | **0.97ms** | **−85.3%** |
+| P99 | 36.32ms | **4.58ms** | **−87.4%** |
+| 正式窗口命中率 | 0% | **100.00%** | — |
+| 非 302 响应 | 0 | **0** | 无回归 |
+| 压测窗口 ERROR | 0 | **0** | — |
+
+**判读**（按压测前预注册的规则，见 PERFORMANCE.md §5.2bis）：提升 505% ≥ 20% → **缓存有效**。
+
+⚠️ **6 倍不能按字面理解**：第 1 周的 13426 是在「整表 20MB 全内存 + `EXPLAIN type=const`」
+下的理想上界，数据库侧几乎没有优化空间可省。这6 倍恰好印证了瓶颈确实在数据库侧；
+生产环境数据库不可全内存时，缓存收益会**更大**（省掉真实磁盘 IO）。
+
+### 关键决策
+
+- **DR-045** 两级结构 + key `shortlink:code:{shortCode}` + 长度前缀序列化 + TTL 抖动 + Redis 故障降级
+- **DR-046** Caffeine TTL 5 分钟**由业务不一致窗口决定，不由 Redis TTL 倒推**；
+  maximumSize 10000 是**数据量依赖**，生产应按「活跃短码数 × 0.1~0.3」重估
+- **DR-047** 本地缓存**只缓存 Hit**，用泛型在编译期挡住 NegativeHit
+- **DR-048** 回源异常绝不进缓存；缓存命中也必须走状态判定；evict 顺序先本地后 Redis
+- **DR-049** 异常日志必须去重或限流——第 2 周的实证：同量级信息从 610 万行ERROR 降到 30 条 WARN
+
+### 降级路径首次真实触发
+
+压测中约 30 条 WARN：`Redis command timed out`（50ms 超时，DR-011基线）→
+缓存自动放弃并回源查库，**无任何请求失败**。这是 DR-045 设计的降级路径首次在生产压测中生效。
+
+### 预热的实测必要性
+
+冷启动预热 10s产生 **32180 次回源**（1 万条数据各回源约 3 次）——这是「第 2 周不加单飞」的代价。
+预热后正式窗口 `miss` 增量为 **0**，命中率 **100%**。
+⚠️ **没有预热，这 32180 次回源会混进压测窗口污染数据**——预热是必需项，不是可选项。
+
+### 顺带兑现
+
+- **healthcheck 升级为 `/actuator/health/readiness`**（ROADMAP 第 5 周 TODO，第 2 周提前兑现）。
+  端点暴露范围最小化为 `metrics,health`，不开 `*`。
+- 三个 Micrometer 指标建成：`shortlink.cache.local.hit` / `.redis.hit` / `.miss`，
+  压测时从 `/actuator/metrics` 直接读，不从日志数。
+
+### 测试
+
+**343 个测试 0 失败**（Core 124 + Redirect 191 + App 28）。
+新增 41 个：RedisRedirectCacheTest（18）、TwoLevelRedirectCacheTest（10）、
+RedirectServiceCacheTest（10）、NoResourceFoundHandlerTest 已在 D6 收尾计入。

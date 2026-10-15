@@ -192,6 +192,11 @@ docker run --rm --network linkforge_default williamyeh/wrk -t12 -c400 -d30s http
 2. 未命中回源 MySQL，存在则回填缓存。
 3. 缓存 Key：`shortlink:code:{shortCode}`；TTL **1 小时 + 随机 0~5 分钟抖动**（防雪崩）。
 4. 缓存异常时回退查库，保证跳转可用（PRD §6.3 降级要求）。
+5. **Caffeine 本地缓存接入第 1 层**（DR-008，RDIS 正结果）。
+6. **空值缓存 30 秒防穿透**；空值**不下沉到本地缓存**（DR-047）。
+7. **三个 Micrometer 指标**：`shortlink.cache.local.hit` / `.redis.hit` / `.miss`，
+   压测时从 `/actuator/metrics` 直接读（不从日志数）。
+8. **healthcheck 升级为 `/actuator/health/readiness`**（下方 TODO 已兑现）。
 
 ### 验收
 
@@ -201,11 +206,21 @@ docker run --rm --network linkforge_default williamyeh/wrk -t12 -c400 -d30s http
 
 ### 对比记录
 
-| 指标 | 第 1 周基线 | 第 2 周 | 变化 |
+| 指标 | 第 1 周基线 | 第 2 周实测 | 变化 |
 |---|---|---|---|
-| QPS | `<填写>` | `<填写>` | `<填写>` |
-| P99 | `<填写>` | `<填写>` | `<填写>` |
-| 命中率 | 0% | `<填写>` | — |
+| QPS | 13426.86 | **81289.94** | **+505.4%（6.05x）** |
+| P50 | 6.59ms | **0.97ms** | **−85.3%** |
+| P99 | 36.32ms | **4.58ms** | **−87.4%** |
+| 命中率（正式窗口） | 0% | **100.00%** | — |
+| 非 302 响应 | 0 | **0** | 无回归 |
+
+✅ **验收全部达成**：命中率 100%（> 95% 阈值）、同环境同脚本同并发、
+清空单key 后回源并回填已在冒烟中验证。
+
+⚠️ **6 倍提升的解读**：第 1 周的 13426 是在「整表20MB 全内存 + `EXPLAIN type=const`」下的
+理想上界，数据库侧几乎没有优化空间可省。这个 6 倍恰好印证了瓶颈确实在数据库侧；
+生产环境数据库不可全内存时，缓存收益会更大（省掉真实磁盘 IO）。
+详见 `docs/PERFORMANCE.md` §5.1 与 §7.1。
 
 ---
 
@@ -289,12 +304,14 @@ curl.exe -s -o NUL -w "%{http_code}" http://localhost:8080/admin/links/<shortCod
 
 ### TODO（第 6 天补记）
 
-- ⏳ **healthcheck 升级为 `/actuator/health/readiness`**：D6 给应用加 `app` 服务时，
+- ✅ **healthcheck 已升级为 `/actuator/health/readiness`**（第 2 周随指标需求引入 actuator 时兑现）。原 TODO 记录：D6 给应用加 `app` 服务时，
   项目尚未引入 `spring-boot-starter-actuator`，因此 healthcheck 只能退化为
   `bash -c '</dev/tcp/localhost/8080'` 探测端口——它只能证明「Tomcat 起来了」，
   **不能证明依赖（MySQL / Redis）可用**，而 `depends_on: service_healthy` 的语义正是后者。
-  引入 actuator 后应改为 `/actuator/health/readiness`（读iness 只报依赖就绪状态，
+  已改为 `/actuator/health/readiness`（readiness 只报依赖就绪状态，
   不会因 liveness 探针误重启），与 `docs/ARCHITECTURE.md` §15.2 一致。
+  实测：容器 `Up (healthy)`，`{"status":"UP"}`。actuator 端点暴露范围已最小化
+  为 `metrics,health`（不开 `*`：env/heapdump 会泄露数据库口令与内存镜像）。
   在此之前，**容器 healthy 不等于应用可服务**，第 1 周的验证仍以真实 curl 为准。
 
 ### 验收（对应 PRD §8）

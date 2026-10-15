@@ -126,11 +126,19 @@ services:
     ports:
       - "${APP_PORT:-8080}:8080"
     healthcheck:
-      # ⚠️ 本项目尚未引入 spring-boot-starter-actuator（/actuator/health 不存在），
-      #    因此健康检查只探测 8080 端口是否已监听——即「Tomcat 起好了」。
-      #    第 1 周的验证靠宿主机 curl 跑真实业务请求，不依赖此检查。
-      #    用 bash 的 /dev/tcp 做无依赖探测：基础镜像里没有 curl/wget，nc 也不一定有。
-      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8080' || exit 1"]
+      # 第 2 周起项目已引入 spring-boot-starter-actuator，
+      # healthcheck 升级为 /actuator/health/readiness（ROADMAP 第 5 周 TODO 已兑现）。
+      # 与之前的 TCP 探测相比，它能证明「MySQL 与 Redis 都可用」，
+      # 而不只是「Tomcat 起来了」——依赖不可用时不该让容器显示 healthy。
+      #
+      # ⚠️ 为什么不用 curl：基础镜像 eclipse-temurin:17-jre-jammy 里没有 curl/wget。
+      # 用 bash 的 /dev/tcp 发一个裸 HTTP 请求，零额外依赖。
+      test:
+        - CMD-SHELL
+        - >-
+          timeout 3 bash -c 'exec 3<>/dev/tcp/localhost/8080 &&
+          printf "GET /actuator/health/readiness HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 &&
+          head -1 <&3 | grep -q "200"'
       interval: 15s
       timeout: 5s
       retries: 5

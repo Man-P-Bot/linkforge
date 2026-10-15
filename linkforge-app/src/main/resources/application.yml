@@ -60,3 +60,26 @@ logging:
     com.linkforge: INFO
     # 第 1 周调 SQL 时临时改成 DEBUG 可打印语句与参数
     com.linkforge.core.infrastructure.persistence: INFO
+
+# Actuator：第 2 周起用于读缓存命中率，第 5 周起作为 Prometheus 抓取源
+# （spring-boot-starter-actuator 已在 linkforge-redirect 引入，
+#   与 shortlink_id_conflict_total 指标同一个 MeterRegistry）
+management:
+  endpoints:
+    web:
+      exposure:
+        # ⚠️ 刻意只暴露 metrics 与 health，不开 '*'。
+        # env / configprops / heapdump 会泄露数据库口令、JVM 内存镜像等内容，
+        # 本项目没有网络隔离层，必须显式最小化。
+        include: metrics,health
+  endpoint:
+    health:
+      # 显式暴露 readiness 供 compose healthcheck 用（ROADMAP 第 5 周 TODO 的兑现）：
+      # TCP 探测只能证明 Tomcat 起来了，不能证明 MySQL/Redis 可用。
+      probes:
+        enabled: true
+      show-details: never
+  metrics:
+    tags:
+      # 第 5 周 Prometheus 按 application 维度区分时用
+      application: linkforge
