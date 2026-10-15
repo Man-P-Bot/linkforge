@@ -16,6 +16,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * 统一异常处理（docs/API.md §3.3）。
@@ -109,6 +110,31 @@ public class GlobalExceptionHandler {
         log.error("发号失败（{}）：{}", code.code(), e.getMessage(), e);
         return ResponseEntity.status(code.httpStatus())
                 .body(errorBody(code, code.defaultMessage(), null));
+    }
+
+    /**
+     * 未匹配到任何路由（{@code NoResourceFoundException}）。
+     *
+     * <p>映射到 404 {@code LINKFORGE-404-01}，与短码查询路径的「短码不存在」用同一个错误码——
+     * 调用方看到 404 就知道「这个地址没有可跳转的东西」，不需要区分是路径写错还是短码不存在。
+     *
+     * <p>⚠️ <b>为什么必须显式映射</b>：Spring 6 起用 {@code NoResourceFoundException}
+     * 替代已废弃的 {@code NoHandlerFoundException}，它由静态资源处理器抛出，
+     * <b>不会</b>被 {@code @ExceptionHandler(Exception.class)} 之外的任何默认机制接住，
+     * 于是掉进兜底 handler 变成 500。500 的语义是「服务有 bug」——
+     * 而用户只是敲错了一个地址，把服务标成故障会污染告警与可用性指标。
+     *
+     * <p>⚠️ <b>为什么记 404 而不是降级为「不处理」</b>：不处理的话 Spring 会走
+     * {@code /error} 分发再进兜底，结果一样是 500 + 一次多余的转发。
+     *
+     * <p>D6 实测教训：修复前该缺陷在压测间隙的 2 分钟内产生了 122042 条 ERROR 级日志
+     * （每次请求 50 行堆栈），把错误日志彻底淹掉。404 属于正常业务语义，记 WARN 不记栈。
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNoResource(NoResourceFoundException e) {
+        log.warn("未匹配到路由：{}", e.getResourcePath());
+        return ResponseEntity.status(ErrorCode.LINK_NOT_FOUND.httpStatus())
+                .body(errorBody(ErrorCode.LINK_NOT_FOUND, ErrorCode.LINK_NOT_FOUND.defaultMessage(), null));
     }
 
     /** 兜底：未预期异常一律 500，**不泄露内部细节**。 */

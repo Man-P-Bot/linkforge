@@ -80,7 +80,7 @@ D5 的 `RedirectService` 直接依赖 `LinkRepository`，第 2 周改这一处�
 
 ### 构建与测试总数（实测，D6 缺陷修复后）
 `.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，
-**298 个测试 0 失败**（Core 124 + Redirect 146 + App 28）。
+**302 个测试 0 失败**（Core 124 + Redirect 150 + App 28）。
 ⚠️ App 的 28 个中有 12 个是 **真实 MySQL 集成测试**，需带
 `RUN_MYBATIS_IT=true` 与 `TEST_MYSQL_PASSWORD` 才会执行（默认跳过）。
 
@@ -121,10 +121,22 @@ ci 让等价域名**合并**（正确归一），敏感会让它们**分裂**（
 | 正式压测 3×30s | ✅ QPS **13426**（中位数），P50 **6.59ms**，P99 **36.32ms** |
 | 压测窗口应用错误 | ✅ **0** |
 | 数据清理 | ✅ `DELETE WHERE id > before_id`，保留 D5 手工记录（9 行） |
-| 构建测试 | ✅ **298 个测试 0 失败** |
+| 构建测试 | ✅ **302 个测试 0 失败** |
 
-**⚠️ 遗留已知缺陷**：`GET /`（根路径）返回 **500** 而非 404
-（`NoResourceFoundException` 落到兜底 handler）。不影响跳转基线，第 2 周前应修。
+**⚠️ 基线解读（新增 §5）**：13426 QPS 是「1 万条数据 + 全内存 + 常数级索引查找」下的
+**理想上界**，不是无缓存的真实生产水平。整表约 20 MB，InnoDB 全内存命中、零磁盘 IO，
+`EXPLAIN type=const`。**不要用它做容量规划**，详见 `docs/PERFORMANCE.md` §5。
+
+**✅ 遗留缺陷已修（DR-044）**：`GET /`（根路径）曾返回 **500** 而非 404
+（`NoResourceFoundException` 落到兜底 handler）。已补
+`@ExceptionHandler(NoResourceFoundException.class)` → 404 + `LINKFORGE-404-01`，
+`NoResourceFoundHandlerTest` 4 个测试覆盖；实测 `GET /`、`GET /nope`、
+`GET /api/v1/unknown` 均返回 404，跳转路径 302 未回归。
+
+**核实结论**：压测前那 122042 条 `NoResourceFoundException` **全部落在 22:13~22:14，
+压测窗口（22:16:23/ 22:16:56 / 22:17:29）内0 条**，基线数据未受污染，无需重跑。
+起因是 wrk 脚本的一版把路径写成了根路径 `/`（`No static resource .`），
+并非此前推测的「`-s /dev/null` 探针」——**此前归因错误，已纠正**。
 
 ### D6 契约修正：成功响应套 `data` 外壳（DR-039）
 
@@ -263,6 +275,7 @@ insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` In
 | **DR-041** | `referer_domain` **保持** `utf8mb4_0900_ai_ci`——「唯一键从严」的直觉在此是错的，记录以防改回去 |
 | **DR-042** | 号段取段拆成 `advanceMaxId`(返回受影响行数) + `selectMaxId`；**MyBatis `<update>` 不返回 `max_id`** |
 | **DR-043** | 号段发号失败映射 **503** 而非漏到兜底 handler 报 500 |
+| **DR-044** | 未匹配路由映射 **404**（`NoResourceFoundException`）而非漏到兜底 handler 报 500 |
 
 ### 数据库权限边界（详见 DR-034）
 

@@ -1127,3 +1127,34 @@
   浪费排查时间。新增基础设施异常类型时，**必须同时确认它有明确的 HTTP 语义映射**。
 - **实现要点**：兜底 handler 只应在「确实没有更精确的映射」时兜底，
   它不是「所有异常都该进这里」的许可。
+
+## DR-044 未匹配路由映射 404（NoResourceFoundException）
+
+- **背景**：D6 收尾时发现 `GET /` 返回 **500 + LINKFORGE-500-01**，而按 API.md 应为 404。
+- **根因**：Spring 6.1起静态资源处理器在路径无匹配时抛
+  `org.springframework.web.servlet.resource.NoResourceFoundException`
+  （取代已废弃的 `NoHandlerFoundException`）。本项目没引actuator、也没有静态资源目录，
+  该异常直接落到 `GlobalExceptionHandler` 的兜底 handler，被报成 500。
+- **决策**：`GlobalExceptionHandler` 新增
+  `@ExceptionHandler(NoResourceFoundException.class)` → **404 `LINKFORGE-404-01`**，
+  与短码查询路径的「短码不存在」用同一个错误码。
+  日志级别 **WARN 且不打堆栈**（404 是正常业务语义，不是故障）。
+- **理由**：
+  1. 500 的语义是「服务有 bug，需要人介入」。用户敲错一个地址就把服务标成故障，
+     会污染告警与可用性指标；
+  2. 与短码查询共用404-01，调用方只需判断「404 = 没有可跳转的东西」，
+     不必区分是路径写错还是短码不存在；
+  3. 不处理的话Spring 会走 `/error` 分发再进兜底，结果一样是 500 + 一次多余转发。
+- **实测代价**：该缺陷在 D6 压测间隙的 2 分钟内产生了 **122042 条 ERROR 级日志**
+  （每次请求约 50 行堆栈，共 610 万行），把真正的错误日志彻底淹没——
+  这是「基础设施/框架异常必须显式映射」的又一个实例（与 DR-043 同源）。
+- **回归测试**：`NoResourceFoundHandlerTest`（4 个）
+  - `unmappedPathReturns404Not500`
+  - `usesSameErrorCodeAsShortCodeLookup`
+  - `doesNotLeakInternals`
+  - `doesNotWrapFailureInDataEnvelope`
+- **⚠️ 测试写法说明**：用 `standaloneSetup` +显式 `setControllerAdvice`，
+  而不是 `@WebMvcTest`。原因是本测试要验证的是**handler 对该异常类型的映射**，
+  而 `@WebMvcTest` 下未匹配路径抛哪种异常会随上下文装配变化
+  （限定 `@ContextConfiguration` 时不加载静态资源处理器，异常类型会变），
+  那测的是框架装配细节而非本项目的映射逻辑。
