@@ -13,7 +13,7 @@
 |---|---|
 | 容器状态 | ✅ `linkforge-mysql` / `linkforge-redis` 均 **healthy** |
 | 应用启动 | ✅ Tomcat **8080**，`Started LinkForgeApplication in 4.259 seconds` |
-| 启动日志 | ✅ **无 ERROR**（仅一条已知的 Flyway schema history 重建 WARN，见下） |
+| 启动日志 | ✅ **无 ERROR**（曾观察到一条来源未定位的 Flyway WARN，见下） |
 | ① 创建短链 | ✅ `201`，`shortCode = 0000Q0u`（7 位 Base62），`createdAt = 2026-10-14T21:40:03+08:00` |
 | ② **跳转** | ✅ `302`，`Location: https://example.com/very/long/path`，`Cache-Control: no-store`，**body 0 字节** |
 | ③ 不存在的短码 | ✅ `404` + `LINKFORGE-404-01` |
@@ -38,8 +38,23 @@ Spring 6 默认**不匹配尾斜杠**，若只注册 `GET /{code}`，`/0000Q0u/`
 「找不到处理器」的 404 —— 状态码看似对，但 body 不是统一错误体，属于契约违规。
 实测加了显式映射后才拿到 `400 + LINKFORGE-400-01`。
 
-**已知无害 WARN**：Flyway 报 `Detected 2 non-empty schema history table(s)`，
-原因是 D4 集成测试曾把 Flyway 元数据写进 `linkforge_test` 库。不影响业务，暂不处理。
+**启动时曾观察到的一条 WARN（真实来源未定位，记录在案）**：
+启动日志中曾出现 `Detected 2 non-empty schema history table(s)`。
+**初版归因「D4 集成测试污染 `linkforge` 库」已被实测推翻**——Flyway 按库工作，
+`linkforge_test` 的元数据不会触发 `linkforge` 库的该条告警。实测结论：
+
+| 排查项 | 结果 |
+|---|---|
+| 两个 non-empty schema | `linkforge` 与 `linkforge_test`，**两库各 1 张** `flyway_schema_history`（均 V1/V2，`success=1`） |
+| 是否同一物理库的不同 schema | ❌ 不是。`application.yml` → `linkforge`，`application-test.yml` → `linkforge_test`，是**同一 MySQL 实例下的两个独立库**，各自独立连接串与连接池 |
+| 主配置是否有交叉路径 | ❌ 无。主配置不含任何指向 `linkforge_test` 的路径 |
+| 能否复现 | ❌ **不能**。连续 3 次冷启动（全新 JVM）日志完全一致，该消息再未出现 |
+| 是否 Flyway 输出 | ❌ 不是。在 `flyway-core-11.7.2.jar` / `flyway-mysql-11.7.2.jar` 字节码常量池中全文搜索该文案：**零匹配** |
+
+**结论**：真实来源未定位。当前启动日志**不含 ERROR**，迁移正常
+（`Current version of schema 'linkforge': 2`、up to date），**不影响迁移，也不影响 D6 压测**
+（D6 用 `linkforge` 库，与 `application-test.yml` 是两条独立路径）。**不做修复**——
+不为一条复现不出的现象改配置。
 
 ### D5 跳转接口（已完成）
 
@@ -63,9 +78,42 @@ Spring 6 默认**不匹配尾斜杠**，若只注册 `GET /{code}`，`/0000Q0u/`
 D5 的 `RedirectService` 直接依赖 `LinkRepository`，第 2 周改这一处依赖即可（局部改动，非架构改动）。
 理由：为猜不准的需求提前建抽象往往要返工——KISS，现在只需要「查库 → 跳转」。
 
-### 构建与测试总数（实测，D5 后）
+### 构建与测试总数（实测，D6 契约修正后）
 `.\mvnw.cmd clean install` → **BUILD SUCCESS**，6/6 模块，
-**285 个测试 0 失败**（Core 124 + Redirect 145 + App 16）。
+**286 个测试 0 失败**（Core 124 + Redirect 146 + App 16，
+App 的 13 个 MyBatis 集成测试按 `RUN_MYBATIS_IT` 设计跳过）。
+
+### D6 契约修正：成功响应套 `data` 外壳（DR-039）
+
+**偏差**：实现返回扁平 `{"shortCode":...}`，而 API.md §3.3 / §5.3 定义的是
+`{"data": {...}, "timestamp": "..."}`。**以 API.md 为准，改代码不改文档。**
+
+**核对结论（三处）**：
+| 项 | API.md 定义 | 修正前实现 | 修正后 |
+|---|---|---|---|
+| 成功响应 §3.3/§5.3 | `{"data":{...},"timestamp":...}` | ❌ 扁平，无 `data`、无 `timestamp` | ✅ 一致 |
+| 失败响应 §3.3 | `{"code","message","timestamp","details"?}` | ✅ 已一致 | ✅ **不动** |
+
+**改动**：
+- 新增 `redirect/api/dto/ApiResponse<T>`（协议外壳，与业务 DTO 分离）；
+- `LinkController.create` 返回 `ResponseEntity<ApiResponse<CreateLinkResponse>>`，
+  构造签名增加 `ZoneId`（外壳的 `timestamp` 需要展示时区）；
+- `LinkControllerTest` jsonPath 从 `$.xxx` 改为 `$.data.xxx`，
+  **新增** `topLevelHasOnlyDataAndTimestamp`（断言旧扁平字段不再出现于顶层）。
+
+**实测（容器化，DR-039 生效）**：
+```
+POST /api/v1/links → 201
+{"data":{"shortCode":"0000Q10","shortUrl":"http://localhost:8080/0000Q10",
+  "targetUrl":"https://example.com/envelope/verify","custom":false,
+  "expireAt":null,"createdAt":"2026-10-15T20:50:06+08:00"},
+ "timestamp":"2026-10-15T20:50:06.558834417+08:00"}
+
+GET  /zzzzzzz        → 404 {"code":"LINKFORGE-404-01","message":"短码不存在: zzzzzzz","timestamp":...}
+POST /api/v1/links {} → 400 {"code":"LINKFORGE-400-01","message":"请求参数校验失败",
+                            "timestamp":...,"details":{"targetUrl":"targetUrl 不能为空"}}
+```
+失败体确认**不套 `data`**，且 `details` 在参数校验类错误中如期出现（API.md §3.3）。
 
 ### D4 启动验证结果（✅ 全部通过，D4 正式完成）
 
@@ -166,6 +214,8 @@ insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` In
 | **DR-035** | `.env` 中的 root 凭据是待收紧项（v1 保留不动，v2 或第 5 周处理）；**已补记当前状态表**：本地放宽 / 生产只 DML / D5 后评估是否收紧 |
 | **DR-036** | D5 不引入跳转缓存，且**不预建缓存接口**（第 2 周与 `RedisRedirectCache` 一起写） |
 | **DR-037** | 路径短码「字符/尾斜杠 → 400、长度不符 → 404」及**字符检查先于长度检查**的判定顺序 |
+| **DR-038** | GC 日志统一用 `-Xlog:gc*`；`-XX:+PrintGCDetails`（JDK 17 已废弃）仅作历史记录，**保留是为了口径不漂移** |
+| **DR-039** | 成功响应统一套 `{"data":{...},"timestamp":...}` 外壳（API.md §3.3），**失败响应不套** |
 
 ### 数据库权限边界（详见 DR-034）
 

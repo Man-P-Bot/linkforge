@@ -69,7 +69,7 @@ class LinkControllerTest {
     class Created {
 
         @Test
-        @DisplayName("返回 201，body 含 shortCode/shortUrl/custom/expireAt/createdAt")
+        @DisplayName("返回 201，body 为统一外壳 {data:{...}, timestamp}（API.md §3.3）")
         void returns201WithBody() throws Exception {
             given(linkCreationService.create(any())).willReturn(new CreateLinkResponse(
                     "0000Q0u",
@@ -83,15 +83,36 @@ class LinkControllerTest {
                             .contentType(MediaType.APPLICATION_JSON)
                             .content(VALID_BODY))
                     .andExpect(status().isCreated())
-                    .andExpect(jsonPath("$.shortCode").value("0000Q0u"))
-                    .andExpect(jsonPath("$.shortUrl").value("http://localhost:8080/0000Q0u"))
-                    .andExpect(jsonPath("$.targetUrl").value("https://example.com/very/long/path"))
-                    .andExpect(jsonPath("$.custom").value(false))
-                    .andExpect(jsonPath("$.expireAt").doesNotExist());
+                    .andExpect(jsonPath("$.data.shortCode").value("0000Q0u"))
+                    .andExpect(jsonPath("$.data.shortUrl").value("http://localhost:8080/0000Q0u"))
+                    .andExpect(jsonPath("$.data.targetUrl").value("https://example.com/very/long/path"))
+                    .andExpect(jsonPath("$.data.custom").value(false))
+                    .andExpect(jsonPath("$.data.expireAt").doesNotExist())
+                    // 外壳自带 timestamp（API.md §3.3 成功响应含 timestamp）
+                    .andExpect(jsonPath("$.timestamp").exists());
         }
 
         @Test
-        @DisplayName("⭐ 响应体不含数据库内部 id（API.md §5.3 明确要求不外泄）")
+        @DisplayName("⭐ 业务字段一律在 data 下，顶层只有 data 与 timestamp 两个键")
+        void topLevelHasOnlyDataAndTimestamp() throws Exception {
+            given(linkCreationService.create(any())).willReturn(new CreateLinkResponse(
+                    "0000Q0u", "http://localhost:8080/0000Q0u", "https://example.com/x",
+                    false, null, OffsetDateTime.parse("2026-01-15T10:30:00+08:00")));
+
+            mockMvc.perform(post("/api/v1/links")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(VALID_BODY))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data").exists())
+                    .andExpect(jsonPath("$.timestamp").exists())
+                    // 旧版扁平结构已移除：业务字段不得再出现在顶层
+                    .andExpect(jsonPath("$.shortCode").doesNotExist())
+                    .andExpect(jsonPath("$.shortUrl").doesNotExist())
+                    .andExpect(jsonPath("$.targetUrl").doesNotExist());
+        }
+
+        @Test
+        @DisplayName("⭐ data 内不含数据库内部 id（API.md §5.3 明确要求不外泄）")
         void doesNotLeakInternalId() throws Exception {
             given(linkCreationService.create(any())).willReturn(new CreateLinkResponse(
                     "0000Q0u", "http://localhost:8080/0000Q0u", "https://example.com/x",
@@ -101,6 +122,9 @@ class LinkControllerTest {
                             .contentType(MediaType.APPLICATION_JSON)
                             .content(VALID_BODY))
                     .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data.id").doesNotExist())
+                    .andExpect(jsonPath("$.data.status").doesNotExist())
+                    // id 也不得泄漏到顶层
                     .andExpect(jsonPath("$.id").doesNotExist())
                     .andExpect(jsonPath("$.status").doesNotExist());
         }

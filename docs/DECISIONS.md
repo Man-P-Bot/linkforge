@@ -989,3 +989,40 @@
   因此 `RedirectController` **显式注册 `/{code}/`** 并抛 400，保证契约写明的行为真的发生。
 - **影响**：规则收在 `core` 的 `ShortCodeFormat`（纯格式判定，不抛异常），
   错误码映射在 `LinkValidator`，`RedirectController` 对尾斜杠直接拒绝且不查库。
+
+## DR-038 GC 日志统一用 `-Xlog:gc*`，`-XX:+PrintGCDetails` 仅作历史记录
+
+- **决策**：性能基线与调优阶段的 GC 日志**统一用 `-Xlog:gc*` 输出**（JDK 9+ 的正式方案）；
+  `-XX:+PrintGCDetails` 虽在 `JAVA_OPTS` 中保留，但**仅作历史记录**，不作为分析依据。
+- **理由**：
+  1. `-XX:+PrintGCDetails` 在 **JDK 9 起已废弃**，JDK 17 启动时会打印
+     `PrintGCDetails is deprecated. Will use -Xlog:gc* instead.`。
+     保留一个「被 JDK 明确告知已废弃」的参数，会让读日志的人误以为它在生效。
+  2. `-Xlog:gc*` 可指定输出目标与装饰器（`file=/dev/stdout:time,uptime,level,tags`），
+     能把 GC 日志直接送进容器日志，`docker compose logs app` 即可取到；
+     旧参数只能写文件，容器里还得额外挂卷捞。
+  3. **保留旧参数是为了口径不漂移**：D6 决策 Q2 原文写的是 `-XX:+PrintGCDetails`。
+     若基线阶段就悄悄换成新参数，第 5 周回看基线报告时无法判断 GC 差异来自参数变更还是来自代码。
+     因此**基线阶段的 `JAVA_OPTS` 与决策原文保持一致**，同时**追加** `-Xlog:gc*` 让日志真的落到日志流。
+- **⚠️ 何时可以删掉 `-XX:+PrintGCDetails`**：第 5 周做调优对比时，
+  应在报告里显式声明「基线含废弃参数、结果不含」，且两边的 GC 日志均取自 `-Xlog:gc*`，
+  之后再移除。**提前移除会让基线与结果不可比**。
+- **影响**：`Dockerfile` 的 `JAVA_OPTS` 与 `docker-compose.yml` 的 `JAVA_OPTS` 同步携带两者；
+  分析 GC 行为时只读 `-Xlog:gc*` 的行，忽略 `PrintGCDetails` 的 deprecation warning。
+
+## DR-039 成功响应统一套 `data` 外壳，失败响应不套
+
+- **决策**：创建接口的成功响应改为 API.md §3.3 定义的
+  `{"data": {...}, "timestamp": "..."}`；**失败响应保持** `{code, message, timestamp, details?}` **不套外壳**。
+- **理由**：
+  1. **契约以 API.md 为准**：§3.3 与 §5.3 都写明成功响应有 `data` 层，
+     而实现此前返回扁平结构——是实现偏离契约，不是契约写错。
+  2. **失败不套外壳是 API.md 的原文约定**，不是遗漏。失败时没有业务数据，
+     硬套一个 `data: null` 只会让调用方多写一层判空。
+  3. **外壳与 DTO 分离**：`ApiResponse<T>` 是协议，`CreateLinkResponse` 是业务。
+     第 4 周查询接口、第 3 周 admin 接口只需换 DTO，外壳复用同一份。
+- **实现要点**：`timestamp` 在**外壳**上而非 `data` 里——它标记「响应生成时间」而非业务字段，
+  放进 data 会让各接口的 data 内容不一致。
+- **影响**：新增 `redirect/api/dto/ApiResponse`；`LinkController` 构造签名增加 `ZoneId`；
+  `LinkControllerTest` 的 jsonPath 断言从 `$.xxx` 改为 `$.data.xxx`，
+  并新增「顶层只有 data 与 timestamp」的结构测试。

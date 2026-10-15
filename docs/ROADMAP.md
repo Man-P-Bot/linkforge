@@ -287,6 +287,16 @@ curl.exe -s -o NUL -w "%{http_code}" http://localhost:8080/admin/links/<shortCod
 5. **一键部署**：`docker compose up` 起应用 + MySQL + Redis（PRD A-1）。
 6. **最终对比报告**：第 1 周基线 → 第 5 周结果，同一脚本、同一环境。
 
+### TODO（第 6 天补记）
+
+- ⏳ **healthcheck 升级为 `/actuator/health/readiness`**：D6 给应用加 `app` 服务时，
+  项目尚未引入 `spring-boot-starter-actuator`，因此 healthcheck 只能退化为
+  `bash -c '</dev/tcp/localhost/8080'` 探测端口——它只能证明「Tomcat 起来了」，
+  **不能证明依赖（MySQL / Redis）可用**，而 `depends_on: service_healthy` 的语义正是后者。
+  引入 actuator 后应改为 `/actuator/health/readiness`（读iness 只报依赖就绪状态，
+  不会因 liveness 探针误重启），与 `docs/ARCHITECTURE.md` §15.2 一致。
+  在此之前，**容器 healthy 不等于应用可服务**，第 1 周的验证仍以真实 curl 为准。
+
 ### 验收（对应 PRD §8）
 
 | PRD 编号 | 验收内容 | 验证方式 |

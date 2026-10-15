@@ -1,9 +1,11 @@
 package com.linkforge.redirect.api;
 
+import com.linkforge.redirect.api.dto.ApiResponse;
 import com.linkforge.redirect.api.dto.CreateLinkRequest;
 import com.linkforge.redirect.api.dto.CreateLinkResponse;
 import com.linkforge.redirect.application.LinkCreationService;
 import jakarta.validation.Valid;
+import java.time.ZoneId;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -18,6 +20,10 @@ import org.springframework.web.bind.annotation.RestController;
  * 调用用例、返回状态码。校验规则、发号、拼接、事务都在
  * {@link LinkCreationService}（ARCHITECTURE §4 的分层约束）。
  *
+ * <p>响应体用统一外壳 {@link ApiResponse} 包裹（API.md §3.3）：
+ * {@code {"data": {...}, "timestamp": "..."}}。失败响应<b>不套</b>这一层，
+ * 走 {@code GlobalExceptionHandler} 的 {@code {code, message, timestamp, details}}。
+ *
  * <p>返回 <b>201 Created</b>（API.md §5.3 定稿）。
  * <b>刻意不加 {@code Location} 头</b>（DR-028）：指向 {@code shortUrl} 语义混乱
  * （那是给最终用户点击的跳转入口，不是本 API 的资源端点），而指向
@@ -29,14 +35,18 @@ import org.springframework.web.bind.annotation.RestController;
 public class LinkController {
 
     private final LinkCreationService linkCreationService;
+    private final ZoneId displayZone;
 
-    public LinkController(LinkCreationService linkCreationService) {
+    public LinkController(LinkCreationService linkCreationService, ZoneId displayZone) {
         this.linkCreationService = linkCreationService;
+        this.displayZone = displayZone;
     }
 
     @PostMapping
-    public ResponseEntity<CreateLinkResponse> create(@Valid @RequestBody CreateLinkRequest request) {
+    public ResponseEntity<ApiResponse<CreateLinkResponse>> create(
+            @Valid @RequestBody CreateLinkRequest request) {
         CreateLinkResponse response = linkCreationService.create(request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.of(response, displayZone));
     }
 }
