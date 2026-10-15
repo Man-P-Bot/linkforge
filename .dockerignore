@@ -1,0 +1,30 @@
+# 构建镜像时不需要的东西（减小构建上下文，避免把宿主机产物带进镜像）
+
+# 本地 Maven 仓库（.mvn/maven.config 指定 -Dmaven.repo.local=.mvn-repo）
+# 镜像内会重新解析依赖，带上它只会让上下文膨胀到数 GB
+.mvn-repo/
+
+# 构建产物：镜像内用 ./mvnw clean package 重新构建
+target/
+**/target/
+
+# 版本控制与 IDE
+.git/
+.gitignore
+.idea/
+*.iml
+.vscode/
+
+# 本地环境变量与数据（含真实口令，禁止进镜像）
+.env
+docker/mysql/data/
+docker/redis/data/
+
+# 文档与脚本：运行镜像不需要
+docs/
+scripts/
+*.md
+
+# 日志与临时文件
+*.log
+logs/

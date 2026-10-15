@@ -75,6 +75,68 @@ services:
       retries: 5
       start_period: 10s
 
+# ===========================================================================
+  # app —— 应用（第 6 天起，见 docs/PERFORMANCE.md §基线口径）
+  #
+  # 为什么第 1 周就把应用放进容器：第 5 周必然容器化。两周若一个跑宿主 JVM、一个跑容器 JVM，
+  # CPU 配额与网络栈不同，优化前后的比值不成立。口径必须从一开始就一致。
+  #
+  # 启动：docker compose up -d --build app
+  # 验证：docker compose logs -f app
+  # ===========================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: linkforge-app:0.1.0
+    container_name: linkforge-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # ⚠️ 容器内连 mysql:3306，不是 3307。3307 是宿主机侧的映射端口，
+      #    在 compose 网络内服务名 + 容器端口才是正确地址。
+      # ⚠️ 时区参数一个都不能少（DR-032）：connectionTimeZone=UTC +
+      #    forceConnectionTimeZoneToSession=true。漏掉会出现「宿主机正常、容器内差 8 小时」。
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:?MYSQL_DATABASE 未设置}?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&characterEncoding=utf8"
+      MYSQL_USER: ${MYSQL_USER:?MYSQL_USER 未设置}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD 未设置}
+      # redis 是服务名；容器里的 localhost 指向应用容器自身，会连不上（DR-003）
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      APP_PORT: 8080
+      # 对外基地址：宿主机通过 8080 访问，所以这里仍是 localhost 而非服务名
+      SHORTLINK_BASE_URL: ${SHORTLINK_BASE_URL:?SHORTLINK_BASE_URL 未设置}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?ADMIN_API_TOKEN 未设置}
+      RATE_LIMIT_REDIRECT_PER_SEC: ${RATE_LIMIT_REDIRECT_PER_SEC:-20}
+      RATE_LIMIT_CREATE_PER_MIN: ${RATE_LIMIT_CREATE_PER_MIN:-10}
+      RATE_LIMIT_QUERY_PER_MIN: ${RATE_LIMIT_QUERY_PER_MIN:-60}
+      RATE_LIMIT_ADMIN_PER_MIN: ${RATE_LIMIT_ADMIN_PER_MIN:-30}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
+      CACHE_NULL_TTL_SECONDS: ${CACHE_NULL_TTL_SECONDS:-30}
+      STATS_DEFAULT_RANGE_DAYS: ${STATS_DEFAULT_RANGE_DAYS:-7}
+      STATS_MAX_RANGE_DAYS: ${STATS_MAX_RANGE_DAYS:-90}
+      RESERVED_CODES: ${RESERVED_CODES:-api,admin,actuator,health,favicon.ico,static,error}
+      # 固定堆 + G1 + GC 日志（D6 决策 Q2）：基线必须可复现，
+      # 不固定堆则第 2 周调优时「堆大小」会混进「代码优化」的效果里。
+      JAVA_OPTS: "-Xms1g -Xmx1g -XX:+UseG1GC -XX:+PrintGCDetails -Xlog:gc*:file=/dev/stdout:time,uptime,level,tags"
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      # ⚠️ 本项目尚未引入 spring-boot-starter-actuator（/actuator/health 不存在），
+      #    因此健康检查只探测 8080 端口是否已监听——即「Tomcat 起好了」。
+      #    第 1 周的验证靠宿主机 curl 跑真实业务请求，不依赖此检查。
+      #    用 bash 的 /dev/tcp 做无依赖探测：基础镜像里没有 curl/wget，nc 也不一定有。
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8080' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # 首次启动要等 JVM 起来 + Flyway 迁移完成，start_period 内失败不计入 retries
+      start_period: 60s
+
 volumes:
   mysql-data:
     name: linkforge-mysql-data
