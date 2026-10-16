@@ -15,10 +15,11 @@ import com.linkforge.core.domain.ReservedCodes;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.linkforge.core.infrastructure.cache.BloomFilter;
 import com.linkforge.core.infrastructure.cache.CacheEntry;
+import com.linkforge.core.infrastructure.cache.CacheKeys;
 import com.linkforge.core.infrastructure.cache.CachedLink;
 import com.linkforge.core.repository.LinkRepository;
+import com.linkforge.redirect.infrastructure.cache.RedisBloomFilter;
 import com.linkforge.redirect.infrastructure.cache.RedisRedirectCache;
 import com.linkforge.redirect.infrastructure.cache.TwoLevelRedirectCache;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -75,44 +76,73 @@ class RedirectServiceCacheTest {
     private final List<String> putKeys = new ArrayList<>();
     private final List<String> emptyKeys = new ArrayList<>();
 
+    /**
+     * 可编程的布隆替身。
+     *
+     * <p>合并路径下 L2 的值由 Lua 脚本直接带回来（{@code checkAndGet}），
+     * 不再经过 {@code redis.get}。因此本类要控制「L2 里有什么」，
+     * 得通过这个替身 + {@code parseCached} 两处一起设。
+     *
+     * <p>本类验证的是**跳转侧的缓存语义**（命中不查库 / 异常不进缓存 /
+     * 命中也走状态判定），布隆自身的判否与往返次数由
+     * {@code BloomMergedRoundTripTest} 覆盖。
+     */
+    private static final class ControllableBloom extends RedisBloomFilter {
+        /** null = 需回源；__EMPTY__ = 已缓存不存在；其它 = L2 的原始值。 */
+        private String l2Value = null;
+        private boolean definitelyAbsent = false;
+
+        ControllableBloom() {
+            super(null, new SimpleMeterRegistry());
+        }
+
+        @Override
+        public RedisBloomFilter.BloomCheckResult checkAndGet(String shortCode) {
+            if (definitelyAbsent) {
+                return RedisBloomFilter.BloomCheckResult.absent();
+            }
+            // ⚠️ 嵌套类型要用外层限定：BloomCheckResult 是 RedisBloomFilter 的 record，
+            // 在它的子类里写裸名会找不到符号
+            return l2Value == null
+                    ? RedisBloomFilter.BloomCheckResult.source()
+                    : RedisBloomFilter.BloomCheckResult.cached(l2Value);
+        }
+    }
+
+    private final ControllableBloom bloom = new ControllableBloom();
+
     private RedirectService service() {
         return new RedirectService(linkRepository, validator,
                 new TwoLevelRedirectCache(
                         Caffeine.newBuilder().maximumSize(1).build(),
-                        redisGateway, registry),
-                bloomAlwaysPresent, Clock.fixed(NOW, ZoneOffset.UTC));
+                        redisGateway, bloom, registry),
+                Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
-    private static final BloomFilter bloomAlwaysPresent = new BloomFilter() {
-        @Override
-        public boolean mightContain(String shortCode) {
-            return true;
-        }
+    /** 让下一次请求「L2 里有一个 ACTIVE 且未过期的值」。 */
+    private void givenCachedInL2(String targetUrl) {
+        givenCachedInL2(targetUrl, LinkStatus.ACTIVE, null);
+    }
 
-        @Override
-        public void put(String shortCode) {
-        }
+    /**
+     * 让下一次请求「L2 里有指定状态与过期时间的值」。
+     *
+     * <p>⚠️ 状态与expireAt 必须在缓存里带上——跳转判定依赖它们，
+     * 若缓存只存 targetUrl，命中时就没法区分 302/404/410（DR-048）。
+     */
+    private void givenCachedInL2(String targetUrl, LinkStatus status,
+                                 LocalDateTime expireAtUtc) {
+        String raw = "v1|" + status.name() + "|" + (expireAtUtc == null ? "" : expireAtUtc)
+                + "|" + targetUrl.length() + "|" + targetUrl;
+        bloom.l2Value = raw;
+        given(redisGateway.parseCached(CODE, raw)).willReturn(
+                new CachedLink(targetUrl, status.name(), expireAtUtc));
+    }
 
-        @Override
-        public boolean isReady() {
-            return true;
-        }
-
-        @Override
-        public long expectedInsertions() {
-            return 0L;
-        }
-
-        @Override
-        public long bitSize() {
-            return 0L;
-        }
-
-        @Override
-        public int hashFunctions() {
-            return 0;
-        }
-    };
+    /** 让下一次请求走回源。 */
+    private void givenNeedsSource() {
+        bloom.l2Value = null;
+    }
 
     private static Link link(LinkStatus status, LocalDateTime expireAt) {
         return new Link(1L, CODE, "https://example.com/target", status, false,
@@ -124,8 +154,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 场景 8：缓存命中 → 仓储零调用")
     void cacheHitSkipsRepository() {
-        given(redisGateway.get(CODE)).willReturn(Optional.of(
-                new CacheEntry.Hit(new CachedLink("https://example.com/cached", "ACTIVE", null))));
+        givenCachedInL2("https://example.com/cached");
 
         assertThat(service().resolveTargetUrl(CODE)).isEqualTo("https://example.com/cached");
 
@@ -135,7 +164,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ NegativeHit 命中 → 404，且**不查库**（防穿透生效）")
     void negativeHitReturns404WithoutQuery() {
-        given(redisGateway.get(CODE)).willReturn(Optional.of(new CacheEntry.NegativeHit()));
+        bloom.l2Value = CacheKeys.EMPTY_SENTINEL;
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
                 .extracting(e -> ((LinkForgeException) e).errorCode())
@@ -149,7 +178,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 场景 10：两级未命中 → 回源一次并回填，携带 status 与 expireAt")
     void missQueriesOnceAndBackfills() {
-        given(redisGateway.get(CODE)).willReturn(Optional.empty());
+        givenNeedsSource();
         given(linkRepository.findByShortCode(CODE)).willReturn(Optional.of(
                 link(LinkStatus.ACTIVE, LocalDateTime.parse("2027-01-01T00:00:00"))));
 
@@ -167,7 +196,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 回源 404 → 只写空值缓存（防穿透）")
     void repositoryMissWritesEmptyCache() {
-        given(redisGateway.get(CODE)).willReturn(Optional.empty());
+        givenNeedsSource();
         given(linkRepository.findByShortCode(CODE)).willReturn(Optional.empty());
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
@@ -183,7 +212,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐⭐ 场景 11：回源抛异常 → **两级都不写**，异常向上传播")
     void repositoryFailureIsNeverCached() {
-        given(redisGateway.get(CODE)).willReturn(Optional.empty());
+        givenNeedsSource();
         given(linkRepository.findByShortCode(CODE))
                 .willThrow(new org.springframework.dao.QueryTimeoutException("db timeout"));
 
@@ -201,8 +230,8 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐⭐ 场景 12：缓存命中 DELETED → 404（不因命中而跳过判定）")
     void cachedDeletedStillReturns404() {
-        given(redisGateway.get(CODE)).willReturn(Optional.of(
-                new CacheEntry.Hit(new CachedLink("https://example.com/x", "DELETED", null))));
+        // ⚠️ 缓存里带 DELETED：命中后仍要走状态判定，不能直接 302
+        givenCachedInL2("https://example.com/cached", LinkStatus.DELETED, null);
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
                 .extracting(e -> ((LinkForgeException) e).errorCode())
@@ -212,9 +241,9 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐⭐ 场景 12：缓存命中已过期 → 410")
     void cachedExpiredStillReturns410() {
-        given(redisGateway.get(CODE)).willReturn(Optional.of(new CacheEntry.Hit(
-                new CachedLink("https://example.com/x", "ACTIVE",
-                        LocalDateTime.parse("2026-01-15T01:00:00")))));
+        // 缓存里的 expireAt 早于固定时钟 NOW（2026-01-15T02:30:00Z）
+        givenCachedInL2("https://example.com/cached", LinkStatus.ACTIVE,
+                LocalDateTime.parse("2026-01-15T01:00:00"));
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
                 .extracting(e -> ((LinkForgeException) e).errorCode())
@@ -224,7 +253,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 回源查到的已失效链接**也要回填**（下次命中可省一次回源）")
     void invalidatedLinkIsStillBackfilled() {
-        given(redisGateway.get(CODE)).willReturn(Optional.empty());
+        givenNeedsSource();
         given(linkRepository.findByShortCode(CODE))
                 .willReturn(Optional.of(link(LinkStatus.DELETED, null)));
 

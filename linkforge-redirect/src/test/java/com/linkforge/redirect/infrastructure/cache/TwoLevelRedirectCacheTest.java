@@ -37,6 +37,9 @@ class TwoLevelRedirectCacheTest {
     @Mock
     private RedisRedirectCache redis;
 
+    @Mock
+    private RedisBloomFilter bloom;
+
     private Cache<String, CacheEntry.Hit> local;
     private SimpleMeterRegistry registry;
     private TwoLevelRedirectCache cache;
@@ -49,7 +52,9 @@ class TwoLevelRedirectCacheTest {
                 .recordStats()
                 .build();
         registry = new SimpleMeterRegistry();
-        cache = new TwoLevelRedirectCache(local, redis, registry);
+        // ⚠️ bloom 是 mock：本类只测 L1/L2 的编排，布隆行为由
+        // BloomMergedRoundTripTest 覆盖。返回「需回源」让它不干扰本类断言。
+        cache = new TwoLevelRedirectCache(local, redis, bloom, registry);
     }
 
     private static CachedLink link() {

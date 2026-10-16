@@ -4,7 +4,6 @@ import com.linkforge.core.domain.Link;
 import com.linkforge.core.domain.LinkStatus;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
-import com.linkforge.core.infrastructure.cache.BloomFilter;
 import com.linkforge.core.infrastructure.cache.CacheEntry;
 import com.linkforge.core.infrastructure.cache.CachedLink;
 import com.linkforge.redirect.infrastructure.cache.TwoLevelRedirectCache;
@@ -54,18 +53,15 @@ public class RedirectService {
     private final LinkRepository linkRepository;
     private final LinkValidator linkValidator;
     private final TwoLevelRedirectCache cache;
-    private final BloomFilter bloomFilter;
     private final Clock clock;
 
     public RedirectService(LinkRepository linkRepository,
                            LinkValidator linkValidator,
                            TwoLevelRedirectCache cache,
-                           BloomFilter bloomFilter,
                            Clock clock) {
         this.linkRepository = linkRepository;
         this.linkValidator = linkValidator;
         this.cache = cache;
-        this.bloomFilter = bloomFilter;
         this.clock = clock;
     }
 
@@ -84,22 +80,26 @@ public class RedirectService {
         // 1. 格式校验先行：非法字符不应该消耗一次缓存查询，更不该消耗数据库查询
         linkValidator.validateForRedirect(rawCode);
 
-        // 2. 布隆前置判断（DR-007）。判「一定不存在」时直接 404，不查缓存也不查库。
-        // ⚠️ 未初始化与不可用时都返回 true（放行），保证首次部署前服务可用
-        if (!bloomFilter.mightContain(rawCode)) {
-            throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
-                    "短码不存在: " + rawCode);
-        }
+        // 2. 缓存查询 + 布隆前置，**一次 Redis 往返完成**（DR-052）。
+        //    顺序：L1（0 次 Redis）→ 1 次 Lua（布隆 k 次 GETBIT + L2 GET 合并）→ 单飞回源
+        //
+        //    ⚠️ 不要再单独调 bloomFilter.mightContain：那是「EXISTS + 7 次 GETBIT」
+        //    =8 次独立往返，8 万 QPS 下等于每秒 64 万次 Redis 往返。
+        //    合并脚本在 RedisBloomFilter.checkAndGet 里，DR-052 有完整背景。
+        TwoLevelRedirectCache.BloomAwareResult result =
+                cache.getOrLoadWithBloom(rawCode, this::loadFromSource);
 
-        // 3. 带单飞的缓存查询 + 回源（DR-052）。
-        //    同一短码的并发回源只执行一次 loader，其余请求同步等待其结果
-        CacheEntry entry = cache.getOrLoad(rawCode, this::loadFromSource);
-        if (entry instanceof CacheEntry.NegativeHit) {
-            // 空值缓存命中：已确认不存在，直接 404，不回源（防穿透生效）
+        if (result.definitelyAbsent()) {
+            // 布隆判「一定不存在」：直接 404，不查缓存也不查库（防穿透）
             throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
                     "短码不存在: " + rawCode);
         }
-        CachedLink link = ((CacheEntry.Hit) entry).link();
+        if (result.hit() == null) {
+            // 空值缓存命中 或 回源确认不存在：直接 404，不重复回源
+            throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
+                    "短码不存在: " + rawCode);
+        }
+        CachedLink link = result.hit().link();
 
         // 4. 失效判定。与第 1 周完全相同的顺序：DELETED 先于 EXPIRED
         LinkStatus status = LinkStatus.valueOf(link.status());

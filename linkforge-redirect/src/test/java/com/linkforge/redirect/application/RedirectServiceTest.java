@@ -13,6 +13,7 @@ import com.linkforge.core.error.ErrorCode;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.linkforge.core.infrastructure.cache.BloomFilter;
 import com.linkforge.core.repository.LinkRepository;
+import com.linkforge.redirect.infrastructure.cache.RedisBloomFilter;
 import com.linkforge.redirect.infrastructure.cache.RedisRedirectCache;
 import com.linkforge.redirect.infrastructure.cache.TwoLevelRedirectCache;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -48,8 +49,7 @@ class RedirectServiceTest {
             Clock.fixed(NOW, ZoneOffset.UTC));
 
     private RedirectService service(Clock clock) {
-        return new RedirectService(linkRepository, linkValidator, alwaysMiss(),
-                BLOOM_ALWAYS_PRESENT, clock);
+        return new RedirectService(linkRepository, linkValidator, alwaysMiss(), clock);
     }
 
     private RedirectService service() {
@@ -97,41 +97,24 @@ class RedirectServiceTest {
     private static TwoLevelRedirectCache alwaysMiss() {
         return new TwoLevelRedirectCache(
                 Caffeine.newBuilder().maximumSize(1).build(),
-                MISSING_REDIS, new SimpleMeterRegistry());
+                MISSING_REDIS, BLOOM_NEEDS_SOURCE, new SimpleMeterRegistry());
     }
 
+    /**
+     * 布隆恒定「需回源」。
+     *
+     * <p>本类验证「查库 → 判定」的纯逻辑，布隆必须放过才能走到回源。
+     * 布隆的拦截行为由 {@code BloomMergedRoundTripTest} 覆盖。
+     */
+    private static final RedisBloomFilter BLOOM_NEEDS_SOURCE =
+            new RedisBloomFilter(null, new SimpleMeterRegistry()) {
+                @Override
+                public com.linkforge.redirect.infrastructure.cache.RedisBloomFilter
+                        .BloomCheckResult checkAndGet(String shortCode) {
+                    return BloomCheckResult.source();
+                }
+            };
 
-    /** 布隆恒定「可能存在」——本类验证的是判定逻辑，不是布隆的拦截行为。 */
-    private static final BloomFilter BLOOM_ALWAYS_PRESENT = new BloomFilter() {
-        @Override
-        public boolean mightContain(String shortCode) {
-            return true;
-        }
-
-        @Override
-        public void put(String shortCode) {
-        }
-
-        @Override
-        public boolean isReady() {
-            return true;
-        }
-
-        @Override
-        public long expectedInsertions() {
-            return 0L;
-        }
-
-        @Override
-        public long bitSize() {
-            return 0L;
-        }
-
-        @Override
-        public int hashFunctions() {
-            return 0;
-        }
-    };
 
     private static Link link(LinkStatus status, LocalDateTime expireAtUtc) {
         return new Link(1L, "abc1234", "https://example.com/very/long/path", status, false,

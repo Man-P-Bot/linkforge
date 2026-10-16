@@ -155,6 +155,24 @@ public class RedisRedirectCache {
                 + "|" + url;
     }
 
+    /**
+     * 解析缓存值（供 {@link TwoLevelRedirectCache#getOrLoadWithBloom} 复用）。
+     *
+     * <p>Lua 合并脚本把原始 value 直接带回来了，这里不重复实现一遍格式解析——
+     * <b>两处各写一份解析是缓存格式演进时最容易出错的写法</b>：
+     * 改了一处忘了另一处，同一个 value 在两条路径上行为不一致。
+     *
+     * @param shortCode 短码，仅用于错误日志定位
+     * @param raw 原始缓存值
+     * @return 解析结果；格式损坏返回 {@code null}（调用方当未命中处理）
+     */
+    public CachedLink parseCached(String shortCode, String raw) {
+        if (raw == null || CacheKeys.EMPTY_SENTINEL.equals(raw)) {
+            return null;
+        }
+        return parse(raw, CacheKeys.code(shortCode));
+    }
+
     private CachedLink parse(String raw, String key) {
         // 限制 5 段：targetUrl 作为最后一段完整保留，不受其中分隔符影响
         String[] head = raw.split("\\|", 5);

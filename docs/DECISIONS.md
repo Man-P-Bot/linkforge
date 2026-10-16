@@ -1268,6 +1268,11 @@
 
 ### 结论：那不是取舍，是缺陷
 
+> ⚠️ **顺序已演进**：本条定的「L1 → L2 → 回源」在DR-052 之后更新为
+> **「L1 → (布隆 + L2 合并) → 回源」**——布隆插在 L2 那一段，
+> 与 ARCHITECTURE §158「判断顺序必须是布隆 → 缓存 → DB」一致。
+> 往返数不变（L1 命中 0 次、L1 miss 1 次），但那 1 次里多了布隆检查。
+
 | | 三段式（L1 优先） | 两段式（L2 优先） |
 |---|---|---|
 | L1 命中时的 Redis 往返 | **0次** | 1 次 |
@@ -1307,3 +1312,101 @@ CacheEntry.Hit hit = local.get(shortCode, loader);
 直接断言「L1 命中时 `redis.get` 调用次数 == 0」。
 只断言 `local.hit` 计数是不够的——那测的是指标，而缺陷恰恰可以绕过指标发生。
 **要断言被优化的那个资源本身没被访问。**
+
+## DR-052 布隆检查与 L2 查询合并为一次 Redis 往返
+
+### 背景
+
+DR-007 明确要求「布隆检查与缓存查询合并为**一次** Redis 往返」，实现时也确实写了这个方法
+（`RedisBloomFilter.checkAndGet`，Lua 脚本：EXISTS → k 次 GETBIT → GET 缓存key）。
+
+⚠️ **但它从未被调用**——`RedirectService` 走的是裸的 `mightContain`，那是
+「先 `EXISTS` 再 7 次 `GETBIT`」= **8 次独立网络往返**。合并脚本成了**死代码**。
+
+### 后果
+
+8 万 QPS 下等于每秒 **64 万次** Redis 往返，Redis 直接成为绝对瓶颈。
+第 3 周压测的 3153 QPS 里有相当一部分由此而来（另一部分是 DR-051 的 L1 失效）。
+
+### 决策
+
+`RedirectService` 改为调 `checkAndGet`，L1 miss 时 **1 次 Lua** 同时完成
+布隆检查 + L2 查询。新的调用链与往返数：
+
+```
+L1 命中        → 0 次 Redis
+L1 未命中      → 1 次 EVAL（k 次 GETBIT + 1 次 GET，服务端执行）
+布隆判不存在   → 1 次 Redis，然后 404
+L2 有值        → 1 次 Redis，写 L1 后返回
+都无          → 1 次 Redis + 单飞回源
+```
+
+⚠️ **L1 命中时布隆不执行**：L1 里的值是之前查过库确认存在的，
+布隆判它「不存在」的唯一可能是假阴性（重建漏扫），
+而此时我们已有一份**确定正确**的数据。反过来若先问布隆，
+L1 命中也会多一次往返，DR-051 的修复就白做了。
+
+### 代价
+
+**布隆不是零成本，是从 8 次降到 1 次。** L1 miss 时仍要占一次往返。
+
+### 验证
+
+用 `redis-cli MONITOR` 确认真实往返（比 mock 强）：
+
+```
+客户端：[0 127.0.0.1:43206] "EVAL" "...整个脚本..." "2" "shortlink:bloom" "shortlink:code:xxx" ...
+服务端：[0 lua] "EXISTS"  shortlink:bloom
+       [0 lua] "GETBIT"  shortlink:bloom 100
+       ...（共 8 条）
+```
+
+客户端只有 1 条命令，内部 8 条标记 `[0 lua]`（服务端执行，无网络往返），
+1.2 毫秒内完成。
+
+### 教训：「写好了没接上」比「没写」更危险
+
+> 没写：review 时看得见「这里还没做」。
+> 写好了没接上：review 时**以为设计已落地**。
+
+死代码比缺失更危险，因为它让「是否已实现」这个问题无法从代码结构回答。
+本条与 DR-051（「我以为的取舍其实是缺陷」）同源：
+**错误的完成感比明显的缺失更难发现。**
+
+### 触发场景
+
+第 3 周压测前的设计核对。是用户要求「核实布隆是 1 次还是 7 次往返」时发现的。
+
+### 回归测试
+
+`BloomMergedRoundTripTest`（11 个）锁的是**往返次数**而非功能：
+`localHitCausesZeroRedisCalls`（L1 命中 → `verifyNoInteractions`）、
+`localMissCausesExactlyOneBloomCall`（恰好 1 次 `checkAndGet`）、
+`bloomAbsentShortCircuitsWithoutLoading`（判否后不回源）、
+`l2HitBackfillsLocalSoNextCallIsFree`（第二次请求 0 次 Redis）。
+
+⚠️ **功能测试无法发现这类缺陷**：初版 `mightContain` 的单测全绿，
+因为它功能完全正确。**只有断言「往返/访问次数」的测试能拦住它。**
+
+## 待验证项（第 3 周记，第 5 周处理）
+
+### ⏳ Redis 首连延迟与 50ms 命令超时的冲突
+
+**现象**：编写 `checkAndGet` 的真实 Redis 验证时，用 `@SpringBootTest` 启动上下文后
+**第一个 Redis 命令就超时**：
+
+```
+Caused by: io.lettuce.core.RedisCommandTimeoutException: Command timed out after 50 millisecond(s)
+```
+
+**待验证**：应用冷启动后**首次** Redis 调用的延迟分布。
+若首连普遍超过 50ms，考虑把**连接超时**与**命令超时**分开配置：
+连接放宽到 500ms，命令保持 50ms。
+
+**为什么**：`spring.data.redis.timeout: 50ms` 目前同时约束了连接建立与命令执行。
+但DR-011 的 50ms 是**命令执行预算**（跳转总预算 P99 < 50ms，慢于此已无意义），
+**不该被连接建立消耗掉**——一次偶发的慢连接会让本该成功的请求被判为「Redis 不可用」，
+进而走降级路径放行全部流量，限流与缓存同时失效。
+
+**注意**：这只是待验证项，**现在不做**。当前单实例部署下连接是长连接复用，
+首连只发生在应用启动时；第 5 周上多实例后再用真实数据决定。

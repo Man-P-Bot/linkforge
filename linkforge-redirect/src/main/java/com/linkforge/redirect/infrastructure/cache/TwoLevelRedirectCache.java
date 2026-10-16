@@ -2,6 +2,7 @@ package com.linkforge.redirect.infrastructure.cache;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.linkforge.core.infrastructure.cache.CacheEntry;
+import com.linkforge.core.infrastructure.cache.CacheKeys;
 import com.linkforge.core.infrastructure.cache.CachedLink;
 import com.linkforge.core.infrastructure.cache.RedirectCacheService;
 import io.micrometer.core.instrument.Counter;
@@ -37,13 +38,16 @@ public class TwoLevelRedirectCache implements RedirectCacheService {
 
     private final Cache<String, CacheEntry.Hit> local;
     private final RedisRedirectCache redis;
+    private final RedisBloomFilter bloom;
     private final Counter localHitCounter;
 
     public TwoLevelRedirectCache(Cache<String, CacheEntry.Hit> localLinkCache,
                                  RedisRedirectCache redis,
+                                 RedisBloomFilter bloom,
                                  MeterRegistry meterRegistry) {
         this.local = localLinkCache;
         this.redis = redis;
+        this.bloom = bloom;
         this.localHitCounter = Counter.builder("shortlink.cache.local.hit")
                 .description("跳转本地缓存（Caffeine）命中次数（第 1 层）")
                 .register(meterRegistry);
@@ -175,6 +179,83 @@ public class TwoLevelRedirectCache implements RedirectCacheService {
         // loader 返回 null -> 确认不存在。只写 Redis 空值，不写本地（DR-047）
         redis.putEmpty(shortCode);
         return new CacheEntry.NegativeHit();
+    }
+
+    /**
+     * 带布隆前置的查询（DR-052）。
+     *
+     * <p>顺序与往返数：
+     * <pre>
+     *   L1 命中→ 0 次 Redis
+     *   L1 未命中   → 1 次 Lua（布隆 k 次 GETBIT + L2 GET 合并为一次 EVAL）
+     *   布隆判不存在 → 1 次 Redis，然后 404
+     *   L2 有值     → 1 次 Redis，写 L1 后返回
+     *   都无        → 1 次 Redis + 单飞回源
+     * </pre>
+     *
+     * <h2>⚠️ 为什么布隆合并在 L2 这一步而不是单独一次</h2>
+     * 初版是「先 {@code EXISTS} 再 7 次 {@code GETBIT}」= <b>8 次独立往返</b>，
+     * 8 万 QPS 下等于每秒 64 万次 Redis 往返，Redis 直接成为瓶颈（DR-052）。
+     * 合并后 L1 miss 只有 <b>1 次</b>——比 8 次少一个数量级，
+     * 但<b>不是零成本</b>：布隆检查确实要占一次往返。
+     *
+     * <h2>⚠️ L1 命中时布隆不执行</h2>
+     * 这是有意的：L1 里的值是之前查过库确认存在的，
+     * 布隆判它「不存在」的唯一可能是假阴性（布隆重建漏扫），
+     * 而此时我们已经有一份**确定正确**的数据，不需要再问布隆。
+     * 反过来若先问布隆，L1 命中也会多一次往返，DR-051 的修复就白做了。
+     *
+     * @return {@link BloomAwareResult#absent()} 表示布隆判「一定不存在」，应直接 404
+     */
+    public BloomAwareResult getOrLoadWithBloom(String shortCode,
+                                                Function<String, CacheEntry.Hit> loader) {
+        // ---- 第 1 段：L1 命中 → 0 次 Redis ----
+        CacheEntry.Hit localHit = local.getIfPresent(shortCode);
+        if (localHit != null) {
+            localHitCounter.increment();
+            return new BloomAwareResult(localHit, false);
+        }
+
+        // ---- 第 2 段：1 次 Lua 同时完成布隆检查 + L2 查询 ----
+        RedisBloomFilter.BloomCheckResult checked = bloom.checkAndGet(shortCode);
+        if (checked.definitelyAbsent()) {
+            return new BloomAwareResult(null, true);
+        }
+
+        String cachedValue = checked.cachedValue();
+        if (cachedValue != null && CacheKeys.EMPTY_SENTINEL.equals(cachedValue)) {
+            // 空值哨兵：已确认不存在。⚠️ **不写 L1**（DR-047）
+            return new BloomAwareResult(null, false);
+        }
+
+        if (cachedValue != null) {
+            CachedLink link = redis.parseCached(shortCode, cachedValue);
+            if (link != null) {
+                // 正向结果下沉 L1
+                CacheEntry.Hit hit = new CacheEntry.Hit(link);
+                local.put(shortCode, hit);
+                return new BloomAwareResult(hit, false);
+            }
+            // 缓存值损坏：parseCached 已删除该 key，当未命中处理
+        }
+
+        // ---- 第 3 段：布隆放过 + L2 无值（或损坏）→ 单飞回源 ----
+        CacheEntry.Hit loaded = local.get(shortCode, loader);
+        if (loaded != null) {
+            return new BloomAwareResult(loaded, false);
+        }
+        // loader 返回 null → 确认不存在，只写 L2 空值（DR-047）
+        redis.putEmpty(shortCode);
+        return new BloomAwareResult(null, false);
+    }
+
+    /**
+     * {@link #getOrLoadWithBloom} 的结果。
+     *
+     * @param hit 命中的数据；「确认不存在」时为 null
+     * @param definitelyAbsent 布隆判「一定不存在」，调用方应直接 404
+     */
+    public record BloomAwareResult(CacheEntry.Hit hit, boolean definitelyAbsent) {
     }
 
     /**
