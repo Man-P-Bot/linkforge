@@ -4,6 +4,9 @@ import com.linkforge.redirect.api.dto.ApiResponse;
 import com.linkforge.redirect.api.dto.CreateLinkRequest;
 import com.linkforge.redirect.api.dto.CreateLinkResponse;
 import com.linkforge.redirect.application.LinkCreationService;
+import com.linkforge.redirect.infrastructure.limit.RateLimitScope;
+import com.linkforge.redirect.infrastructure.limit.RedisTokenBucketLimiter;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import java.time.ZoneId;
 import org.springframework.http.HttpStatus;
@@ -35,18 +38,55 @@ import org.springframework.web.bind.annotation.RestController;
 public class LinkController {
 
     private final LinkCreationService linkCreationService;
+    private final RedisTokenBucketLimiter limiter;
     private final ZoneId displayZone;
 
-    public LinkController(LinkCreationService linkCreationService, ZoneId displayZone) {
+    public LinkController(LinkCreationService linkCreationService,
+                          RedisTokenBucketLimiter limiter,
+                          ZoneId displayZone) {
         this.linkCreationService = linkCreationService;
+        this.limiter = limiter;
         this.displayZone = displayZone;
     }
 
     @PostMapping
     public ResponseEntity<ApiResponse<CreateLinkResponse>> create(
-            @Valid @RequestBody CreateLinkRequest request) {
+            @Valid @RequestBody CreateLinkRequest request,
+            HttpServletRequest httpRequest) {
+        // ⚠️ 限流在业务逻辑之前。⚠️ scope 必须用 CREATE 而非 REDIRECT——
+        // 两者阈值差 120 倍（20/s vs 10/min），共用 key 会让创建配额被跳转流量吃光
+        RedisTokenBucketLimiter.Decision decision =
+                limiter.tryAcquire(resolveClientId(httpRequest), RateLimitScope.CREATE);
+        if (!decision.allowed()) {
+            throw new com.linkforge.core.error.LinkForgeException(
+                    com.linkforge.core.error.ErrorCode.RATE_LIMITED,
+                    "创建过于频繁，请 " + decision.retryAfter().toMillis() + "ms 后重试");
+        }
+
         CreateLinkResponse response = linkCreationService.create(request);
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.of(response, displayZone));
+    }
+
+    /**
+     * 解析客户端标识（与 {@code RedirectController} 同逻辑）。
+     *
+     * <p>⚠️ 信任 X-Forwarded-For 有被伪造的风险（伪造不同 IP 即可绕过限流）。
+     * 当前项目直连，只取 XFF 第一个值作为最靠近客户端的那一跳。
+     * 取不到时回退到 {@code remoteAddr}，再取不到则用 {@code "unknown"}——
+     * **所有拿不到 IP 的请求共享一个桶**是保守方向，比各自独立（等于不限流）安全。
+     */
+    private String resolveClientId(HttpServletRequest request) {
+        String xff = request.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            int comma = xff.indexOf(',');
+            String first = comma > 0 ? xff.substring(0, comma) : xff;
+            first = first.trim();
+            if (!first.isEmpty()) {
+                return first;
+            }
+        }
+        String remote = request.getRemoteAddr();
+        return (remote == null || remote.isBlank()) ? "unknown" : remote;
     }
 }

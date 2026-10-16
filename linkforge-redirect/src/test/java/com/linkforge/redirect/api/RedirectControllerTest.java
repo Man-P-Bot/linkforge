@@ -12,6 +12,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.redirect.application.RedirectService;
+import com.linkforge.redirect.infrastructure.limit.RedisTokenBucketLimiter;
 import com.linkforge.redirect.error.GlobalExceptionHandler;
 import java.time.ZoneId;
 import org.junit.jupiter.api.DisplayName;
@@ -22,6 +23,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.test.context.ContextConfiguration;
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -50,6 +52,21 @@ class RedirectControllerTest {
 
     @MockitoBean
     private RedirectService redirectService;
+
+    /**
+     * 限流器替身。
+     *
+     * <p>⚠️ 默认放行：本类测的是跳转的HTTP 契约（状态码、响应头），
+     * 限流本身由 {@code RedisTokenBucketLimiterTest} 覆盖。
+     * 若不设桩，Mockito 返回的 null 会被 {@code !decision.allowed()} 抛 NPE。
+     */
+    @MockitoBean
+    private RedisTokenBucketLimiter limiter;
+
+    @BeforeEach
+    void allowAll() {
+        given(limiter.tryAcquire(any(), any())).willReturn(RedisTokenBucketLimiter.Decision.permit());
+    }
 
     @Nested
     @DisplayName("成功：302 Found")

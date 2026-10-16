@@ -3,6 +3,9 @@ package com.linkforge.redirect.api;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.redirect.application.RedirectService;
+import com.linkforge.redirect.infrastructure.limit.RateLimitScope;
+import com.linkforge.redirect.infrastructure.limit.RedisTokenBucketLimiter;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -41,9 +44,12 @@ import org.springframework.web.bind.annotation.RestController;
 public class RedirectController {
 
     private final RedirectService redirectService;
+    private final RedisTokenBucketLimiter limiter;
 
-    public RedirectController(RedirectService redirectService) {
+    public RedirectController(RedirectService redirectService,
+                              RedisTokenBucketLimiter limiter) {
         this.redirectService = redirectService;
+        this.limiter = limiter;
     }
 
     /**
@@ -54,7 +60,19 @@ public class RedirectController {
      * 填进去会让浏览器跳回自己，形成一次多余往返甚至循环。
      */
     @GetMapping("/{code}")
-    public ResponseEntity<Void> redirect(@PathVariable("code") String code) {
+    public ResponseEntity<Void> redirect(@PathVariable("code") String code,
+                                         HttpServletRequest request) {
+        // ⚠️ 限流在业务逻辑**之前**：限流保护的是下游（缓存 + DB），
+        // 若先查库再限流，保护就失去意义了
+        RedisTokenBucketLimiter.Decision decision =
+                limiter.tryAcquire(resolveClientId(request), RateLimitScope.REDIRECT);
+        if (!decision.allowed()) {
+            // 向上抛，由 GlobalExceptionHandler.rateLimited 统一加 Retry-After 头
+            throw new com.linkforge.core.error.LinkForgeException(
+                    com.linkforge.core.error.ErrorCode.RATE_LIMITED,
+                    "请求过于频繁，请 " + decision.retryAfter().toMillis() + "ms 后重试");
+        }
+
         String targetUrl = redirectService.resolveTargetUrl(code);
         return ResponseEntity.status(HttpStatus.FOUND)
                 .header(HttpHeaders.LOCATION, targetUrl)
@@ -72,5 +90,33 @@ public class RedirectController {
     public ResponseEntity<Void> rejectTrailingSlash(@PathVariable("code") String code) {
         throw new LinkForgeException(ErrorCode.INVALID_PARAMETER,
                 "短码路径不允许尾斜杠: \"/" + code + "/\"");
+    }
+
+    /**
+     * 解析客户端标识。
+     *
+     * <p>⚠️ <b>信任 X-Forwarded-For 是有代价的</b>：该头可被客户端伪造，
+     * 攻击者每次换一个伪造 IP 就能绕过限流。
+     * 当前项目直连（前面无代理），因此**只取 XFF 的第一个值**作为最靠近客户端的那一跳，
+     * 并在注释里标明这个限制。
+     * 第 4 周若接入反向代理，需改为「只信任最后一跳」或改用框架提供的
+     * {@code ForwardedHeaderFilter}。
+     *
+     * <p>⚠️ 真实 IP 拿不到时回退到 {@code "unknown"}——
+     * **所有拿不到 IP 的请求会共享一个桶**，这是保守方向（更容易被限流），
+     * 比「各自独立一个桶」（等于不限流）安全。
+     */
+    private String resolveClientId(HttpServletRequest request) {
+        String xff = request.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            int comma = xff.indexOf(',');
+            String first = comma > 0 ? xff.substring(0, comma) : xff;
+            first = first.trim();
+            if (!first.isEmpty()) {
+                return first;
+            }
+        }
+        String remote = request.getRemoteAddr();
+        return (remote == null || remote.isBlank()) ? "unknown" : remote;
     }
 }

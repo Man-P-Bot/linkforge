@@ -13,9 +13,11 @@ import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.redirect.api.dto.CreateLinkResponse;
 import com.linkforge.redirect.application.LinkCreationService;
+import com.linkforge.redirect.infrastructure.limit.RedisTokenBucketLimiter;
 import com.linkforge.redirect.error.GlobalExceptionHandler;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -59,6 +61,21 @@ class LinkControllerTest {
 
     @MockitoBean
     private LinkCreationService linkCreationService;
+
+    /**
+     * 限流器替身，默认放行。
+     *
+     * <p>⚠️ 本类测的是创建接口的 HTTP 契约，限流由
+     * {@code RedisTokenBucketLimiterTest} 覆盖。
+     * 不设桩时 Mockito 返回 null，{@code !decision.allowed()} 会 NPE。
+     */
+    @MockitoBean
+    private RedisTokenBucketLimiter limiter;
+
+    @BeforeEach
+    void allowAll() {
+        given(limiter.tryAcquire(any(), any())).willReturn(RedisTokenBucketLimiter.Decision.permit());
+    }
 
     private static final String VALID_BODY = """
             {"targetUrl":"https://example.com/very/long/path"}
