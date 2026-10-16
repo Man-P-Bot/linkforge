@@ -33,5 +33,22 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
+
+    <!--
+      Micrometer：删除短链后的「清缓存失败」指标 shortlink.cache.evict.failed。
+      库已改成功但缓存没清时会出现「删了还能跳」，这是**静默故障**，
+      必须可观测（第 5 周据此加告警规则）。
+      与 redirect 模块的指标共用同一个 MeterRegistry。
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>
