@@ -1257,3 +1257,53 @@
   - `encodedFormsAreAllowed`（参数化 2 个）
   - `delIsNotBlockedByControlCharCheck`
   - `checkedBeforeProtocolCheck`（含控制字符的 `javascript:` 必须返回 400-01 而非 400-02）
+
+## DR-051 两级缓存必须是三段式（L1 优先），「为正确性付代价」的说法要警惕
+
+### 背景
+
+第 3 周给 `getOrLoad` 写单飞时，我把顺序实现成了**「先问 L2（Redis），再查 L1（Caffeine），最后回源」**，并在注释里论证这是「为正确性付的代价」——理由是 `caffeine.get(key, loader)` 只在 L1 miss 时执行 loader，不给「先问 L2 再决定要不要 loader」的机会。
+
+压测实测 QPS 从第2 周的 **81289掉到 3153**，`shortlink.cache.local.hit`恒为 0。
+
+### 结论：那不是取舍，是缺陷
+
+| | 三段式（L1 优先） | 两段式（L2 优先） |
+|---|---|---|
+| L1 命中时的 Redis 往返 | **0次** | 1 次 |
+| 正确性 | 一样 | 一样 |
+| 回源次数与实例数无关 | ✅ 一样成立 | ✅ 一样成立 |
+
+**三段式没有牺牲任何正确性。** 我在注释里写的「两次 L1 查找之间存在竞态」是伪问题：
+`getIfPresent` 只读不写，第二次 `get(key, loader)` 的加载不依赖第一次的结果，两者不冲突。
+
+真正被绕过的性质是「L1 命中这一分支根本走不到」——每次请求都先问 Redis，
+本地缓存形同虚设，8 万 QPS 下 Redis 直接成为瓶颈。
+
+### 教训：「为正确性付代价」这个说法本身要警惕
+
+> **如果代价不换任何正确性，它就是缺陷。**
+
+写注释时给一个取舍编造理由，比不写理由更糟：它让后来人（包括我自己复核时）
+以为这是有意为之的性能权衡，从而不再去质疑它。DR-042 讲的是
+「测试全绿与路径未执行可同时成立」，本条是它的姊妹篇——
+**「我以为的取舍可能只是缺陷」**，而错误的自我认知比缺陷更难发现，
+因为它有完整的论证支撑。
+
+### 正确实现与回归测试
+
+```java
+// 第 1 段：L1
+CacheEntry.Hit localHit = local.getIfPresent(shortCode);
+if (localHit != null) { localHitCounter.increment(); return localHit; }
+// 第 2 段：L2
+Optional<CacheEntry> fromRedis = redis.get(shortCode);
+...
+// 第 3 段：单飞回源
+CacheEntry.Hit hit = local.get(shortCode, loader);
+```
+
+⚠️ **回归测试 `localHitSkipsRedisCompletely`**（比指标测试更重要）：
+直接断言「L1 命中时 `redis.get` 调用次数 == 0」。
+只断言 `local.hit` 计数是不够的——那测的是指标，而缺陷恰恰可以绕过指标发生。
+**要断言被优化的那个资源本身没被访问。**

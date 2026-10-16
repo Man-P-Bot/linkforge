@@ -2,6 +2,7 @@ package com.linkforge.redirect.infrastructure.cache;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -140,49 +141,55 @@ class SingleFlightTest {
     }
 
     @Test
-    @DisplayName("⭐⭐ getOrLoad 本地命中 → local.hit 计数器 +1（观测缺口修复）")
-    void localHitIncrementsCounter() {
-        // 先用一次回源把值写进 L1
-        given(redis.get(CODE)).willReturn(Optional.empty());
-        cache.getOrLoad(CODE, code -> new CacheEntry.Hit(link()));
+    @DisplayName("⭐⭐⭐ L1 命中时 Redis **零调用**——锁住「本地缓存生效」这个核心行为")
+    void localHitSkipsRedisCompletely() {
+        // 这条比localHitCounter 的测试更重要：它直接断言
+        // 「本地命中时不产生任何 Redis 往返」。
+        // DR-051 的缺陷正是把 getIfPresent 放到了 redis.get 之后，
+        // 于是每次请求都问Redis、QPS 从 81289 掉到 3153——
+        // 而功能测试全绿，只有这条测试能拦住它。
+        local.put(CODE, new CacheEntry.Hit(link()));
 
-        double afterFirst = registry.get("shortlink.cache.local.hit").counter().count();
+        CacheEntry result = cache.getOrLoad(CODE, code -> new CacheEntry.Hit(link()));
 
-        // 第二次：L1 有值，loader 不该再跑，但**计数器必须加 1**
-        AtomicInteger calls = new AtomicInteger();
-        cache.getOrLoad(CODE, code -> {
-            calls.incrementAndGet();
-            return new CacheEntry.Hit(link());
-        });
-
-        assertThat(calls.get()).isZero();
-        assertThat(registry.get("shortlink.cache.local.hit").counter().count())
-                .isEqualTo(afterFirst + 1.0);
+        assertThat(result).isInstanceOf(CacheEntry.Hit.class);
+        // ⚠️ 核心断言：一次 Redis 往返都不该有
+        verify(redis, never()).get(anyString());
     }
 
     @Test
-    @DisplayName("⭐⭐ 首次回源（loader 执行）**不算**本地命中——否则指标虚高")
-    void loaderExecutionIsNotCountedAsLocalHit() {
-        // ⚠️ local.get(key, loader) 返回非 null 有两种情形：
-        // L1 原有值 / 刚跑完 loader 写入。后者这次请求确实访问了数据库，
-        // 计入 local.hit 会让「本地缓存省了多少回源」被高估，
-        // 压测时就看不出真实的回源压力。
-        given(redis.get(CODE)).willReturn(Optional.empty());
+    @DisplayName("⭐⭐ L1 命中 → local.hit 计数器 +1（观测缺口修复）")
+    void localHitIncrementsCounter() {
+        local.put(CODE, new CacheEntry.Hit(link()));
 
         cache.getOrLoad(CODE, code -> new CacheEntry.Hit(link()));
 
+        assertThat(registry.get("shortlink.cache.local.hit").counter().count())
+                .isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("⭐⭐ L1 miss 后 L2 命中 → local.hit **不**加（那次是 L2 供给的）")
+    void l2HitDoesNotIncrementLocalHit() {
+        given(redis.get(CODE)).willReturn(Optional.of(new CacheEntry.Hit(link())));
+
+        cache.getOrLoad(CODE, code -> new CacheEntry.Hit(link()));
+
+        // 访问了 Redis 就不算「本地零成本供给」
         assertThat(registry.get("shortlink.cache.local.hit").counter().count())
                 .isEqualTo(0.0);
     }
 
     @Test
-    @DisplayName("⭐ Redis 命中时 local.hit 不变（那次是 L2 供给的）")
-    void redisHitDoesNotIncrementLocalHit() {
-        given(redis.get(CODE)).willReturn(Optional.of(new CacheEntry.Hit(link())));
+    @DisplayName("⭐⭐ 首次回源（loader 执行）**不算**本地命中——否则指标虚高")
+    void loaderExecutionIsNotCountedAsLocalHit() {
+        // 本次请求访问了数据库，绝不能被记成本地命中：
+        // 计入会让「本地缓存省了多少回源」被高估，
+        // 压测时就看不出真实的回源压力。
+        given(redis.get(CODE)).willReturn(Optional.empty());
 
         cache.getOrLoad(CODE, code -> new CacheEntry.Hit(link()));
 
-        // Redis 命中有自己的指标（redis.hit），不能同时记到 local.hit 上
         assertThat(registry.get("shortlink.cache.local.hit").counter().count())
                 .isEqualTo(0.0);
     }

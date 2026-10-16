@@ -112,17 +112,35 @@ public class TwoLevelRedirectCache implements RedirectCacheService {
      * @return 缓存/回源结果；{@link CacheEntry.NegativeHit} 表示已确认不存在
      */
     public CacheEntry getOrLoad(String shortCode, Function<String, CacheEntry.Hit> loader) {
-        // ⚠️ 顺序：**先问 L2（Redis），再查 L1（Caffeine），最后回源**。
+        // ⚠️ 顺序：**三段式——L1（本地）→ L2（Redis）→ 回源**。
         //
-        // 这个顺序看着反直觉（L2 明明更慢），但 caffeine.get(key, loader) 的语义决定了它：
-        // 它**只在 L1 miss 时执行 loader**，不给你「先问 L2 再决定要不要 loader」的机会。
-        // 若把 loader 直接挂在 L1 的 get 上，L1 miss 就会直接回源、L2 形同虚设。
+        // ⚠️ 曾一度写成「先问 L2 再查 L1」，那是**缺陷不是取舍**（DR-051）：
+        // 那样写的话 L1 命中这一分支永远走不到，每次请求都要多一次 Redis 往返，
+        // 本地缓存形同虚设。第 3 周压测实测 QPS 从81289 掉到 3153，
+        // 当时初判为「布隆多一次往返」，实为 L1 完全失效。
         //
-        // ⚠️ 代价是 L1 的价值被削弱：L1 命中之前每次都要先问一遍 L2。
-        // 这是**为正确性付的代价**，不是疏忽——第 3 周压测已实测到这带来的 QPS 损失，
-        // 换来的是「L1 miss 时回源次数与实例数无关」这个更重要的性质。
-        // 若要恢复 L1 优先，需要「L1 getIfPresent -> L2 -> L1 get(loader)」三段式，
-        // 那样两次 L1 查找之间存在竞态（并发 put 会被后一次覆盖），权衡见 DR-052。
+        //⚠️ 为什么不能把 loader 直接挂在 {@code local.get(key, loader)} 上：
+        //它**只在 L1 miss 时执行 loader**，不给「先问 L2 再决定要不要 loader」的机会。
+        // 所以必须先 getIfPresent 探一次 L1，miss 后再问 L2，
+        // L2 也miss 才用 get(key, loader) 做单飞。
+        //
+        // ✅ **两次 L1 查找之间没有竞态**：getIfPresent 只读不写，
+        // 第二次 get(key, loader) 的加载不依赖第一次的结果。
+        // 这一点曾被误当作「L2 优先的理由」，实际上 L1 优先一样满足
+        // 「回源次数与实例数无关」这个真正重要的性质。
+        //
+        // 回归测试：localHitSkipsRedisCompletely（锁住 L1 命中时 Redis 零调用）
+        // ---- 第 1 段：L1 本地缓存 ----
+        // ⚠️ 必须在查 L2 **之前**。放在之后会让本地缓存完全失效：
+        // 每次请求都要多一次 Redis 往返，8 万 QPS 下 Redis 直接成为瓶颈。
+        CacheEntry.Hit localHit = local.getIfPresent(shortCode);
+        if (localHit != null) {
+            localHitCounter.increment();
+            // L1 命中：0 次 Redis 往返
+            return localHit;
+        }
+
+        // ---- 第 2 段：L2（Redis）----
         Optional<CacheEntry> fromRedis = redis.get(shortCode);
         if (fromRedis.isPresent()) {
             CacheEntry entry = fromRedis.get();
@@ -134,33 +152,24 @@ public class TwoLevelRedirectCache implements RedirectCacheService {
             return entry;
         }
 
-        // 两级都未命中 -> 单飞回源
+        // ---- 第 3 段：两级都未命中 -> 单飞回源 ----
         //
-        // ⚠️ local.get(key, loader) 返回非 null 有**两种**情形：
-        //   a) L1 本来就有值（loader 未执行）——这是真正的本地命中；
-        //   b) L1 原本没有，loader 刚跑完并写入（本次请求执行了回源）——这是**未命中**。
-        // 直接对「非 null」计数会把 (b) 也算成命中，指标虚高，
-        // 于是「本地缓存帮了多少忙」被高估、看不出真实的回源压力。
-        // 因此用包装 loader 记录它到底跑没跑。
+        // ⚠️ local.get(key, loader) 在这里的语义是**「取或加载」**：
+        // 它内部若L1 已有值就直接返回（loader 不跑），否则执行 loader 并写入。
         //
-        // 🚫 **不要把下面这段简化成 `if (hit != null) localHitCounter.increment();`**
-        // 那会让首次回源（访问了数据库）被记成本地命中，
-        // 压测时 local.hit 虚高、miss 被掩盖——恰好毁掉这个指标存在的意义。
-        // 回归测试：loaderExecutionIsNotCountedAsLocalHit / localHitIncrementsCounter
-        final boolean[] loaderRan = new boolean[1];
-        CacheEntry.Hit hit = local.get(shortCode, code -> {
-            loaderRan[0] = true;
-            return loader.apply(code);
-        });
+        // 🚫 **不要在 hit != null 时累加 localHitCounter**：
+        // 此时无论走a) 还是有 b) 分支，本次请求要么访问了 Redis（L2 刚问过）、
+        // 要么访问了数据库（loader 执行了），**都不是「本地缓存零成本供给了本次读取」**。
+        // local.hit 的口径必须是「本次响应完全由 L1 供给，未访问 Redis/DB」，
+        // 那已经在第 1 段累加了。
+        //
+        // 回归测试：loaderExecutionIsNotCountedAsLocalHit
+        //若把第 1 段的 getIfPresent 挪到 redis.get 之后，
+        // 这个方法就会退化成「每次都问 Redis」，而本段又不再计数——
+        // local.hit 会重新变成恒 0，且没有任何测试报警。
+        // 锁住核心行为的是 localHitSkipsRedisCompletely。
+        CacheEntry.Hit hit = local.get(shortCode, loader);
         if (hit != null) {
-            // ⚠️ 这里也是**本地命中**（L1 有值，loader 未执行），必须累加。
-            // 漏掉它会让压测时 shortlink.cache.local.hit 恒为 0，
-            // 看起来像「本地缓存完全没起作用」——这是**观测缺口**而非功能缺陷
-            //（本地缓存确实在生效，只是没被计数）。
-            // 与 get() 的口径保持一致：只计loader 未执行的那种。
-            if (!loaderRan[0]) {
-                localHitCounter.increment();
-            }
             return hit;
         }
         // loader 返回 null -> 确认不存在。只写 Redis 空值，不写本地（DR-047）
