@@ -49,4 +49,48 @@ public interface LinkMapper {
      * 用 {@code id > afterId ORDER BY id LIMIT} 推进，避免大 OFFSET 的深分页代价。
      */
     List<String> selectActiveShortCodesAfter(@Param("afterId") long afterId, @Param("limit") int limit);
+
+    /**
+     * 布隆重建：游标分批拉取 {@code (id, shortCode)}。
+     *
+     * <p>⚠️ <b>为什么必须返回 id</b>：只返回短码时调用方无法知道本批的
+     * {@code id > afterId} 该推进到哪里，只能「按批大小猜」。
+     * 猜错的后果是漏扫——重建出的布隆缺一批短码，
+     * 那些短码会被判「不存在」→ <b>真实用户收到 404</b>（DR-007 的假阴性故障）。
+     *
+     * <p>⚠️ <b>ORDER BY 必须与 afterId 语义一致</b>：{@code ORDER BY id} 让
+     * 「本批最大 id」就是下一轮的 {@code afterId}，游标严格单调推进。
+     * 若改成 {@code ORDER BY short_code}，id 与短码的顺序无关，游标会来回跳。
+     */
+    List<IdShortCode> selectIdAndShortCodeAfter(@Param("afterId") long afterId,
+                                                 @Param("limit") int limit);
+
+    /**
+     * {@code (id, shortCode)} 行。
+     *
+     * <p>⚠️ 必须提供两个 getter 而不只是 record 访问器：
+     * MyBatis 的默认对象映射走 <b>setter</b>，record 的访问器 {@code id()}
+     * 不被识别（除非显式配 {@code argNameBasedConstructorAutoMapping}），
+     * 结果是静默返回 {@code null} 而不是报错——很难排查。
+     */
+    class IdShortCode {
+        private long id;
+        private String shortCode;
+
+        public long getId() {
+            return id;
+        }
+
+        public void setId(long id) {
+            this.id = id;
+        }
+
+        public String getShortCode() {
+            return shortCode;
+        }
+
+        public void setShortCode(String shortCode) {
+            this.shortCode = shortCode;
+        }
+    }
 }

@@ -66,4 +66,13 @@ public class LinkRepositoryImpl implements LinkRepository {
     public List<String> scanActiveShortCodes(long afterId, int limit) {
         return linkMapper.selectActiveShortCodesAfter(afterId, limit);
     }
+
+    @Override
+    public List<IdShortCode> scanActiveWithId(long afterId, int limit) {
+        return linkMapper.selectIdAndShortCodeAfter(afterId, limit).stream()
+                // ⚠️ Mapper 侧的 IdShortCode 是可变 POJO（MyBatis 需要 setter），
+                // 这里转成不可变 record，让上层拿到的对象不可被意外修改
+                .map(row -> new IdShortCode(row.getId(), row.getShortCode()))
+                .toList();
+    }
 }

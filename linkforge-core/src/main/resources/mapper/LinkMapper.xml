@@ -115,4 +115,23 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+      布隆重建专用：返回 (id, short_code) 让调用方能严格推进游标。
+      只 select 两列，仍走覆盖索引 idx_status_code(status, short_code)，
+      不回表读 target_url（2048 字节 × 1000 万行 = 20GB 传输，绝不能这么干）。
+
+      ⚠️ ORDER BY id 不能改成 short_code：id 与短码的顺序无关，
+      改了就无法用「本批最大 id」作为下一轮游标，会漏扫。
+      ⚠️ 漏扫的布隆会把真实短码判为不存在 -> 用户 404（DR-007 假阴性故障）。
+    -->
+    <select id="selectIdAndShortCodeAfter"
+            resultType="com.linkforge.core.infrastructure.persistence.LinkMapper$IdShortCode">
+        SELECT id, short_code
+        FROM short_link
+        WHERE status = 0
+          AND id > #{afterId}
+        ORDER BY id
+        LIMIT #{limit}
+    </select>
+
 </mapper>

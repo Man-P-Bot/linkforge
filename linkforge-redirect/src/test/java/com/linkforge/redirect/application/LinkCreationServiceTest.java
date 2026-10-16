@@ -15,6 +15,7 @@ import com.linkforge.core.domain.ShortLinkBaseUrl;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.core.repository.LinkRepository;
+import com.linkforge.redirect.infrastructure.cache.BloomFilterMaintenance;
 import com.linkforge.core.repository.ShortCodeGenerator;
 import com.linkforge.core.repository.ShortCodeGenerator.ShortCodeGenerationException;
 import com.linkforge.core.time.TimeConverter;
@@ -115,6 +116,12 @@ class LinkCreationServiceTest {
             return List.of();
         }
 
+        @Override
+        public List<com.linkforge.core.repository.LinkRepository.IdShortCode> scanActiveWithId(
+                long afterId, int limit) {
+            return List.of();
+        }
+
         int insertCalls() {
             return insertCalls;
         }
@@ -138,7 +145,32 @@ class LinkCreationServiceTest {
 
     private LinkCreationService service(ShortCodeGenerator generator, String baseUrl) {
         return new LinkCreationService(repository, generator, validator,
-                ShortLinkBaseUrl.parse(baseUrl), TimeConverter.INSTANCE, DISPLAY, meterRegistry);
+                ShortLinkBaseUrl.parse(baseUrl), TimeConverter.INSTANCE, DISPLAY,
+                noopBloomMaintenance(), meterRegistry);
+    }
+
+    /**
+     * 布隆维护的空实现。
+     *
+     * <p>本类测的是「发号 / 唯一索引冲突 / 校验」，
+     * 布隆写穿有独立的 {@code RedisBloomFilterTest}。
+     */
+    /**
+     * 布隆维护的空实现。
+     *
+     * <p>⚠️ 刻意做成<b>方法</b>而不是字段：{@code meterRegistry} 在 {@code @BeforeEach}
+     * 里才赋值，写成字段会在初始化时传进null——
+     * 而 {@code BloomFilterMaintenance} 的构造器会立刻注册计数器，直接 NPE。
+     * <p>本类测的是「发号/ 唯一索引冲突 / 校验」，
+     * 布隆写穿有独立的 {@code RedisBloomFilterTest}。
+     */
+    private BloomFilterMaintenance noopBloomMaintenance() {
+        return new BloomFilterMaintenance(null, repository, meterRegistry) {
+            @Override
+            public void writeThrough(String shortCode) {
+                // 本类不关心布隆
+            }
+        };
     }
 
     private double conflictCount() {

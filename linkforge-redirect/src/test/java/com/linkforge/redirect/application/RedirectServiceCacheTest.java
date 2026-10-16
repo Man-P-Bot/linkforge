@@ -14,10 +14,14 @@ import com.linkforge.core.domain.LinkStatus;
 import com.linkforge.core.domain.ReservedCodes;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.linkforge.core.infrastructure.cache.BloomFilter;
 import com.linkforge.core.infrastructure.cache.CacheEntry;
 import com.linkforge.core.infrastructure.cache.CachedLink;
-import com.linkforge.core.infrastructure.cache.RedirectCacheService;
 import com.linkforge.core.repository.LinkRepository;
+import com.linkforge.redirect.infrastructure.cache.RedisRedirectCache;
+import com.linkforge.redirect.infrastructure.cache.TwoLevelRedirectCache;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -58,8 +62,10 @@ class RedirectServiceCacheTest {
     @Mock
     private LinkRepository linkRepository;
 
-    @Mock
-    private RedirectCacheService cache;
+    /** 门面的第 2 层（L2 Redis）。本类断言的「缓存行为」都发生在这里。 */
+    private final RedisRedirectCache redisGateway = org.mockito.Mockito.mock(RedisRedirectCache.class);
+
+    private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
 
     private final LinkValidator validator = new LinkValidator(
             ReservedCodes.parse(ReservedCodes.DEFAULT_CODES),
@@ -70,31 +76,43 @@ class RedirectServiceCacheTest {
     private final List<String> emptyKeys = new ArrayList<>();
 
     private RedirectService service() {
-        RedirectCacheService spy = new RedirectCacheService() {
-            @Override
-            public Optional<CacheEntry> get(String shortCode) {
-                return cache.get(shortCode);
-            }
-
-            @Override
-            public void put(String shortCode, CachedLink link) {
-                putKeys.add(shortCode);
-                cache.put(shortCode, link);
-            }
-
-            @Override
-            public void putEmpty(String shortCode) {
-                emptyKeys.add(shortCode);
-                cache.putEmpty(shortCode);
-            }
-
-            @Override
-            public void evict(String shortCode) {
-                cache.evict(shortCode);
-            }
-        };
-        return new RedirectService(linkRepository, validator, spy, Clock.fixed(NOW, ZoneOffset.UTC));
+        return new RedirectService(linkRepository, validator,
+                new TwoLevelRedirectCache(
+                        Caffeine.newBuilder().maximumSize(1).build(),
+                        redisGateway, registry),
+                bloomAlwaysPresent, Clock.fixed(NOW, ZoneOffset.UTC));
     }
+
+    private static final BloomFilter bloomAlwaysPresent = new BloomFilter() {
+        @Override
+        public boolean mightContain(String shortCode) {
+            return true;
+        }
+
+        @Override
+        public void put(String shortCode) {
+        }
+
+        @Override
+        public boolean isReady() {
+            return true;
+        }
+
+        @Override
+        public long expectedInsertions() {
+            return 0L;
+        }
+
+        @Override
+        public long bitSize() {
+            return 0L;
+        }
+
+        @Override
+        public int hashFunctions() {
+            return 0;
+        }
+    };
 
     private static Link link(LinkStatus status, LocalDateTime expireAt) {
         return new Link(1L, CODE, "https://example.com/target", status, false,
@@ -106,7 +124,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 场景 8：缓存命中 → 仓储零调用")
     void cacheHitSkipsRepository() {
-        given(cache.get(CODE)).willReturn(Optional.of(
+        given(redisGateway.get(CODE)).willReturn(Optional.of(
                 new CacheEntry.Hit(new CachedLink("https://example.com/cached", "ACTIVE", null))));
 
         assertThat(service().resolveTargetUrl(CODE)).isEqualTo("https://example.com/cached");
@@ -117,7 +135,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ NegativeHit 命中 → 404，且**不查库**（防穿透生效）")
     void negativeHitReturns404WithoutQuery() {
-        given(cache.get(CODE)).willReturn(Optional.of(new CacheEntry.NegativeHit()));
+        given(redisGateway.get(CODE)).willReturn(Optional.of(new CacheEntry.NegativeHit()));
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
                 .extracting(e -> ((LinkForgeException) e).errorCode())
@@ -131,14 +149,14 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 场景 10：两级未命中 → 回源一次并回填，携带 status 与 expireAt")
     void missQueriesOnceAndBackfills() {
-        given(cache.get(CODE)).willReturn(Optional.empty());
+        given(redisGateway.get(CODE)).willReturn(Optional.empty());
         given(linkRepository.findByShortCode(CODE)).willReturn(Optional.of(
                 link(LinkStatus.ACTIVE, LocalDateTime.parse("2027-01-01T00:00:00"))));
 
         service().resolveTargetUrl(CODE);
 
         ArgumentCaptor<CachedLink> captor = ArgumentCaptor.forClass(CachedLink.class);
-        verify(cache).put(eq(CODE), captor.capture());
+        verify(redisGateway).put(eq(CODE), captor.capture());
         CachedLink cached = captor.getValue();
         assertThat(cached.targetUrl()).isEqualTo("https://example.com/target");
         // status 与 expireAt 必须一起缓存，否则命中缓存时无法做 404/410 判定
@@ -149,15 +167,15 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 回源 404 → 只写空值缓存（防穿透）")
     void repositoryMissWritesEmptyCache() {
-        given(cache.get(CODE)).willReturn(Optional.empty());
+        given(redisGateway.get(CODE)).willReturn(Optional.empty());
         given(linkRepository.findByShortCode(CODE)).willReturn(Optional.empty());
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
                 .extracting(e -> ((LinkForgeException) e).errorCode())
                 .isEqualTo(ErrorCode.LINK_NOT_FOUND);
 
-        verify(cache).putEmpty(CODE);
-        verify(cache, never()).put(anyString(), any());
+        verify(redisGateway).putEmpty(CODE);
+        verify(redisGateway, never()).put(anyString(), any());
     }
 
     // ---------- 场景 11：异常绝不进缓存 ----------
@@ -165,7 +183,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐⭐ 场景 11：回源抛异常 → **两级都不写**，异常向上传播")
     void repositoryFailureIsNeverCached() {
-        given(cache.get(CODE)).willReturn(Optional.empty());
+        given(redisGateway.get(CODE)).willReturn(Optional.empty());
         given(linkRepository.findByShortCode(CODE))
                 .willThrow(new org.springframework.dao.QueryTimeoutException("db timeout"));
 
@@ -174,8 +192,8 @@ class RedirectServiceCacheTest {
 
         // ⚠️ 核心断言：若这里把异常当成「不存在」缓存，
         // 一次数据库抖动会变成 30 秒的 404 风暴，比不做缓存更糟
-        verify(cache, never()).putEmpty(anyString());
-        verify(cache, never()).put(anyString(), any());
+        verify(redisGateway, never()).putEmpty(anyString());
+        verify(redisGateway, never()).put(anyString(), any());
     }
 
     // ---------- 场景 12：缓存命中也必须走状态判定 ----------
@@ -183,7 +201,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐⭐ 场景 12：缓存命中 DELETED → 404（不因命中而跳过判定）")
     void cachedDeletedStillReturns404() {
-        given(cache.get(CODE)).willReturn(Optional.of(
+        given(redisGateway.get(CODE)).willReturn(Optional.of(
                 new CacheEntry.Hit(new CachedLink("https://example.com/x", "DELETED", null))));
 
         assertThatThrownBy(() -> service().resolveTargetUrl(CODE))
@@ -194,7 +212,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐⭐ 场景 12：缓存命中已过期 → 410")
     void cachedExpiredStillReturns410() {
-        given(cache.get(CODE)).willReturn(Optional.of(new CacheEntry.Hit(
+        given(redisGateway.get(CODE)).willReturn(Optional.of(new CacheEntry.Hit(
                 new CachedLink("https://example.com/x", "ACTIVE",
                         LocalDateTime.parse("2026-01-15T01:00:00")))));
 
@@ -206,7 +224,7 @@ class RedirectServiceCacheTest {
     @Test
     @DisplayName("⭐ 回源查到的已失效链接**也要回填**（下次命中可省一次回源）")
     void invalidatedLinkIsStillBackfilled() {
-        given(cache.get(CODE)).willReturn(Optional.empty());
+        given(redisGateway.get(CODE)).willReturn(Optional.empty());
         given(linkRepository.findByShortCode(CODE))
                 .willReturn(Optional.of(link(LinkStatus.DELETED, null)));
 
@@ -215,7 +233,7 @@ class RedirectServiceCacheTest {
                 .isEqualTo(ErrorCode.LINK_NOT_FOUND);
 
         // 回填了，下次就能靠缓存判定 404 而不必回源
-        verify(cache).put(eq(CODE), any());
+        verify(redisGateway).put(eq(CODE), any());
     }
 
     // ---------- 格式校验仍先于缓存 ----------
@@ -228,7 +246,7 @@ class RedirectServiceCacheTest {
                 .isEqualTo(ErrorCode.INVALID_PARAMETER);
 
         // 非法请求连缓存都不该查——短码里出现下划线，缓存里必然没有
-        verify(cache, never()).get(anyString());
+        verify(redisGateway, never()).get(anyString());
         verify(linkRepository, never()).findByShortCode(anyString());
     }
 

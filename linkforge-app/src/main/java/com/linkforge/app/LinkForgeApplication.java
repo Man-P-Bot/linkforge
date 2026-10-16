@@ -3,6 +3,7 @@ package com.linkforge.app;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * LinkForge 应用入口。
@@ -25,6 +26,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * 启动类放在 app」（docs/DECISIONS.md DR-021）这一布局必须付出的代价：
  * 包路径不同源，就必须显式指定扫描范围，不能指望默认值。
  */
+@EnableScheduling
 @SpringBootApplication(scanBasePackages = "com.linkforge")
 @MapperScan("com.linkforge.core.infrastructure.persistence")
 public class LinkForgeApplication {

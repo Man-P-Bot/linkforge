@@ -10,10 +10,12 @@ import com.linkforge.core.domain.Link;
 import com.linkforge.core.domain.LinkStatus;
 import com.linkforge.core.domain.ReservedCodes;
 import com.linkforge.core.error.ErrorCode;
-import com.linkforge.core.infrastructure.cache.CacheEntry;
-import com.linkforge.core.infrastructure.cache.CachedLink;
-import com.linkforge.core.infrastructure.cache.RedirectCacheService;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.linkforge.core.infrastructure.cache.BloomFilter;
 import com.linkforge.core.repository.LinkRepository;
+import com.linkforge.redirect.infrastructure.cache.RedisRedirectCache;
+import com.linkforge.redirect.infrastructure.cache.TwoLevelRedirectCache;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -46,7 +48,8 @@ class RedirectServiceTest {
             Clock.fixed(NOW, ZoneOffset.UTC));
 
     private RedirectService service(Clock clock) {
-        return new RedirectService(linkRepository, linkValidator, ALWAYS_MISS, clock);
+        return new RedirectService(linkRepository, linkValidator, alwaysMiss(),
+                BLOOM_ALWAYS_PRESENT, clock);
     }
 
     private RedirectService service() {
@@ -54,35 +57,79 @@ class RedirectServiceTest {
     }
 
     /**
-     * 恒定未命中的缓存替身。
+     * 恒定未命中的 L2。
      *
-     * <p>刻意<b>不用 mock</b>：本类验证的是「查库 → 判定」这条纯逻辑路径，
-     * 缓存一律未命中才能保证每次都真的回源。若用 {@code @Mock} + 全局 stub，
-     * Mockito 的 strict 模式会对「某些用例没用上这个 stub」报错，
-     * 反而把注意力从被测逻辑上引开。
-     *
-     * <p>缓存自身的行为由 {@code TwoLevelRedirectCacheTest} 与
-     * {@code RedirectServiceCacheTest} 覆盖。
+     * <p>⚠️ 用 Mockito 的 {@code RETURNS_SMART_NULLS} 不够——它仍会返回 null 而不是
+     * {@code Optional.empty()}。最稳的做法是写一个匿名实现明确返回 empty，
+     * 这样「未命中」是**代码事实**而不是「碰巧不是 null」。
      */
-    private static final RedirectCacheService ALWAYS_MISS = new RedirectCacheService() {
+    private static final RedisRedirectCache MISSING_REDIS = new RedisRedirectCache(
+            null, new SimpleMeterRegistry()) {
         @Override
-        public Optional<CacheEntry> get(String shortCode) {
-            return Optional.empty();
+        public java.util.Optional<com.linkforge.core.infrastructure.cache.CacheEntry> get(
+                String shortCode) {
+            return java.util.Optional.empty();
         }
 
         @Override
-        public void put(String shortCode, CachedLink link) {
-            // 不回填：本类每次都应回源
+        public void put(String shortCode,
+                        com.linkforge.core.infrastructure.cache.CachedLink link) {
+            // ⚠️ 必须 override：门面在 loader 回源成功后调 putToRedisOnly，
+            // 不 override 就会走到父类的 redis.opsForValue()，对 null 抛 NPE
         }
 
         @Override
         public void putEmpty(String shortCode) {
-            // 不回填
+            // 同上：本类不关心缓存写入
+        }
+    };
+
+    /**
+     * 恒定「未命中」的缓存门面。
+     *
+    /**
+     * ⚠️ <b>刻意不用 static 字段</b>：Caffeine 实例内部有状态，
+     * 静态共享会让上一个用例写入的条目被下一个用例读到
+     *（表现为「短码已删除: abc1234」出现在本该 302 的用例里——
+     * 错误信息完全指不到「测试之间共享了状态」这个真正的原因）。
+     * 因此每次调用都新建一个空缓存的门面。
+     */
+    private static TwoLevelRedirectCache alwaysMiss() {
+        return new TwoLevelRedirectCache(
+                Caffeine.newBuilder().maximumSize(1).build(),
+                MISSING_REDIS, new SimpleMeterRegistry());
+    }
+
+
+    /** 布隆恒定「可能存在」——本类验证的是判定逻辑，不是布隆的拦截行为。 */
+    private static final BloomFilter BLOOM_ALWAYS_PRESENT = new BloomFilter() {
+        @Override
+        public boolean mightContain(String shortCode) {
+            return true;
         }
 
         @Override
-        public void evict(String shortCode) {
-            // 无内容可失效
+        public void put(String shortCode) {
+        }
+
+        @Override
+        public boolean isReady() {
+            return true;
+        }
+
+        @Override
+        public long expectedInsertions() {
+            return 0L;
+        }
+
+        @Override
+        public long bitSize() {
+            return 0L;
+        }
+
+        @Override
+        public int hashFunctions() {
+            return 0;
         }
     };
 

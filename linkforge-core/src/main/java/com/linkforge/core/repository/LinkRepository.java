@@ -71,4 +71,24 @@ public interface LinkRepository {
      * @param afterId 游标：只取 {@code id > afterId} 的记录，配合主键有序推进
      */
     List<String> scanActiveShortCodes(long afterId, int limit);
+
+    /**
+     * 扫描有效短码，**同时返回主键**（供布隆重建推进游标）。
+     *
+     * <p>⚠️ 为什么不能只用 {@link #scanActiveShortCodes}：
+     * 只返回短码时调用方不知道本批最大 {@code id}，无法正确推进 {@code afterId}，
+     * 只能「按批大小猜」。猜错会漏扫，重建出的布隆缺一批短码——
+     * 那些短码会被判「不存在」→ **真实用户收到 404**（DR-007 假阴性故障）。
+     *
+     * @param afterId 游标：只取 {@code id > afterId} 的记录
+     * @param limit 单批上限
+     * @return 按 {@code id} 升序的行列表；本批最大 {@code id} 即下一轮的游标
+     */
+    List<IdShortCode> scanActiveWithId(long afterId, int limit);
+
+    /**
+     * {@code (id, shortCode)} 行。
+     */
+    record IdShortCode(long id, String shortCode) {
+    }
 }

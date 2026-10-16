@@ -4,9 +4,10 @@ import com.linkforge.core.domain.Link;
 import com.linkforge.core.domain.LinkStatus;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
+import com.linkforge.core.infrastructure.cache.BloomFilter;
 import com.linkforge.core.infrastructure.cache.CacheEntry;
 import com.linkforge.core.infrastructure.cache.CachedLink;
-import com.linkforge.core.infrastructure.cache.RedirectCacheService;
+import com.linkforge.redirect.infrastructure.cache.TwoLevelRedirectCache;
 import com.linkforge.core.repository.LinkRepository;
 import java.time.Clock;
 import java.time.LocalDateTime;
@@ -52,16 +53,19 @@ public class RedirectService {
 
     private final LinkRepository linkRepository;
     private final LinkValidator linkValidator;
-    private final RedirectCacheService cache;
+    private final TwoLevelRedirectCache cache;
+    private final BloomFilter bloomFilter;
     private final Clock clock;
 
     public RedirectService(LinkRepository linkRepository,
                            LinkValidator linkValidator,
-                           RedirectCacheService cache,
+                           TwoLevelRedirectCache cache,
+                           BloomFilter bloomFilter,
                            Clock clock) {
         this.linkRepository = linkRepository;
         this.linkValidator = linkValidator;
         this.cache = cache;
+        this.bloomFilter = bloomFilter;
         this.clock = clock;
     }
 
@@ -80,35 +84,24 @@ public class RedirectService {
         // 1. 格式校验先行：非法字符不应该消耗一次缓存查询，更不该消耗数据库查询
         linkValidator.validateForRedirect(rawCode);
 
-        // 2. 查缓存（两级）。返回的 CachedLink 携带 status 与 expireAt，判定能力与查库一致
-        Optional<CacheEntry> cached = cache.get(rawCode);
-        CachedLink link;
-        if (cached.isPresent()) {
-            CacheEntry entry = cached.get();
-            if (entry instanceof CacheEntry.NegativeHit) {
-                // 空值缓存命中：已确认不存在，直接 404，不回源（防穿透生效）
-                throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
-                        "短码不存在: " + rawCode);
-            }
-            link = ((CacheEntry.Hit) entry).link();
-        } else {
-            // 3. 回源。仓储层不做状态过滤——已删除与已过期都要返回，由本层决定 404 还是 410
-            Link found = linkRepository.findByShortCode(rawCode)
-                    .orElseThrow(() -> {
-                        // ⚠️ 只有「确认不存在」才写空值缓存。
-                        // 若这里抛的是数据库异常（不是 orElseThrow 分支），异常会向上传播，
-                        // 不会走到这里——所以绝不会把「查询失败」缓存成「不存在」。
-                        cache.putEmpty(rawCode);
-                        return new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
-                                "短码不存在: " + rawCode);
-                    });
-            link = new CachedLink(found.targetUrl(), found.status().name(), found.expireAt());
-            // 4. 回填。⚠️ 无论该链接是否已失效都回填：404/410 的判定依赖 status 与 expireAt，
-            //    缓存下来才能省掉下次回源；下次命中时本方法会重新走一遍判定。
-            cache.put(rawCode, link);
+        // 2. 布隆前置判断（DR-007）。判「一定不存在」时直接 404，不查缓存也不查库。
+        // ⚠️ 未初始化与不可用时都返回 true（放行），保证首次部署前服务可用
+        if (!bloomFilter.mightContain(rawCode)) {
+            throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
+                    "短码不存在: " + rawCode);
         }
 
-        // 5. 失效判定。与第 1 周完全相同的顺序：DELETED 先于 EXPIRED
+        // 3. 带单飞的缓存查询 + 回源（DR-052）。
+        //    同一短码的并发回源只执行一次 loader，其余请求同步等待其结果
+        CacheEntry entry = cache.getOrLoad(rawCode, this::loadFromSource);
+        if (entry instanceof CacheEntry.NegativeHit) {
+            // 空值缓存命中：已确认不存在，直接 404，不回源（防穿透生效）
+            throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND,
+                    "短码不存在: " + rawCode);
+        }
+        CachedLink link = ((CacheEntry.Hit) entry).link();
+
+        // 4. 失效判定。与第 1 周完全相同的顺序：DELETED 先于 EXPIRED
         LinkStatus status = LinkStatus.valueOf(link.status());
         if (status == LinkStatus.DELETED) {
             throw new LinkForgeException(ErrorCode.LINK_NOT_FOUND, "短码已删除: " + rawCode);
@@ -119,5 +112,32 @@ public class RedirectService {
         }
 
         return link.targetUrl();
+    }
+
+    /**
+     * 回源查库（单飞的 loader）。
+     *
+     * <p>⚠️ <b>三条约束</b>：
+     * <ol>
+     *   <li><b>只能是查库</b>——100 个并发请求会同步等待它完成，耗时操作会卡住本地缓存；</li>
+     *   <li><b>异常直接向上抛</b>，不转成 {@code null}——返回 null 的语义是
+     *       「确认不存在」，而数据库异常绝不能被当成「不存在」缓存（DR-048）；</li>
+     *   <li><b>无论链接是否已失效都要回填</b>——404/410 的判定依赖 status 与 expireAt，
+     *       缓存下来才能省掉下次回源；命中时第 4 步会重新走一遍判定。</li>
+     * </ol>
+     *
+     * @return 查到的链接；{@code null} 表示「确认不存在」
+     */
+    private CacheEntry.Hit loadFromSource(String rawCode) {
+        // 仓储层不做状态过滤——已删除与已过期都要返回，由调用方决定 404 还是 410
+        Link found = linkRepository.findByShortCode(rawCode).orElse(null);
+        if (found == null) {
+            return null;
+        }
+        CachedLink cached = new CachedLink(
+                found.targetUrl(), found.status().name(), found.expireAt());
+        // 回填 Redis（L2）。⚠️ 本地层由 Caffeine 的 loader 自动写入
+        cache.putToRedisOnly(rawCode, cached);
+        return new CacheEntry.Hit(cached);
     }
 }

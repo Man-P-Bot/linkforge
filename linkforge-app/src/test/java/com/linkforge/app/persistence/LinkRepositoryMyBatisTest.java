@@ -416,4 +416,191 @@ class LinkRepositoryMyBatisTest {
                 .isEqualTo("uk_short_code");
         assertThat(rows).as("唯一索引等值查询应只扫 1 行").isEqualTo("1");
     }
+
+    // ---------------------------------------------------------------------
+    // 5. scanActiveWithId：布隆重建的游标扫描（DR-007 假阴性防线）
+    // ---------------------------------------------------------------------
+
+    /** 本组测试专用的短码前缀，与 CODE_A/B/UPPER/LOWER 都不冲突。 */
+    private static final String SCAN_PREFIX = "its";
+
+    private void cleanupScanCodes() {
+        jdbcTemplate.update("DELETE FROM short_link WHERE short_code LIKE ?", SCAN_PREFIX + "%");
+    }
+
+    private long insertScanCode(String shortCode, LinkStatus status) {
+        linkRepository.insert(new Link(null, shortCode, "https://example.com/scan", status,
+                false, null, null, null));
+        return linkRepository.findByShortCode(shortCode)
+                .orElseThrow(() -> new AssertionError("插入后回查不到: " + shortCode))
+                .id();
+    }
+
+    @Test
+    @DisplayName("⭐ 批次边界：N<limit / N==limit / N>limit 三种都返回 min(N, limit)")
+    void scanActiveWithId_shouldRespectBatchLimitAtAllBoundaries() {
+        cleanupScanCodes();
+
+        // N=3 < limit=5
+        long a = insertScanCode(SCAN_PREFIX + "001", LinkStatus.ACTIVE);
+        long b = insertScanCode(SCAN_PREFIX + "002", LinkStatus.ACTIVE);
+        long c = insertScanCode(SCAN_PREFIX + "003", LinkStatus.ACTIVE);
+
+        assertThat(linkRepository.scanActiveWithId(0L, 5))
+                .as("N=3 < limit=5：应全部返回")
+                .hasSize(3);
+
+        // N==limit=5：补 2 条，恰好 5 条
+        long d = insertScanCode(SCAN_PREFIX + "004", LinkStatus.ACTIVE);
+        long e = insertScanCode(SCAN_PREFIX + "005", LinkStatus.ACTIVE);
+        assertThat(linkRepository.scanActiveWithId(0L, 5))
+                .as("N=5 == limit=5：应恰好返回 5 条，不多不少")
+                .hasSize(5);
+
+        // N>limit：补 1 条变6 条，limit 仍是 5
+        long f = insertScanCode(SCAN_PREFIX + "006", LinkStatus.ACTIVE);
+        assertThat(linkRepository.scanActiveWithId(0L, 5))
+                .as("N=6 > limit=5：必须被截断到 5 条，**返回更多就是 LIMIT 没生效**")
+                .hasSize(5);
+
+        // 确认第三个场景确实是 6 条数据，只是不返回第 6 条
+        long all = linkRepository.scanActiveWithId(0L, 100).size();
+        assertThat(all).as("库里应有 6 条").isEqualTo(6);
+        assertThat(linkRepository.scanActiveWithId(0L, 5))
+                .as("截断结果里不应含最大 id（应由下一批取）")
+                .noneMatch(r -> r.id() == f);
+        assertThat(List.of(a, b, c, d, e)).allSatisfy(id ->
+                assertThat(linkRepository.scanActiveWithId(0L, 100))
+                        .anyMatch(r -> r.id() == id));
+
+        cleanupScanCodes();
+    }
+
+    @Test
+    @DisplayName("⭐⭐ 游标严格递增：下一批最小 id **严格大于**上一批最大 id（漏扫会让真实短码404）")
+    void scanActiveWithId_cursorShouldStrictlyIncrease() {
+        cleanupScanCodes();
+        for (int i = 1; i <= 10; i++) {
+            insertScanCode(SCAN_PREFIX + String.format("%03d", i), LinkStatus.ACTIVE);
+        }
+
+        List<LinkRepository.IdShortCode> firstBatch =
+                linkRepository.scanActiveWithId(0L, 4);
+        List<LinkRepository.IdShortCode> secondBatch =
+                linkRepository.scanActiveWithId(firstBatch.get(firstBatch.size() - 1).id(), 4);
+
+        assertThat(firstBatch).hasSize(4);
+        assertThat(secondBatch).hasSize(4);
+
+        long firstBatchMax = firstBatch.get(firstBatch.size() - 1).id();
+        long secondBatchMin = secondBatch.get(0).id();
+
+        // ⚠️ 必须**严格大于**。若写成 >= 或误用「最后一个 id - 1」，
+        // 边界那条记录会被重复取或跳过；跳过的后果是布隆缺该短码
+        // -> 判「不存在」-> 真实用户收到 404（DR-007 假阴性故障）
+        assertThat(secondBatchMin)
+                .as("游标必须严格递增，否则会漏扫或重扫")
+                .isGreaterThan(firstBatchMax);
+
+        // 批内也必须严格递增（ORDER BY id 生效）
+        assertThat(firstBatch).isSortedAccordingTo(
+                java.util.Comparator.comparingLong(LinkRepository.IdShortCode::id));
+        assertThat(secondBatch).isSortedAccordingTo(
+                java.util.Comparator.comparingLong(LinkRepository.IdShortCode::id));
+
+        // 连续扫 3 批，覆盖全部 10 条且无重复——这是「不漏扫」的直接证据
+        java.util.Set<Long> seen = new java.util.HashSet<>();
+        long cursor = 0L;
+        for (int batchNo = 0; batchNo < 3; batchNo++) {
+            List<LinkRepository.IdShortCode> batch =
+                    linkRepository.scanActiveWithId(cursor, 4);
+            if (batch.isEmpty()) {
+                break;
+            }
+            for (LinkRepository.IdShortCode row : batch) {
+                assertThat(seen.add(row.id()))
+                        .as("短码 id %d 被重复取到——游标推进有误", row.id())
+                        .isTrue();
+            }
+            cursor = batch.get(batch.size() - 1).id();
+        }
+        assertThat(seen).as("3 批 × 4 条应覆盖全部 10 条").hasSize(10);
+
+        cleanupScanCodes();
+    }
+
+    @Test
+    @DisplayName("⭐ 只返回 ACTIVE：DELETED 不出现；全 DELETED 时返回空")
+    void scanActiveWithId_shouldReturnOnlyActiveRows() {
+        cleanupScanCodes();
+        insertScanCode(SCAN_PREFIX + "a1", LinkStatus.ACTIVE);
+        insertScanCode(SCAN_PREFIX + "d1", LinkStatus.DELETED);
+        insertScanCode(SCAN_PREFIX + "a2", LinkStatus.ACTIVE);
+        insertScanCode(SCAN_PREFIX + "d2", LinkStatus.DELETED);
+
+        List<LinkRepository.IdShortCode> rows = linkRepository.scanActiveWithId(0L, 100);
+
+        assertThat(rows).as("DELETED 不应被重建进布隆").hasSize(2);
+        assertThat(rows).extracting(LinkRepository.IdShortCode::shortCode)
+                .containsExactlyInAnyOrder(SCAN_PREFIX + "a1", SCAN_PREFIX + "a2");
+
+        // 全 DELETED 的边界：必须返回空列表而不是 null
+        cleanupScanCodes();
+        insertScanCode(SCAN_PREFIX + "x1", LinkStatus.DELETED);
+        insertScanCode(SCAN_PREFIX + "x2", LinkStatus.DELETED);
+
+        assertThat(linkRepository.scanActiveWithId(0L, 100))
+                .as("全 DELETED 时应返回空列表")
+                .isEmpty();
+
+        // 库里其实有 DELETED 数据——确认上面的空不是因为数据没插进去
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM short_link WHERE short_code LIKE ?", Integer.class,
+                SCAN_PREFIX + "%")).isPositive();
+
+        cleanupScanCodes();
+    }
+
+    @Test
+    @DisplayName("⭐⭐ 覆盖索引生效：key=idx_status_code 且 Extra 含 Using index（不回表）")
+    void scanActiveWithId_shouldUseCoveringIndexWithoutTableLookup() {
+        // ⚠️ EXPLAIN 断言**依赖表里有数据**：MySQL 优化器在空表时会选全表扫
+        // （扫 0 行的代价低于走索引），此时 key 会是 NULL，断言必然失败。
+        // 因此先插入足够的数据让优化器愿意用索引。
+        cleanupScanCodes();
+        for (int i = 1; i <= 50; i++) {
+            insertScanCode(SCAN_PREFIX + String.format("e%03d", i), LinkStatus.ACTIVE);
+        }
+
+        // ⚠️ SQL 必须与 LinkMapper.xml 里selectIdAndShortCodeAfter **逐字一致**，
+        // 否则 EXPLAIN 测的是另一条语句、优化器的选择可能不同。
+        List<Map<String, Object>> plan = jdbcTemplate.queryForList(
+                "EXPLAIN SELECT id, short_code FROM short_link "
+                        + "WHERE status = 0 AND id > ? ORDER BY id LIMIT ?", 0L, 10);
+
+        assertThat(plan).as("EXPLAIN 应返回一行计划").hasSize(1);
+        Map<String, Object> row = plan.get(0);
+        String key = row.get("key") == null ? null : String.valueOf(row.get("key"));
+        String extra = String.valueOf(row.get("Extra"));
+        String type = String.valueOf(row.get("type"));
+
+        assertThat(key)
+                .as("应命中 idx_status_code 覆盖索引（status, short_code）")
+                .isEqualTo("idx_status_code");
+        assertThat(extra)
+                .as("Extra 应含 Using index（覆盖索引，不回表读 target_url）")
+                .contains("Using index");
+        assertThat(type)
+                .as("type 应为 ref（走索引等值+范围），不能是 ALL（全表扫）")
+                .isNotEqualTo("ALL");
+
+        // ⚠️ 顺带记录一个**已知性能特征**：Extra 里还有 "Using filesort"。
+        // 原因是 idx_status_code 的列顺序为 (status, short_code)，
+        // ORDER BY id 无法利用其有序性，排序在内存/文件里完成。
+        // 这**不是缺陷**：布隆重建每批 1000 条，排序代价相对 1000 万行的扫描可忽略；
+        // 改成 (status, id, short_code) 反而要多维护一个索引。
+        // 写在这里是为了免得后人看到 filesort 就误判为缺陷、或盲目加索引。
+
+        cleanupScanCodes();
+    }
 }

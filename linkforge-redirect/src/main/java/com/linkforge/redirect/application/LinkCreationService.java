@@ -12,6 +12,7 @@ import com.linkforge.core.repository.ShortCodeGenerator.ShortCodeGenerationExcep
 import com.linkforge.core.time.TimeConverter;
 import com.linkforge.redirect.api.dto.CreateLinkRequest;
 import com.linkforge.redirect.api.dto.CreateLinkResponse;
+import com.linkforge.redirect.infrastructure.cache.BloomFilterMaintenance;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.LocalDateTime;
@@ -21,6 +22,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * 创建短链用例（docs/API.md §5）。
@@ -65,6 +68,7 @@ public class LinkCreationService {
     private final ShortLinkBaseUrl baseUrl;
     private final TimeConverter timeConverter;
     private final ZoneId displayZone;
+    private final BloomFilterMaintenance bloomMaintenance;
     private final Counter idConflictCounter;
 
     public LinkCreationService(LinkRepository linkRepository,
@@ -73,6 +77,7 @@ public class LinkCreationService {
                                ShortLinkBaseUrl baseUrl,
                                TimeConverter timeConverter,
                                ZoneId displayZone,
+                               BloomFilterMaintenance bloomMaintenance,
                                MeterRegistry meterRegistry) {
         this.linkRepository = linkRepository;
         this.shortCodeGenerator = shortCodeGenerator;
@@ -80,6 +85,7 @@ public class LinkCreationService {
         this.baseUrl = baseUrl;
         this.timeConverter = timeConverter;
         this.displayZone = displayZone;
+        this.bloomMaintenance = bloomMaintenance;
         this.idConflictCounter = Counter.builder("shortlink_id_conflict_total")
                 .description("自动生成短码插入时命中唯一索引的次数。理论上应恒为 0；"
                         + "突增说明发号器号段可能回退（docs/DECISIONS.md DR-022）")
@@ -104,12 +110,38 @@ public class LinkCreationService {
         // 2. 自定义短码：冲突**不重试**，直接 409（PRD US-2：不静默覆盖）
         if (custom) {
             Link link = insertCustom(request.customCode(), request.targetUrl(), expireAtUtc);
+            // ⚠️ 与自动短码一样挂到提交后（见 step 4 的说明）
+            registerBloomWriteThrough(link.shortCode());
             return toResponse(link);
         }
 
         // 3. 自动短码：唯一索引冲突时重新发号重试
         Link link = insertGenerated(request.targetUrl(), expireAtUtc);
+        // 4. 写穿布隆（ARCHITECTURE.md §259）。⚠️ 必须在**事务提交之后**——
+        //    布隆写入不属于数据库事务；若在事务内写，事务回滚后布隆里会留下
+        //    一个「存在」但库里没有的短码。它不会导致 404（误判存在只多查一次库），
+        //    但会永久占着布隆的位，直到下次重建。
+        //    实现见 registerBloomWriteThrough。
+        registerBloomWriteThrough(link.shortCode());
         return toResponse(link);
+    }
+
+    /**
+     * 把布隆写穿挂到<b>事务提交后</b>。
+     *
+     * <p>⚠️ 没有事务时（理论上不会，{@code @Transactional} 保证有）立即执行。
+     */
+    private void registerBloomWriteThrough(String shortCode) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            bloomMaintenance.writeThrough(shortCode);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                bloomMaintenance.writeThrough(shortCode);
+            }
+        });
     }
 
     private Link insertCustom(String customCode, String targetUrl, LocalDateTime expireAtUtc) {
