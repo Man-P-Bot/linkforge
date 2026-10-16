@@ -1,0 +1,14 @@
+# 压测专用 overlay：临时放宽限流阈值。
+#
+# ⚠️ 为什么不直接改 .env：.env 是「生产默认值」的约定（20/s、10/min），
+# 改它就得记得改回来——漏一次就会把压测配置带进后续所有运行。
+# overlay 只在压测时用 `docker compose -f docker-compose.yml -f docker-compose.bench.yml up`，
+# 压完不加载即失效。
+#
+# ⚠️ 为什么跳转也需要放宽：8万 QPS 的压测流量必然触发 20/s 的限流，
+# 那时测到的会是「限流后的 429 响应」而不是跳转性能。
+services:
+  app:
+    environment:
+      RATE_LIMIT_REDIRECT_PER_SEC: "1000000"
+      RATE_LIMIT_CREATE_PER_MIN: "1000000"
