@@ -1222,3 +1222,38 @@
 - **通用规则**：任何会被高频触达的异常路径，日志必须**去重或限流**
   （按短码采样、按时间窗聚合），否则单点异常就能淹没整个错误日志。
   这与 DR-043（基础设施异常必须显式映射）、DR-044（404 不是 500）是同一条主线的三个实例。
+
+## DR-050 targetUrl 显式拒绝 C0 控制字符（U+0000~U+001F）
+
+- **背景**：第 2 周做缓存序列化时发现缺陷——`targetUrl` 用 `\n` 分隔存储会串位。
+  改用长度前缀格式后回头追查，发现**更根本的问题**：`LinkValidator`
+  只校验协议与长度，从未显式排除控制字符。
+- **⚠️ 实测结论（重要，不要误读为「堵上了安全漏洞」）**：
+  JDK 17 的 `java.net.URI` 对 `\n \r \t \0` 及其它 C0 控制字符**一律抛
+  `URISyntaxException`**（已在容器内实测：`\n`、`\r`、`\t`、`\u0000`、`\u0007` 全部 FAIL）。
+  **也就是说这个输入当前并没有真的漏过去**，它被 JDK 兜住了。
+  本次修复的实质是：**把「碰巧被第三方实现兜住的事」变成「我们自己的契约」**。
+- **决策**：`LinkValidator.validateTargetUrl` 在**协议白名单之前**
+  显式扫描 C0 控制字符，命中即抛 `LINKFORGE-400-01`，消息含具体码位（如 `U+000A`）。
+- **为什么不依赖 URI 解析兜底**：
+  1. **JDK 行为可能变化**——不同版本、不同 URI 实现的严格程度不同，
+     把正确性押在第三方实现细节上是不可持续的依赖；
+  2. **存在绕过 URI 解析的路径**——当前顺序是「协议白名单（纯字符串 `startsWith`）
+     → URI 解析」，而缓存序列化、统计落库等路径可能不经 URI 解析；
+  3. **错误码不对**——靠 `URISyntaxException` 兜住时消息是「targetUrl 不是合法 URI」，
+     调用方无法区分「有个控制字符」与「URI 结构写错了」。
+- **⚠️ 刻意不拦截的两类输入**：
+  - **百分号编码**（`%0A`、`%09`）：这是**合法 URL**，符合 RFC 3986 的
+    percent-encoding 规则，在 HTTP 传输层安全（不会真的产生 header 注入）。
+    过度拦截合法 URL 比放过一个编码形式更有害。
+    回归测试 `encodedFormsAreAllowed` 锁住这个决定，防止后人写成「任何不可见字符都拒绝」。
+  - **U+007F（DEL）**：不在 C0 段内。实测 `new URI()` 也会拒它，
+    但那是 URI 解析的既有行为，与本检查无关。若要扩展，改的是 `findControlChar` 的边界。
+    回归测试 `delIsNotBlockedByControlCharCheck` **断言的是「不是被控制字符检查拦下的」**
+    而不是「整体通过校验」——这个区别必须写清楚，否则会被误读为漏网之鱼。
+- **回归测试**：`LinkValidatorTest.ControlChars`（12 个）
+  - `c0ControlCharsRejected`（参数化 7 个码位）
+  - `messageIdentifiesTheCharacter`
+  - `encodedFormsAreAllowed`（参数化 2 个）
+  - `delIsNotBlockedByControlCharCheck`
+  - `checkedBeforeProtocolCheck`（含控制字符的 `javascript:` 必须返回 400-01 而非 400-02）

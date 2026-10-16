@@ -281,6 +281,7 @@ insert 回读（缺陷 1 的回归测试）、`createdAt` 时区、`expireAt` In
 | **DR-047** | 本地缓存只缓存 Hit——用泛型在**编译期**挡住 NegativeHit，防止刚创建的短码持续 404 达5 分钟 |
 | **DR-048** | 回源异常绝不进缓存；缓存命中也必须走状态判定；evict 顺序先本地后 Redis |
 | **DR-049** | 异常日志必须去重或限流，否则会淹没真实故障信号（第 2 周实证：610 万行 ERROR → 30 条 WARN） |
+| **DR-050** | `targetUrl` 显式拒绝 C0 控制字符（U+0000~U+001F）→ 400-01。**实测当前并未漏过去**（`java.net.URI` 已兜住），本次是把「依赖第三方实现」变成「自己的契约」 |
 
 ### 数据库权限边界（详见 DR-034）
 
@@ -733,6 +734,31 @@ SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3307/linkforge?useSSL=false&allowPu
 
 ### 测试
 
-**343 个测试 0 失败**（Core 124 + Redirect 191 + App 28）。
+**355 个测试 0 失败**（Core 124 + Redirect 203 + App 28）。
 新增 41 个：RedisRedirectCacheTest（18）、TwoLevelRedirectCacheTest（10）、
 RedirectServiceCacheTest（10）、NoResourceFoundHandlerTest 已在 D6 收尾计入。
+
+
+### D2 收尾修正（第 2 周末，2026-10-16）
+
+**修正 1：6 倍归因**。「瓶颈在数据库侧」改为「**瓶颈在『数据库访问路径』，
+不在『数据库查询本身』**」——`type=const` 全内存命中下查询本身无优化空间，
+但每次请求仍有 JDBC 连接借还、SQL 解析、`ResultSet → Java` 映射、事务边界等固定开销。
+
+**修正 2：100% 命中率标注「设计必然」**。三个条件叠加导致它必然是 100%：
+预热填满 1 万条 + 窗口内无新增 + 数据量恰好等于 `maximumSize`。
+真实生产不可能 100%。这个数字只证明「缓存路径通畅」，不代表生产命中率。
+
+**修正 3：`LinkValidator` 拒控制字符（DR-050）**。
+⚠️ **实测结论与预期不同，值得单独记录**：JDK 17 的 `java.net.URI` 对
+`\n \r \t \0 \u0007` **一律抛 `URISyntaxException`**——
+**这个输入当前并没有真的漏过去**，被 JDK 兜住了。
+本次修复的实质是把「碰巧被第三方实现兜住的事」变成「我们自己的契约」。
+理由有三：JDK 行为可能变化；存在绕过 URI 解析的代码路径；错误码不对
+（靠 URI 兜住时消息是「不是合法 URI」，无法区分是控制字符还是结构写错）。
+
+刻意**不拦截** `%0A` 百分号编码（合法 URL，RFC 3986）与 `U+007F`（不在 C0 段内），
+各有回归测试锁住这个决定。
+
+**测试**：355 个测试 0 失败（Core 124 + Redirect 203 + App 28），
+`LinkValidatorTest.ControlChars` 新增 12 个。

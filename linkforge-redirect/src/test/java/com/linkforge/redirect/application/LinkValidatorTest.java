@@ -119,6 +119,66 @@ class LinkValidatorTest {
     }
 
     @Nested
+    @DisplayName("targetUrl：控制字符（DR-050）")
+    class ControlChars {
+
+        @ParameterizedTest(name = "含 U+{0} → 400-01")
+        @ValueSource(chars = {'\n', '\r', '\t', '\u0000', '\u0007', '\u001B', '\u001F'})
+        @DisplayName("⭐ C0 控制字符（U+0000~U+001F）一律拒绝，错误码 400-01")
+        void c0ControlCharsRejected(char controlChar) {
+            // ⚠️ 必须用 @ValueSource(chars=...)。曾试过 @ValueSource(strings={"000A"})
+            // 再 Integer.parseInt 的写法——JUnit 无法把 "000A" 转成 char，
+            // **静默不注册任何用例**，表现为「Tests run: 0」且没有失败信息。
+            String url = "https://example.com/a" + controlChar + "b";
+
+            assertThatThrownBy(() -> validator.validateTargetUrl(url))
+                    .isInstanceOf(LinkForgeException.class)
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+
+        @Test
+        @DisplayName("⭐ 错误消息含控制字符的码位，便于定位是哪个字符")
+        void messageIdentifiesTheCharacter() {
+            assertThatThrownBy(() -> validator.validateTargetUrl("https://example.com/a\nb"))
+                    .hasMessageContaining("U+000A");
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {"https://example.com/a%0Ab", "https://example.com/a%09b"})
+        @DisplayName("⭐ 百分号编码**刻意放行**——%0A 是合法 URL（RFC 3986 percent-encoding）")
+        void encodedFormsAreAllowed(String url) {
+            // ⚠️ 不要「顺手」把 %0A 也拦掉——过度拦截合法 URL 比放过一个编码形式更有害。
+            // 这条测试的作用是防止后人把控制字符检查写成「任何不可见字符都拒绝」。
+            assertThatCode(() -> validator.validateTargetUrl(url)).doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("⭐ U+007F（DEL）不在**控制字符检查**的拦截范围——它不在 C0 段内")
+        void delIsNotBlockedByControlCharCheck() {
+            // ⚠️ 断言的是「**不是被控制字符检查拦下的**」，不是「整体通过校验」。
+            // DEL 确实会被 new URI() 拒（java.net.URI 把它视为不可打印字符），
+            // 那是 URI 解析的既有行为，与本检查无关。
+            // 写清楚这个区别，是为了避免后人误以为 DEL 是「漏网之鱼」。
+            // 若将来要拦截 DEL，改的是 findControlChar 的边界，不是这里。
+            assertThatThrownBy(() -> validator.validateTargetUrl("https://example.com/a\u007Fb"))
+                    .isInstanceOf(LinkForgeException.class)
+                    .hasMessageNotContaining("控制字符");
+        }
+
+        @Test
+        @DisplayName("⭐ 控制字符检查在协议白名单**之前**（不依赖 JDK 的 URI 解析兜底）")
+        void checkedBeforeProtocolCheck() {
+            // 若顺序反了，会先命中「协议不允许」返回 400-02，而不是 400-01。
+            // 显式检查的价值就在这里：不依赖 new URI() 恰好抛 URISyntaxException。
+            assertThatThrownBy(() -> validator.validateTargetUrl("javascript:alert\u0007(1)"))
+                    .isInstanceOf(LinkForgeException.class)
+                    .extracting(e -> ((LinkForgeException) e).errorCode())
+                    .isEqualTo(ErrorCode.INVALID_PARAMETER);
+        }
+    }
+
+    @Nested
     @DisplayName("customCode：格式与保留字（大小写不敏感）")
     class CustomCode {
 

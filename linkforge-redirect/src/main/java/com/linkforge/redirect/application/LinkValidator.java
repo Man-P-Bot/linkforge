@@ -53,7 +53,7 @@ public class LinkValidator {
     /**
      * 校验目标地址。
      *
-     * @throws LinkForgeException {@link ErrorCode#INVALID_PARAMETER} 为空/超长/畸形；
+     * @throws LinkForgeException {@link ErrorCode#INVALID_PARAMETER} 为空/超长/含控制字符/畸形；
      *                            {@link ErrorCode#UNSUPPORTED_PROTOCOL} scheme 不在白名单
      */
     public void validateTargetUrl(String targetUrl) {
@@ -64,6 +64,16 @@ public class LinkValidator {
             // 明确**拒绝**而不是截断：截断会产生指向错误地址的短链，比拒绝危险得多（DATABASE §4.1）
             throw new LinkForgeException(ErrorCode.INVALID_PARAMETER,
                     "targetUrl 长度 " + targetUrl.length() + " 超过上限 " + TARGET_URL_MAX_LENGTH);
+        }
+
+        // ⚠️ 控制字符必须在 URI 解析**之前**显式拒绝（DR-050）。
+        // 见下方 findControlChar 的说明：URI 解析虽然也会拒，但那是依赖 JDK 实现的
+        // 偶然行为，不是我们自己的契约。显式拒绝才是契约。
+        char controlChar = findControlChar(targetUrl);
+        if (controlChar != 0) {
+            throw new LinkForgeException(ErrorCode.INVALID_PARAMETER,
+                    "targetUrl 不能包含控制字符（U+0000~U+001F）：发现 U+"
+                            + String.format("%04X", (int) controlChar));
         }
 
         // ⚠️ 先做「有没有 http/https 前缀」这个纯字符串判断，**再做 URI 解析**。
@@ -92,6 +102,54 @@ public class LinkValidator {
         if (uri.getHost() == null || uri.getHost().isBlank()) {
             throw new LinkForgeException(ErrorCode.INVALID_PARAMETER, "targetUrl 缺少 host");
         }
+    }
+
+    /**
+     * 查找第一个 C0 控制字符（U+0000~U+001F）。
+     *
+     * <h2>⚠️ 为什么必须显式检查，而不是依赖 {@link URI} 解析</h2>
+     * 第 2 周实现缓存序列化时发现一个缺陷：{@code targetUrl} 用 {@code \n} 分隔存储会串位。
+     * 追查后发现更根本的问题——<b>校验器从未显式排除控制字符</b>。
+     *
+     * <p>⚠️ <b>实测：当前并没有真的漏过去</b>。JDK 17 的 {@code java.net.URI}
+     * 对 {@code \n \r \t \0} 及其它 C0 控制字符一律抛 {@code URISyntaxException}
+     * （已实测验证）。所以这次修复<b>不是堵安全漏洞</b>，而是把一件
+     * 「碰巧被第三方实现兜住的事」变成「我们自己的契约」。
+     *
+     * <p>这在三个场景下会失效：
+     * <ol>
+     *   <li><b>JDK 行为变化</b>：不同 JDK 版本、不同 URI 实现的严格程度不同，
+     *       依赖它等于把正确性押在第三方实现细节上；</li>
+     *   <li><b>绕过 URI 解析的代码路径</b>：当前顺序是「先协议白名单（纯字符串
+     *       {@code startsWith}）→ 再 URI 解析」，而缓存序列化、统计落库等路径
+     *       可能不经 URI 解析；</li>
+     *   <li><b>错误码不对</b>：靠 URISyntaxException 兜住时，消息是
+     *       「targetUrl 不是合法 URI」，调用方无法区分「有个控制字符」
+     *       与「URI 结构写错了」。</li>
+     * </ol>
+     *
+     * <p>⚠️ <b>不拦截百分号编码形式</b>：{@code %0A} 是<b>合法</b>的 URL，
+     * 符合 RFC 3986 的 percent-encoding 规则。它在 HTTP 传输层是安全的
+     * （不会真的产生 header 注入），<b>刻意放行</b>——
+     * 过度拦截合法 URL 比放过一个编码形式更有害。回归测试
+     * {@code encodedFormsAreAllowed} 锁住这个决定。
+     *
+     * <p>⚠️ <b>不拦截 U+007F（DEL）</b>：它不在 C0 段（U+0000~U+001F）内。
+     * 实际上 {@code java.net.URI} 也会拒它，但那是 URI 解析的行为，
+     * 与本检查无关。若将来要扩展，改的是这里的边界。
+     *
+     * @return 第一个控制字符；没有则返回 {@code 0}（{@code 0} 本身是合法控制字符，
+     *         所以用 {@code 0} 表示「没找到」是安全的：真找到 {@code \u0000} 时
+     *         调用方也会因消息含控制字符而立即抛异常，不会继续往下走）
+     */
+    private static char findControlChar(String targetUrl) {
+        for (int i = 0; i < targetUrl.length(); i++) {
+            char c = targetUrl.charAt(i);
+            if (c <= 0x1F) {
+                return c;
+            }
+        }
+        return 0;
     }
 
     // ---------------------------------------------------------------------
