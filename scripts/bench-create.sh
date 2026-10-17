@@ -7,12 +7,12 @@
 #
 # 用法：
 #   ./scripts/bench-create.sh                 # 容器内并发（默认，快）
-#   ./scripts/bench-create.sh 10000 50 host   # 宿主 fork 并发（慢，仅供对照）
+#   ./scripts/bench-create.sh 10000 20 host   # 宿主 fork 并发（慢，仅供对照）
 #
 # ⚠️ 为什么默认走容器：
-#   宿主版每个请求都要 fork 一个 bash + curl 进程。实测 50 并发下
-#   **每分钟仅约 13 个请求**（进程创建开销远大于请求本身），
-#   造 1 万个需要约 12 小时。容器内单进程并发无此开销，实测快 3 个数量级。
+#   宿主版每个请求都要 fork 一个 bash + curl 进程。实测 20 并发下
+#   **每分钟仅约 5 个请求**（进程创建开销远大于请求本身），
+#   造 1 万个需要约 14 小时。容器内单进程并发无此开销，实测快 3 个数量级。
 #   ⚠️ 这只影响造数速度，**不影响被测应用**——两者打的是同一个 app:8080。
 #   但报告里必须注明造数是容器内发起的，否则会被误读成「应用吞吐只有 13/s」。
 #
@@ -24,16 +24,63 @@
 # ⚠️ 最终唯一性检查才是权威判据：
 #   无论 201/503 各多少，只要数据库里出现重复 short_code 就说明发号器坏了。
 #   脚本最后直接查库做 GROUP BY 判定，不依赖任何计数器的推断。
+#
+# ⚠️ 并发数默认 20，不是 50——**并发必须小于连接池大小的 2 倍**：
+#   创建接口每个请求都要开一个数据库连接（HikariCP maximum-pool-size=10）。
+#   并发 50 时实测出现：
+#     HikariPool-1 - Connection is not available, request timed out after 30000ms
+#     (total=10, active=10, idle=0, waiting=136)
+#   即 136 个请求在排队等 10 个连接，30 秒后集体超时，造数只完成 3432/10000。
+#   并发 20 = 池子 2 倍，是「能压满但不排队」的上界。
+#
+#   ⚠️ **不要为了造数去调大连接池**——那是生产配置，
+#   为了造数方便而改生产参数，等于让压测语料的生产环境与真实环境不一致。
+#   造数慢一点没关系，它不参与性能数据。
 # =============================================================================
 set -uo pipefail
 
+# --dry-run：只打印将要执行的命令，**不执行 docker/curl**。
+# ⚠️ 为什么要有它：`bash -x` **不是 dry-run，它照常执行**。
+#   曾用 `bash -x scripts/bench-create.sh 10000 2` 想「看看实际命令」，
+#   结果它真的造了 1350 条数据进库。
+#   「以为在观察、实际在执行」与「timeout 杀宿主但容器内进程存活」
+#   是同一种认知偏差（见 DR-053）。
+#   想看命令就用脚本自己的 --dry-run，不要用 -x。
+# ⚠️ 必须先剥离 --dry-run 再取位置参数，否则 `bench-create.sh 10000 --dry-run`
+#   会把 "--dry-run" 当成 $2（并发数）。
+DRY_RUN=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
 TOTAL="${1:-10000}"
-CONCURRENCY="${2:-50}"
+CONCURRENCY="${2:-20}"
 MODE="${3:-container}"
 BASE_URL_HOST="${BASE_URL:-http://localhost:8080}"
 BASE_URL_CONTAINER="http://app:8080"
 NETWORK="${DOCKER_NETWORK:-linkforge_default}"
 WORK_DIR="${WORK_DIR:-./benchmark/results}"
+
+# ⚠️ docker -v 的源路径**必须是 Windows 格式或 Docker 能自动转换的 MSYS 格式**。
+#   相对路径（如 ./benchmark/results）在 Git Bash 下会被 Docker 当成**无名卷**，
+#   容器内 /out 不存在 → 输出重定向失败 → 脚本 exit=1，
+#   但 create-err.log 是空的，看起来像「没有原因」。
+#   这个坑的实际后果：曾误判为「造数并发太高导致连接池超时」，
+#   而真因是路径——两者是独立问题，不能混为一谈。
+#   pwd -W 是 Git Bash 专有的，返回 D:/... 格式（正斜杠，Docker 友好）。
+#   某些版本不可用时回退到 cygpath -w（返回 D:/... 反斜杠，Docker 同样接受）。
+if [ -d "$WORK_DIR" ]; then
+  WORK_DIR_ABS="$(cd "$WORK_DIR" && pwd -W 2>/dev/null || true)"
+  if [ -z "$WORK_DIR_ABS" ]; then
+    WORK_DIR_ABS="$(cygpath -w "$(cd "$WORK_DIR" && pwd)" 2>/dev/null || true)"
+  fi
+  [ -n "$WORK_DIR_ABS" ] && WORK_DIR="$WORK_DIR_ABS"
+fi
 CODE_LIST="$WORK_DIR/codes.txt"
 SUMMARY="$WORK_DIR/create-summary.txt"
 
@@ -43,12 +90,35 @@ if [ "$MODE" = "host" ]; then
   exec "$0" "$TOTAL" "$CONCURRENCY" internal-host
 fi
 
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "=== [DRY-RUN] 不会执行任何 docker/curl，仅打印将执行的命令 ==="
+  echo
+  echo "目标数量 : $TOTAL"
+  echo "并发数   : $CONCURRENCY"
+  echo "模式     : $MODE"
+  echo "网络     : $NETWORK"
+  echo "WORK_DIR : $WORK_DIR"
+  echo
+  echo "--- 将执行 ---"
+  echo "docker run --rm --network $NETWORK \\"
+  echo "  -v $WORK_DIR:/out alpine:3 sh -c '... xargs -P $CONCURRENCY ... curl -X POST $BASE_URL_CONTAINER/api/v1/links ...'"
+  echo
+  echo "--- 将写入 ---"
+  echo "$CODE_LIST（短码清单）"
+  echo "$SUMMARY（统计摘要）"
+  echo "$WORK_DIR/create-raw.log（原始响应）"
+  echo "$WORK_DIR/create-err.log（stderr）"
+  echo
+  echo "=== DRY-RUN 结束，未做任何修改 ==="
+  exit 0
+fi
+
 # ---------------------------------------------------------------- 容器内并发
 if [ "$MODE" = "container" ]; then
   echo "=== LinkForge 并发造数（容器内并发）==="
   echo "目标数量 : $TOTAL"
   echo "并发数   : $CONCURRENCY"
-  echo "目标地址 : $BASE_URL_CONTAINER（compose 网络内服务名，非 localhost）"
+  echo "目标地址 : $BASE_URL_CONTAINER（compose 网络内容器名，非 localhost）"
   echo
 
   START_TS=$(date +%s)
