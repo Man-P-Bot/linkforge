@@ -58,8 +58,10 @@ docker/redis/data/
 *.aof
 
 # --- Benchmark / report artifacts ---
-benchmark/results/
-benchmark/*.tmp
+# ⚠️ 整个压测产物目录都忽略：
+#   results/codes.txt 是**每次压测重新生成**的语料，提交它会让下次压测误用旧数据；
+#   根下的 cag.lua / fprate.txt 是验证脚本的临时文件，每次重建。
+benchmark/
 
 # --- OS noise ---
 .DS_Store

@@ -34,6 +34,18 @@ spring:
       pool-name: linkforge-test-pool
       maximum-pool-size: 4
 
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # ⚠️ 测试环境放宽到 1000ms：冷连接 + 上下文初始化会打满 50ms
+      #    （实测 SpringBootTest 首条命令即RedisCommandTimeoutException）
+      #    ⚠️ **生产 application.yml 保持 50ms 不动**（DR-011）：
+      #    那是跳转命令的执行预算，不该被连接建立消耗。
+      #    放宽只发生在测试 profile——否则测试会测一个「与生产不同的超时」，
+      #    而超时行为正是需要验证的东西之一。
+      timeout: 1000ms
+
   flyway:
     enabled: true
     locations: classpath:db/migration

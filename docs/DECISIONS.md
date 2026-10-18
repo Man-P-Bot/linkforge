@@ -1548,3 +1548,91 @@ SELECT MIN(short_code) FROM short_link WHERE id > 18 AND is_custom = 0;
 ### 触发场景
 
 第 3 周压测前清理数据时。
+
+## DR-054 Lua 合并调用的三个缺陷，以及「验证两层 ≠ 验证链路」
+
+### 背景
+
+`ecac087`（第 3 周）提交了 `RedisBloomFilter.checkAndGet`——把「布隆检查 +
+L2 查询」合并为一次 Redis 往返。提交时我写「5 条验证全过」。
+
+**实际上线后跳转全部 500。**
+
+### 三个缺陷
+
+| # | 缺陷 | 后果 |
+|---|---|---|
+| 1 | `toArgs` 返回 `List<String>`，而 `redisTemplate.execute(script, keys, Object... args)` 是**变参** | List 被当作单个元素包成 `Object[]{list}`，`StringRedisSerializer` 内部 `(String) value` 强转 → **ClassCastException** |
+| 2 | `toArgs` 首元素放的是 `BIT_SIZE` 占位符，Lua 从 `for i = 2` 开始 | 实际只检查 **k-1 = 6** 个位，**Lua 不报错** |
+| 3 | `catch (DataAccessException e)` 抓不住 CCE（它是 `RuntimeException`） | 本该「降级为回源」的兜底失效，异常穿透到 Controller → 500 |
+
+### 三层测试的实际覆盖
+
+| 层 | 当时的验证 | 有效性 |
+|---|---|---|
+| Lua 脚本行为 | `redis-cli --eval` + MONITOR | ✅ 真的验过 |
+| 返回值解析 | Mockito 构造 `List.of(...)` | ⚠️ 形状由测试者决定 |
+| **Java 调用 → Spring Data Redis → Lua** | **完全没有** | ❌ **缺陷所在** |
+
+`RedisBloomFilterTest` 是 `@ExtendWith(MockitoExtension.class)` + `@Mock
+StringRedisTemplate`——**`redis.execute` 本身被打桩**。参数序列化的真实行为
+从未执行。
+
+### 教训一：「两端都验过」不等于「链路通了」
+
+> Lua 用 redis-cli 验了，解析用 mock 验了，
+> **中间那层「Java 把参数交给 Spring Data Redis」没人验**——
+> 而 `checkAndGet` 从提交到本次排查前，**Java 调用路径一次都没跑通过**。
+
+与 DR-042 同源但更严重：
+- DR-042：测试全绿，但路径未执行
+- 本次：**测试全绿、脚本也对，但它们从未接在一起**
+
+规则：**验证的覆盖范围必须明确说清——验证的是哪一层，不是整条链路。**
+写「验证全过」时要说「验证了 Lua 行为与解析逻辑」，
+不能省略成「验证全过」。
+
+### 教训二：跨进程/跨语言边界必须有全链路集成测试
+
+涉及 Redis Lua、HTTP 外部调用、MQ 序列化时，mock + 脚本单独验证不够——
+必须有**走真实链路、断言外部可见效果**的测试（HTTP 状态码 + Location 头），
+而不是断言内部方法返回值。
+
+### 教训三：静默的错误比崩溃更危险，但也别夸大它的后果
+
+缺陷 ②（k 从 7 变 6）不崩溃、不报错。我最初在注释与提交信息里写：
+
+> 「误判率从 1% 升到 1.3%」
+
+**这个数字是错的。** 实测（`scripts/bloom-fprate.py`）：
+
+| n（写入量） | k=7 误判率 | k=6 误判率 |
+|---|---|---|
+| 1 000 | 0.0000% | 0.0000% |
+| 1 000 000 | 0.0000% | 0.0000% |
+| **10 000 000**（设计规模） | **1.0039%** | **1.0143%** |
+
+**占位符 bug 的真实危害是 k 与设计规格不符（文档 7、代码 6），
+不是误判率恶化。** 差异仅 0.01 个百分点。
+
+> **教训：涉及数学公式的判断，必须算，不能凭直觉。**
+> 我用「k 减小 → 误判率上升」这个常识替代了 `(1-e^(-kn/m))^k` 的计算，
+> 而在 k 接近最优值时这个直觉**不成立**。
+
+同理，**误判率不能用于判定 k 是 6 还是 7**（两者几乎相同）。
+判定 k 的唯一可靠方法是：只置 6 个位、第 7 位留 0，看脚本是否判否
+（`scripts/verify-bloom-lua.sh` 场景 E）。
+
+### 附带修正：测试 profile 的 Redis timeout
+
+`application-test.yml` 把 `spring.data.redis.timeout` 放宽到 **1000ms**，
+生产 `application.yml` **保持 50ms 不动**（DR-011）。
+
+50ms 是跳转命令的执行预算，不该被连接建立消耗——
+一次偶发慢连接会让请求被判「Redis 不可用」，进而放行全部流量。
+放宽只发生在测试 profile：否则测试测的是一个「与生产不同的超时」，
+而超时行为正是需要验证的东西之一。
+
+### 触发场景
+
+第 3 周压测前造完 1 万条数据后抽样验证跳转，发现全部 500。
