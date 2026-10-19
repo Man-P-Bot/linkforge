@@ -44,10 +44,11 @@ import org.springframework.stereotype.Component;
  * {@code SmartLifecycle} 把启停交给容器，
  * 且 {@link #stop(Runnable)} 能保证容器等到消费线程真正退出。
  *
- * <h2>⚠️ Gauge 必须持有强引用</h2>
- * Micrometer 的 {@code Gauge.builder(name, obj, valueFunction)} 对 obj 是
- * <b>弱引用</b>。若队列被 GC 回收，指标值会变成 {@code NaN}。
- * {@link #queueRef} 就是为此存在的强引用。
+ * <h2>⚠️ Gauge 绑定的对象必须是强可达的</h2>
+ * Micrometer 的 {@code Gauge.builder(name, obj, valueFunction)} 对 obj 用<b>弱引用</b>。
+ * 但那只在 obj <b>没有其他强引用</b>时才会NaN——
+ * 本类的 {@link #queue} 是 final 字段、被 Spring 容器持有，天然安全。
+ * ⚠️ 曾为此加过一个冗余的 {@code queueRef} 字段，属错误归因，已删除。
  */
 @Component
 public class AsyncStatsQueue implements SmartLifecycle {
@@ -60,14 +61,30 @@ public class AsyncStatsQueue implements SmartLifecycle {
     /** 每批最多取多少条。太小则往返多，太大则单次延迟长。 */
     private static final int BATCH_SIZE = 500;
 
-    private final ArrayBlockingQueue<StatsEvent> queue;
+    /**
+     * 默认队列容量。可被 {@code linkforge.stats.queue-capacity} 覆盖。
+     *
+     * <p>⚠️ 默认值按「1 万条短码的压测语料 ×少量突发缓冲」定的，
+     * 不是拍脑袋的整数。调大前先看 {@code shortlink.stats.queue.size}：
+     * 若它长期贴近容量而 {@code dropped{reason=full}} 仍为 0，说明消费端跟得上，
+     * 加容量只是浪费内存。
+     */
+    public static final int DEFAULT_CAPACITY = 10000;
 
     /**
-     * ⚠️ **强引用**：Micrometer 的 {@code Gauge.builder(name, obj, fn)} 对 obj 是弱引用，
-     * 队列若被GC 回收，指标值会变成 {@code NaN}。这个字段专门用来钉住队列实例。
+     * 统计队列。
+     *
+     * <p>⚠️ <b>本字段是 {@code final}，天然被 Spring 容器强引用</b>，
+     * 因此 {@link Gauge} 绑定它不会变成 {@code NaN}。
+     *
+     * <p>⚠️ <b>不要为了「防 NaN」再加一个同类型的冗余字段</b>：
+     * Micrometer 的 {@code Gauge.builder(name, obj, fn)} 确实对 obj 用弱引用，
+     * 但那只在被观测对象<b>没有其他强引用</b>时才有风险
+     *（典型场景：绑一个临时new 出来、方法内就返回的对象）。
+     * 本类不需要那种保护——曾经加过一个 {@code queueRef} 字段做这件事，
+     * 它只重复赋值、从不被读，是纯冗余，已删除。
      */
-    @SuppressWarnings("unused") // 由 Micrometer 反射读取，静态分析会误报未使用
-    private final ArrayBlockingQueue<StatsEvent> queueRef;
+    private final ArrayBlockingQueue<StatsEvent> queue;
 
     private final Counter offeredCounter;
     private final Counter droppedFullCounter;
@@ -84,10 +101,24 @@ public class AsyncStatsQueue implements SmartLifecycle {
     private final Thread consumer;
     private volatile boolean running = false;
 
+    /**
+     * @param meterRegistry 指标注册表
+     * @param capacity      队列容量，由 {@code linkforge.stats.queue-capacity} 注入，
+     *                      默认 {@link #DEFAULT_CAPACITY}。
+     *                      ⚠️ 测试可直接传小值（如 1）造出「队列满」的场景，
+     *                      不必真的new 一万个元素的队列。
+     */
     public AsyncStatsQueue(MeterRegistry meterRegistry,
-                           @Value("${linkforge.stats.queue-capacity:10000}") int capacity) {
+                           @Value("${linkforge.stats.queue-capacity:"
+                                   + DEFAULT_CAPACITY + "}") int capacity) {
+        if (capacity <= 0) {
+            // ⚠️ ArrayBlockingQueue(0) 能建但永远 offer 失败（等于统计全丢），
+            //负数则直接抛 IllegalArgumentException。两种都是配置错误，
+            // 必须在启动期暴露，而不是让统计静默失效。
+            throw new IllegalArgumentException(
+                    "linkforge.stats.queue-capacity 必须 > 0，当前值：" + capacity);
+        }
         this.queue = new ArrayBlockingQueue<>(capacity);
-        this.queueRef = queue;
 
         this.offeredCounter = Counter.builder("shortlink.stats.offered")
                 .description("成功进入统计队列的事件数")

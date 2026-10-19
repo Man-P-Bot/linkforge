@@ -440,4 +440,39 @@ class LinkCreationServiceTest {
             assertThat(repository.insertCalls()).isZero();
         }
     }
+
+    /**
+     * 指标命名必须是 Prometheus 兼容的（DR-058 阶段 1）。
+     *
+     * <p>⚠️ <b>本测试只能验证「代码侧没写 _total」这一半</b>：
+     * {@code _total} 后缀是 Prometheus registry 在 scrape 时补的，
+     * 而 {@code micrometer-registry-prometheus} <b>当前不在依赖树里</b>
+     * （actuator starter 不传递它，需显式引入）。
+     * 因此「导出后是否真的是单后缀」需在第 5 周接 Prometheus 时
+     * 用 {@code GET /actuator/prometheus} 验证。
+     *
+     * <p>能在这里断言的：<b>Micrometer 层的裸名里绝不能已含 {@code _total}</b>，
+     * 否则 Prometheus 再补一次就成了 {@code _total_total}。
+     */
+    @Test
+    @DisplayName("⭐⭐ Micrometer 层裸名不含 _total（否则 Prometheus 会补成 _total_total）")
+    void idConflictMetricNameIsPrometheusCompliant() {
+        // ⚠️ 用 SimpleMeterRegistry 是**正确的**：本测试不验证 Prometheus 后缀，
+        //    只验证「我们交给 Micrometer 的名字里没有 _total」。
+        //    早期版本误用 PrometheusMeterRegistry 断言，
+        //    而那个类根本不在依赖树里 -> 编译失败。
+        io.micrometer.core.instrument.Counter counter =
+                io.micrometer.core.instrument.Counter.builder("shortlink.id.conflict")
+                        .register(meterRegistry);
+
+        var meter = meterRegistry.find("shortlink.id.conflict").counter();
+        assertThat(meter)
+                .as("裸名必须能被 find 到，说明名字里没有多余后缀")
+                .isNotNull();
+        assertThat(meterRegistry.getMeters())
+                .as("注册的指标名不应含 _total（Micrometer 惯例：写裸名，"
+                        + "Prometheus 在 scrape 时补）")
+                .allSatisfy(m -> assertThat(m.getId().getName())
+                        .doesNotContain("_total"));
+    }
 }
