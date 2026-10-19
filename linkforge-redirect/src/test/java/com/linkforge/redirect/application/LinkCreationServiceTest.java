@@ -174,7 +174,9 @@ class LinkCreationServiceTest {
     }
 
     private double conflictCount() {
-        var counter = meterRegistry.find("shortlink_id_conflict_total").counter();
+        // ⚠️ 指标名不带 _total：Micrometer 写裸名，Prometheus 导出时自动补后缀。
+        // 手工加 _total 会变成 _total_total（DR-058阶段 1）。
+        var counter = meterRegistry.find("shortlink.id.conflict").counter();
         return counter == null ? 0.0 : counter.count();
     }
 
@@ -287,7 +289,7 @@ class LinkCreationServiceTest {
         }
 
         @Test
-        @DisplayName("⭐ 冲突累加 shortlink_id_conflict_total 指标（用于发现号段回退，DR-022）")
+        @DisplayName("⭐ 冲突累加 shortlink.id.conflict 指标（用于发现号段回退，DR-022）")
         void incrementsConflictMetric() {
             FakeGenerator generator = new FakeGenerator("0000Q0u", "0000Q0v");
             repository.failOnInsertCall(1);

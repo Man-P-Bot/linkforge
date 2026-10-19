@@ -45,7 +45,12 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  *   <li>放 Repository 会让「一次 insert」隐式变成「可能插入多次」，违反最小惊讶原则。</li>
  * </ol>
  *
- * <h2>⚠️ 指标 {@code shortlink_id_conflict_total} 只在自动短码冲突时累加</h2>
+ * <h2>⚠️ 指标名 {@code shortlink.id.conflict} 只在自动短码冲突时累加</h2>
+ *
+ * <p>⚠️ <b>不要手工加 {@code _total} 后缀</b>：Prometheus 的
+ * {@code SimpleMeterRegistry} 会在导出时自动补后缀，
+ * Micrometer 加一次、Prometheus 再加一次 -> {@code _total_total}（双重后缀）。
+ * Micrometer 的 Counter 惯例是**写不带 {@code _total} 的裸名**。
  * 自定义短码冲突是**正常的用户输入冲突**（返回 409），若也累加该指标，
  * 指标会被日常使用污染，从而**失去「Redis 号段回退」的告警意义**（DR-022）。
  */
@@ -86,7 +91,7 @@ public class LinkCreationService {
         this.timeConverter = timeConverter;
         this.displayZone = displayZone;
         this.bloomMaintenance = bloomMaintenance;
-        this.idConflictCounter = Counter.builder("shortlink_id_conflict_total")
+        this.idConflictCounter = Counter.builder("shortlink.id.conflict")
                 .description("自动生成短码插入时命中唯一索引的次数。理论上应恒为 0；"
                         + "突增说明发号器号段可能回退（docs/DECISIONS.md DR-022）")
                 .register(meterRegistry);

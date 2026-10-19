@@ -4,6 +4,8 @@ import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.redirect.application.RedirectService;
 import com.linkforge.redirect.infrastructure.limit.RateLimitScope;
+import com.linkforge.stats.infrastructure.AsyncStatsQueue;
+import com.linkforge.stats.infrastructure.StatsEvent;
 import com.linkforge.redirect.infrastructure.limit.RedisTokenBucketLimiter;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.CacheControl;
@@ -45,11 +47,14 @@ public class RedirectController {
 
     private final RedirectService redirectService;
     private final RedisTokenBucketLimiter limiter;
+    private final AsyncStatsQueue statsQueue;
 
     public RedirectController(RedirectService redirectService,
-                              RedisTokenBucketLimiter limiter) {
+                              RedisTokenBucketLimiter limiter,
+                              AsyncStatsQueue statsQueue) {
         this.redirectService = redirectService;
         this.limiter = limiter;
+        this.statsQueue = statsQueue;
     }
 
     /**
@@ -74,6 +79,16 @@ public class RedirectController {
         }
 
         String targetUrl = redirectService.resolveTargetUrl(code);
+
+        // ⚠️ 统计在**跳转判定之后、返回 302 之前**入队（DR-058）：
+        // · 位置：必须是「确认有效跳转」之后——404/410 不该被计为 PV
+        // · offer 是非阻塞的：队列满立即返回 false，绝不让主线程等
+        // · 失败/丢弃只影响统计，不影响跳转（返回 false 即忽略）
+        // ⚠️ ts 在**主线程**取：若放到消费端取，记录的是「处理时刻」
+        // 而非「发生时刻」，高负载下两者会差很远，统计失真。
+        // visitor 传 null：阶段 2 才从请求上下文取（当前 Controller 不持有请求对象）。
+        statsQueue.offer(new StatsEvent(code, null, System.currentTimeMillis()));
+
         return ResponseEntity.status(HttpStatus.FOUND)
                 .header(HttpHeaders.LOCATION, targetUrl)
                 .cacheControl(CacheControl.noStore())

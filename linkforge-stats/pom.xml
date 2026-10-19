@@ -23,5 +23,27 @@
       <groupId>com.linkforge</groupId>
       <artifactId>linkforge-core</artifactId>
     </dependency>
+
+    <!-- Spring 上下文：@Component / @Value 注入队列与容量配置。
+         不引 spring-boot-starter-*：统计模块只需要 context，
+         不需要 web / data-redis（DR-018 的依赖约束仍成立）。 -->
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-context</artifactId>
+    </dependency>
+
+    <!-- 指标：shortlink.stats.dropped 等。走 micrometer-core 而非 actuator starter——
+         统计模块不该决定「指标通过什么端点暴露」，那是 app 层的事。 -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+    </dependency>
+
+    <!-- 测试：JUnit 5 + AssertJ。scope=test，不进运行时依赖树。-->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>

@@ -13,6 +13,7 @@ import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.redirect.application.RedirectService;
 import com.linkforge.redirect.infrastructure.limit.RedisTokenBucketLimiter;
+import com.linkforge.stats.infrastructure.AsyncStatsQueue;
 import com.linkforge.redirect.error.GlobalExceptionHandler;
 import java.time.ZoneId;
 import org.junit.jupiter.api.DisplayName;
@@ -62,6 +63,10 @@ class RedirectControllerTest {
      */
     @MockitoBean
     private RedisTokenBucketLimiter limiter;
+
+    /** 统计队列（DR-058）。@MockBean 保证 offer 不影响跳转断言。 */
+    @MockitoBean
+    private AsyncStatsQueue statsQueue;
 
     @BeforeEach
     void allowAll() {

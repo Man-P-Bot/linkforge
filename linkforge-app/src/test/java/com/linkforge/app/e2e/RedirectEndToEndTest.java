@@ -110,6 +110,9 @@ class RedirectEndToEndTest {
     @Autowired
     private ObjectMapper mapper;
 
+    @Autowired
+    private io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
     private final List<String> created = new ArrayList<>();
     private String adminToken;
 
@@ -320,5 +323,53 @@ class RedirectEndToEndTest {
                 .as("布隆判否应直接 404")
                 .isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(resp.getBody()).contains("LINKFORGE-404-01");
+    }
+
+    // -------------------------------------------------------------- 统计集成
+
+    @Test
+    @DisplayName("7️⃣⭐ 每次成功跳转都入队：入队数 == 成功跳转数（DR-058）")
+    void everySuccessfulRedirectEnqueuesOnce() throws Exception {
+        String target = "https://example.com/e2e/stats";
+        String code = createLink(target);
+        redis.delete(CacheKeys.code(code));
+
+        int requests = 20;
+        double offeredBefore = registryCounter("shortlink.stats.offered");
+        for (int i = 0; i < requests; i++) {
+            assertThat(get("/" + code).getStatusCode()).isEqualTo(HttpStatus.FOUND);
+        }
+        double offeredAfter = registryCounter("shortlink.stats.offered");
+
+        assertThat(offeredAfter - offeredBefore)
+                .as("20 次成功跳转应产生 20 次入队")
+                .isEqualTo((double) requests);
+    }
+
+    @Test
+    @DisplayName("8️⃣⭐ 失败跳转（404）**不**入队：统计不该计入无效访问")
+    void failedRedirectDoesNotEnqueue() {
+        double offeredBefore = registryCounter("shortlink.stats.offered");
+
+        assertThat(get("/zzzzzzz").getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        assertThat(registryCounter("shortlink.stats.offered") - offeredBefore)
+                .as("404 不该被计为 PV——统计必须放在跳转判定之后")
+                .isZero();
+    }
+
+    /** 读 Micrometer 计数器（actuator 或直接 registry 均可）。 */
+    private double registryCounter(String name) {
+        try {
+            ResponseEntity<String> resp = get("/actuator/metrics/" + name);
+            if (resp.getStatusCode().is2xxSuccessful() && resp.getBody() != null) {
+                return mapper.readTree(resp.getBody())
+                        .path("measurements").get(0).path("value").asDouble();
+            }
+        } catch (Exception ignored) {
+            // 指标端点不可用时用下面的 registry 兜底
+        }
+        var c = meterRegistry.find(name).counter();
+        return c == null ? 0.0 : c.count();
     }
 }
