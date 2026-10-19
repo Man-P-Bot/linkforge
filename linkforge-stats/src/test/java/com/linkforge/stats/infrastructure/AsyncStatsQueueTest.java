@@ -1,6 +1,9 @@
 package com.linkforge.stats.infrastructure;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -11,10 +14,12 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 
 /**
  * 异步统计队列的行为契约（DR-058）。
@@ -29,6 +34,8 @@ import org.mockito.Mock;
  * <p>这些断言看起来琐碎，但它们防的正是第 3 周限流的教训：
  * **一个「顺手加的保护机制」在热路径上能造成 63% 的吞吐损失**。
  */
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
 class AsyncStatsQueueTest {
 
     private SimpleMeterRegistry registry;
@@ -41,6 +48,13 @@ class AsyncStatsQueueTest {
     void setUp() {
         registry = new SimpleMeterRegistry();
         // 容量设小，方便测试「队列满」这个分支
+        // ⚠️ 必须 mock execute：返回 null 时 Java 会拆箱 NPE，
+        //    那个 NPE 会被 flushPv 的 catch 捕获并计入 dropped{error}，
+        //    污染「队列满导致的丢弃」类断言
+        org.mockito.Mockito.lenient()
+                .when(redis.execute(any(org.springframework.data.redis.core.script.RedisScript.class),
+                        anyList(), any(Object[].class)))
+                .thenReturn(1L);
         queue = new AsyncStatsQueue(registry, redis, 50);
         // ⚠️ 显式 start：SmartLifecycle 改造后线程不在构造器里启动。
         //    需要观察「未消费」状态的测试（N1、N3、N4）必须先 stop()。
@@ -164,7 +178,10 @@ class AsyncStatsQueueTest {
         assertThat(queue.offer(null))
                 .as("null 也应安全返回，绝不抛 NPE")
                 .isFalse();
-        assertThat(counter("shortlink.stats.dropped")).isEqualTo(1.0);
+        // ⚠️ 必须带 tag 读：拆了 reason 之后有两个同名 dropped meter，
+        //    不带 tag 的 find(name).counter() 返回的是**任意一个**（Micrometer 行为），
+        //    断言会随机失败。踩过一次。
+        assertThat(counter("shortlink.stats.dropped", "reason", "error")).isEqualTo(1.0);
     }
 
     @Test

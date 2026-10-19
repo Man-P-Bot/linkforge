@@ -4,7 +4,9 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -13,7 +15,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -126,7 +130,65 @@ public class AsyncStatsQueue implements SmartLifecycle {
     private final StringRedisTemplate redis;
 
     /**
+     * PV 原子脚本（INCRBY + EXPIRE，F4）。
+     *
+     * <p>⚠️ <b>为什么用 Lua 而不是两条命令</b>：
+     * {@code increment()} + {@code expire()} 两条命令之间进程崩溃，
+     * 会留下一个<b>永不过期</b>的 key。PV key 每天每 code 一个，
+     * 累积起来会让 Redis 内存失控。
+     *
+     * <p>⚠️ <b>为什么在消费线程执行 Lua 完全无害</b>（与 DR-056 对照）：
+     * DR-056 的教训是「<b>主线程</b>同步 I/O 拖垮 Tomcat 线程池」。
+     * 本脚本跑在<b>独立的统计消费线程</b>上，与跳转请求完全隔离：
+     * 消费线程慢只会让队列积压，最终表现为 {@code dropped} 上升——
+     * 那是可观测、可接受的（统计可丢，跳转不能慢）。
+     */
+    private DefaultRedisScript<Long> pvScript;
+
+    /** UV 原子脚本（PFADD + EXPIRE），同时规避 DR-054 的变长参数歧义。 */
+    private DefaultRedisScript<Long> uvScript;
+
+    /**
+     * 从 classpath 加载 Lua 脚本并声明返回类型为 Long。
+     *
+     * <h2>⚠️⚠️ 这里踩了三个坑，顺序不能错</h2>
+     * <ol>
+     *   <li><b>{@code setLocation} 单独用不够</b>——它只记录位置，
+     *       {@code getScriptSource()} 仍是 null，执行时报
+     *       「script source must not be null」。
+     *       而 Spring Data Redis 3.5 <b>没有 {@code ResourceScriptSource}</b>
+     *       这个类（查过 jar：只有 DefaultRedisScript / ScriptUtils 等）。</li>
+     *   <li><b>{@code new DefaultRedisScript<>(resource, Long.class)} 构造器不存在</b>——
+     *       编译直接失败。</li>
+     *   <li><b>最终方案：{@code setScriptText}</b>——把脚本内容读成字符串塞进去。
+     *       它同时避开了上面两个坑，且没有额外依赖。</li>
+     * </ol>
+     */
+    private static DefaultRedisScript<Long> luaScript(String path) {
+        try (java.io.InputStream in = new ClassPathResource(path).getInputStream()) {
+            String text = new String(in.readAllBytes(),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+            script.setScriptText(text);
+            script.setResultType(Long.class);
+            return script;
+        } catch (java.io.IOException e) {
+            // ⚠️ 启动期就失败，比运行期「每次写入都报错」好得多
+            throw new IllegalStateException("无法加载 Lua 脚本: " + path, e);
+        }
+    }
+
+    /**
      * flushed：<b>写入 Redis 的结果</b>，与 {@code drained} 严格分层。
+     *
+     * <p><b>单位：条</b>（不是批）——阶段 2 误按批计数，导致
+     * {@code drained}（条）与 {@code flushed}（批）对不上账，已在 F1 修正。
+     *
+     * <p>⚠️ <b>必须成立的不等式</b>：
+     * {@code flushed{target=uv} <= flushed{target=pv}}。
+     * UV 只统计 visitor 非 null 的条目，PV 统计全部条目，
+     * 因此 UV 的 ok + failed 总和**永远不可能超过** PV。
+     * 若出现 {@code uv > pv}，说明分组逻辑有 bug。
      *
      * <p>两个维度都要拆tag：
      * <ul>
@@ -143,6 +205,16 @@ public class AsyncStatsQueue implements SmartLifecycle {
     private final Timer flushPvTimer;
     private final Timer flushUvTimer;
 
+    /**
+     * 死信二次丢失：<b>Redis 写失败且 DLQ 也写失败</b>，数据真的没了。
+     *
+     * <p>⚠️ 只有日志是不够的——运维不翻日志就看不到数据在丢。
+     * {@code stage} 维度预留给阶段 3：Redis 侧死信失败记 {@code stage=redis}，
+     * MySQL 落库重试耗尽记 {@code stage=mysql}。
+     */
+    private final Counter dlqLostRedisPv;
+    private final Counter dlqLostRedisUv;
+
     private final Thread consumer;
     private volatile boolean running = false;
 
@@ -153,11 +225,19 @@ public class AsyncStatsQueue implements SmartLifecycle {
      *                      ⚠️ 测试可直接传小值（如 1）造出「队列满」的场景，
      *                      不必真的new 一万个元素的队列。
      */
+    /**
+     * ⚠️ 只能有**一个**构造器：Spring 的构造器注入在有多个构造器时
+     * 会报「No default constructor found」（实测踩过）。
+     * 测试需要替换 Lua 脚本时，用 {@link #withScripts} 静态工厂，
+     * 而不是再加一个构造器。
+     */
     public AsyncStatsQueue(MeterRegistry meterRegistry,
                            StringRedisTemplate redis,
                            @Value("${linkforge.stats.queue-capacity:"
                                    + DEFAULT_CAPACITY + "}") int capacity) {
         this.redis = redis;
+        this.pvScript = luaScript("lua/pv_incr_by.lua");
+        this.uvScript = luaScript("lua/uv_pfadd.lua");
         if (capacity <= 0) {
             // ⚠️ ArrayBlockingQueue(0) 能建但永远 offer 失败（等于统计全丢），
             //负数则直接抛 IllegalArgumentException。两种都是配置错误，
@@ -216,12 +296,53 @@ public class AsyncStatsQueue implements SmartLifecycle {
                 .publishPercentileHistogram()
                 .register(meterRegistry);
 
+        this.dlqLostRedisPv = Counter.builder("shortlink.stats.dlq.lost")
+                .tag("target", "pv").tag("stage", "redis")
+                .description("PV 写 Redis 失败且死信也写入失败——数据永久丢失")
+                .register(meterRegistry);
+        this.dlqLostRedisUv = Counter.builder("shortlink.stats.dlq.lost")
+                .tag("target", "uv").tag("stage", "redis")
+                .description("UV 写 Redis 失败且死信也写入失败——数据永久丢失")
+                .register(meterRegistry);
+        // ⚠️ stage=mysql 的两个计数器**故意不注册**：
+        //   阶段 3 才会真正落库，那时才注册。提前注册一个恒为 0 的计数器，
+        //   只会让人误以为「已经在监控落库丢失了」。
+
         Gauge.builder("shortlink.stats.queue.size", queue, ArrayBlockingQueue::size)
                 .description("统计队列当前积压深度。持续 > 0 说明消费端跟不上生产端")
                 .register(meterRegistry);
 
         this.consumer = new Thread(this::consumeLoop, "stats-async-consumer");
         this.consumer.setDaemon(true);
+    }
+
+    /**
+     * 测试专用工厂：替换 Lua 脚本。
+     *
+     * <p>⚠️ 存在的理由：测「Redis 写失败」这条路径时，
+     * mock {@code StringRedisTemplate.execute} 的泛型匹配极不可靠
+     * （{@code RedisScript<T>} 擦除后 any(RedisScript.class) 匹配上，
+     * 但 stub 不生效——实测两次都返回 null）。
+     * 而「真实连不上的 Redis」也不行：Lettuce 会长时间重试连接，
+     * 15 秒都到不了 flush 那一步。
+     *
+     * <p>换成「一个必然抛异常的脚本」就干净了：
+     * 走的是**完全真实的** execute 路径（真实序列化、真实异常传播），
+     * 只有脚本本身是坏的。
+     */
+    static AsyncStatsQueue withScripts(MeterRegistry meterRegistry,
+                                      StringRedisTemplate redis,
+                                      int capacity,
+                                      DefaultRedisScript<Long> pvScript,
+                                      DefaultRedisScript<Long> uvScript) {
+        AsyncStatsQueue q = new AsyncStatsQueue(meterRegistry, redis, capacity);
+        if (pvScript != null) {
+            q.pvScript = pvScript;
+        }
+        if (uvScript != null) {
+            q.uvScript = uvScript;
+        }
+        return q;
     }
 
     // ------------------------------------------------------------ 生命周期
@@ -416,67 +537,128 @@ public class AsyncStatsQueue implements SmartLifecycle {
      * <p><b>UV</b>：按 code 收集 visitor 数组，一次 {@code PFADD}。
      */
     private void flushBatch(List<StatsEvent> batch) {
-        String today = today();
-        Map<String, Long> pvByCode = new LinkedHashMap<>();
-        Map<String, List<String>> uvByCode = new LinkedHashMap<>();
+        // ⚠️ F2：**按 event.ts() 推导日期**，不用服务器当前日期。
+        //   否则一批里跨零点的请求会被算到「处理当天」，
+        //   导致 23:59 的访问记到第二天（或反之），报表差一天。
+        Map<LocalDate, Map<String, Long>> pvByDay = new LinkedHashMap<>();
+        Map<LocalDate, Map<String, List<String>>> uvByDay = new LinkedHashMap<>();
+        int pvCount = 0;
+        int uvCount = 0;
 
         for (StatsEvent e : batch) {
-            pvByCode.merge(e.code(), 1L, Long::sum);
+            LocalDate day = dayOf(e.ts());
+            pvByDay.computeIfAbsent(day, d -> new LinkedHashMap<>())
+                    .merge(e.code(), 1L, Long::sum);
+            pvCount++;
             // ⚠️ visitor 为 null 时不能进 UV：PFADD 会 NPE。
             //    但 PV 不受影响——「访问发生了」与「能不能去重」是两件事。
             if (e.visitor() != null) {
-                uvByCode.computeIfAbsent(e.code(), k -> new ArrayList<>()).add(e.visitor());
+                uvByDay.computeIfAbsent(day, d -> new LinkedHashMap<>())
+                        .computeIfAbsent(e.code(), c -> new ArrayList<>())
+                        .add(e.visitor());
+                uvCount++;
             }
         }
 
-        flushPv(pvByCode, today, batch);
-        flushUv(uvByCode, today, batch);
+        flushPv(pvByDay, pvCount, batch);
+        flushUv(uvByDay, uvCount, batch);
     }
 
-    private void flushPv(Map<String, Long> pvByCode, String today, List<StatsEvent> batch) {
-        flushPvTimer.record(() -> {
+    private void flushPv(Map<LocalDate, Map<String, Long>> pvByDay, int pvCount,
+                         List<StatsEvent> batch) {
+        // ⚠️⚠️ **必须用 record(Supplier) 而不是 record(Runnable)**：
+        //   Micrometer 的 record(Runnable) 内部会 **catch 掉异常**
+        //   （交给 MeterRegistry 的异常处理器），于是下面flushPv 内层的
+        //   catch 块**永远不会被执行**—— flushed{failed} 恒为 0，
+        //   DLQ 也不会写。首轮实测就踩到了：mock 抛异常但 failed 指标为 0。
+        //   record(Supplier) 会让异常正常传播。
+        // ⚠️⚠️ **不能用 Timer.record(...) 包住整个 try/catch**：
+        //   Micrometer 的 record(Runnable) 与 record(Supplier) **都会 catch 掉异常**
+        //   （转交给 MeterRegistry 的异常处理器），
+        //   于是内层的 catch **永远不会执行** ——
+        //   flushed{failed} 恒为 0、DLQ 也不写。
+        //   首轮与次轮实测都踩到了这个坑。
+        //   正确做法：**手动计时**（System.nanoTime + finally 里 record），
+        //   让业务代码的 try/catch 自己掌控异常。
+        long t0 = System.nanoTime();
+        try {
             try {
-                pvByCode.forEach((code, n) -> {
-                    String key = PV_KEY_PREFIX + code + ":" + today;
-                    // ⚠️ INCRBY + EXPIRE 非原子，但可接受：
-                    //    EXPIRE 幂等，重复执行无害；
-                    //    最坏情况是「计数成功但没设上TTL」——
-                    //    而这需要进程恰好在两条命令之间崩溃。
-                    //    若要严格，用 Lua 合并（阶段 3 与定时落库时统一处理）。
-                    redis.opsForValue().increment(key, n);
-                    redis.expire(key, KEY_TTL_DAYS, TimeUnit.DAYS);
+                pvByDay.forEach((day, byCode) -> {
+                    String date = formatDay(day);
+                    byCode.forEach((code, n) -> {
+                        String key = PV_KEY_PREFIX + code + ":" + date;
+                        // ⚠️ F4：用 Lua 把 INCRBY + EXPIRE 合成原子操作。
+                        //    两条命令之间进程崩溃会留下**永不过期**的 key。
+                        redis.execute(pvScript,
+                                List.of(key),
+                                String.valueOf(n),
+                                String.valueOf(TimeUnit.DAYS.toSeconds(KEY_TTL_DAYS)));
+                    });
                 });
-                // ⚠️ 计数单位是「批」，不是「条」：一次 flush 处理多个 code
-                flushedPvOk.increment();
+                // ⚠️ F1：按**条**计数，不是按批。
+                //   阶段 2 按批计数时 drained(条) == flushed(批) 的对账等式不成立。
+                flushedPvOk.increment(pvCount);
             } catch (Exception e) {
-                flushedPvFailed.increment();
-                pushToDlq(batch, "pv", e);
-                log.warn("PV 刷写失败，本批 {} 条已进死信: {}", batch.size(), e.toString());
+                flushedPvFailed.increment(pvCount);
+                pushToDlq(batch, "pv", e, pvCount);
+                log.warn("PV 刷写失败，本批 {} 条已进死信", pvCount, e);
             }
-        });
+        } finally {
+            flushPvTimer.record(System.nanoTime() - t0, java.util.concurrent.TimeUnit.NANOSECONDS);
+        }
     }
 
-    private void flushUv(Map<String, List<String>> uvByCode, String today, List<StatsEvent> batch) {
-        flushUvTimer.record(() -> {
+    private void flushUv(Map<LocalDate, Map<String, List<String>>> uvByDay, int uvCount,
+                         List<StatsEvent> batch) {
+        long t0 = System.nanoTime();
+        try {
             try {
-                uvByCode.forEach((code, visitors) -> {
-                    String key = UV_KEY_PREFIX + code + ":" + today;
-                    // ⚠️⚠️ **DR-054 回归点**：
-                    //   opsForHyperLogLog().add(String key, String... values) 是**变长参数**。
-                    //   传 String[] 会展开成多个值；
-                    //   传 List 会被当成**单个元素**序列化——
-                    //   结果是每次 PFADD 只记了一个 "[a, b, c]" 字符串，UV 恒等于 1。
-                    redis.opsForHyperLogLog()
-                            .add(key, visitors.toArray(new String[0]));
-                    redis.expire(key, KEY_TTL_DAYS, TimeUnit.DAYS);
+                uvByDay.forEach((day, byCode) -> {
+                    String date = formatDay(day);
+                    byCode.forEach((code, visitors) -> {
+                        String key = UV_KEY_PREFIX + code + ":" + date;
+                        // ⚠️ F4 + DR-054 回归：Lua 脚本里 ARGV 形态由脚本定义，
+                        //    不存在「传 List 变单个元素」的歧义。
+                        //    ARGV[1]=TTL，ARGV[2..]=visitors。
+                        Object[] args = new Object[visitors.size() + 1];
+                        args[0] = String.valueOf(TimeUnit.DAYS.toSeconds(KEY_TTL_DAYS));
+                        for (int i = 0; i < visitors.size(); i++) {
+                            args[i + 1] = visitors.get(i);
+                        }
+                        // ⚠️⚠️ **必须写 (Object[]) 强转**：execute 的签名是
+                        //   execute(RedisScript, List<K>, Object... args)。
+                        //   直接传 String[] 时，Java 会把整个数组当成
+                        //   **单个 varargs 元素**再包一层——ARGV 于是变成
+                        //   [整个数组] 一个元素。⚠️ 这正是 DR-054 的坑：
+                        //   「List 被当成单个元素序列化」的同构错误，
+                        //   只是这次发生在 Java->Lua 的参数传递上。
+                        //   强转成 Object[] 后 varargs 才会正确展开。
+                        redis.execute(uvScript, List.of(key), (Object[]) args);
+                    });
                 });
-                flushedUvOk.increment();
+                flushedUvOk.increment(uvCount);
             } catch (Exception e) {
-                flushedUvFailed.increment();
-                pushToDlq(batch, "uv", e);
-                log.warn("UV 刷写失败，本批 {} 条已进死信: {}", batch.size(), e.toString());
+                flushedUvFailed.increment(uvCount);
+                pushToDlq(batch, "uv", e, uvCount);
+                log.warn("UV 刷写失败，本批 {} 条已进死信", uvCount, e);
             }
-        });
+        } finally {
+            flushUvTimer.record(System.nanoTime() - t0, java.util.concurrent.TimeUnit.NANOSECONDS);
+        }
+    }
+
+    /**
+     * 从事件时间戳推导统计日期（F2）。
+     *
+     * <p>⚠️ 用 {@link ZoneId#systemDefault()}：统计口径与服务器本地时区一致。
+     * 若将来要多时区统计，得在 key 里带上时区标识，否则跨时区会串。
+     */
+    private LocalDate dayOf(long ts) {
+        return LocalDate.ofInstant(Instant.ofEpochMilli(ts), ZoneId.systemDefault());
+    }
+
+    private String formatDay(LocalDate day) {
+        return day.format(DATE_FMT);
     }
 
     /**
@@ -485,7 +667,8 @@ public class AsyncStatsQueue implements SmartLifecycle {
      * <p>⚠️ <b>死信写入本身也可能失败</b>（Redis 挂了）。
      * 此时只记日志——不能再往 Redis 写，那会无限递归。
      */
-    private void pushToDlq(List<StatsEvent> batch, String target, Exception cause) {
+    private void pushToDlq(List<StatsEvent> batch, String target, Exception cause,
+                           int eventCount) {
         try {
             String dlqKey = DLQ_KEY_PREFIX + today();
             List<String> payload = new ArrayList<>(batch.size());
@@ -495,7 +678,13 @@ public class AsyncStatsQueue implements SmartLifecycle {
             redis.opsForList().rightPushAll(dlqKey, payload);
             redis.expire(dlqKey, KEY_TTL_DAYS, TimeUnit.DAYS);
         } catch (Exception dlqFailure) {
-            // ⚠️ 到这里数据是真的没了。只能记日志 + 让指标说话。
+            // ⚠️ 到这里数据是真的没了。**光记日志不够**——
+            //    运维不翻日志就看不到数据在丢，所以必须计指标。
+            if ("pv".equals(target)) {
+                dlqLostRedisPv.increment(eventCount);
+            } else {
+                dlqLostRedisUv.increment(eventCount);
+            }
             log.error("死信写入也失败，本批 {} 条**永久丢失**: target={} 原因={} / {}",
                     batch.size(), target, cause.toString(), dlqFailure.toString());
         }
