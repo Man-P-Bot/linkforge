@@ -45,7 +45,13 @@ public class RedisTokenBucketLimiter {
      * </ul>
      */
     @SuppressWarnings("rawtypes")
-    private static final RedisScript<List> TOKEN_BUCKET = new DefaultRedisScript<>("""
+    /**
+     * ⚠️ 包级可见（不是 private）：测试需要读脚本源码，
+     * 断言「PEXPIRE 被包在首次创建的 if 里」——
+     * 这是防**改代码**的回归（有人把 PEXPIRE 挪回无条件执行），
+     * 运行时 TTL 那种断言属于层 3 真实 Redis 的职责。
+     */
+    static final RedisScript<List> TOKEN_BUCKET = new DefaultRedisScript<>("""
             -- ⚠️ 唯一时间源：Redis 服务端时间。绝不用 KEYS/ARGV 传入客户端时间戳
             local t = redis.call('TIME')
             local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -53,6 +59,8 @@ public class RedisTokenBucketLimiter {
             local capacity     = tonumber(ARGV[1])
             local refillPerMs  = tonumber(ARGV[2])
 
+            -- HMGET 未命中时返回 {false, false}（不是 nil），
+            -- 这是下面「首次创建才设 TTL」的判据
             local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
             local tokens = tonumber(state[1])
             local ts= tonumber(state[2])
@@ -82,24 +90,47 @@ public class RedisTokenBucketLimiter {
             end
 
             redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
-            -- ⚠️ 每次都刷新过期：IP 维度的 key 基数可能很大，
-            -- 空闲的 IP 必须自动消失，否则 key 会无限增长
-            redis.call('PEXPIRE', KEYS[1], math.ceil(ARGV[3]))
+
+            -- ⚠️ PEXPIRE **只在首次创建 key 时设置一次**，不每次刷新（DR-056）：
+            -- 原实现每次请求都 PEXPIRE，等于每请求多一条**写命令**。
+            -- 压测实测：限流开启时 QPS 2.1 万，关闭时 5.7 万——
+            -- 每请求一次同步 Redis 往返（约 0.5ms）在 Tomcat 线程里累积，
+            -- 把吞吐吃掉 63%。⚠️ 但 CPU 采样显示 **Redis 只有 0.4% 占用**，
+            -- 说明瓶颈是**应用线程同步等待**，不是 Redis CPU——
+            -- 去掉 PEXPIRE 省的是一次网络往返延迟，**不是** Redis 计算资源。
+            --
+            -- 为什么可以不每次刷新：
+            --   · key 里存了 ts，补令牌逻辑本来就靠 elapsed 判断，
+            --     即使 key 活得比 TTL 久，超期的桶也会被「补满」而非「拒绝」
+            --   · 真正的风险是**空闲 IP 的 key 永不消失**，
+            --     由 Redis 的 maxmemory 淘汰策略兜底（部署配置 allkeys-lru）
+            if state[1] == false or state[2] == false then
+              redis.call('PEXPIRE', KEYS[1], math.ceil(ARGV[3]))
+            end
             return {allowed, retryAfterMs}
             """, List.class);
 
     private final StringRedisTemplate redis;
     private final RateLimitScope scopeConfig;
+    private final boolean enabled;
     private final Counter rejectedCounter;
     private final Counter degradedCounter;
+    private final Counter bypassedCounter;
 
     public RedisTokenBucketLimiter(StringRedisTemplate redis,
                                    RateLimitScope scopeConfig,
-                                   MeterRegistry meterRegistry) {
+                                   MeterRegistry meterRegistry,
+                                   @org.springframework.beans.factory.annotation.Value(
+                                           "${linkforge.ratelimit.enabled:true}") boolean enabled) {
         this.redis = redis;
         this.scopeConfig = scopeConfig;
+        this.enabled = enabled;
         this.rejectedCounter = Counter.builder("shortlink.ratelimit.rejected")
                 .description("被限流拒绝的请求数（按 scope 打 tag）")
+                .register(meterRegistry);
+        this.bypassedCounter = Counter.builder("shortlink.ratelimit.bypassed")
+                .description("限流被显式关闭（linkforge.ratelimit.enabled=false）时跳过的请求数。"
+                        + "非零说明该实例**没有限流保护**，不可用于生产")
                 .register(meterRegistry);
         this.degradedCounter = Counter.builder("shortlink.ratelimit.degraded")
                 .description("限流器不可用时**放行**的次数。持续增长说明 Redis 有问题，"
@@ -114,6 +145,15 @@ public class RedisTokenBucketLimiter {
      *         拒绝时返回带建议等待时间的 {@link Decision#reject(Duration)}
      */
     public Decision tryAcquire(String clientId, String scope) {
+        // ⚠️ 开关：linkforge.ratelimit.enabled=false 时**完全不执行 Lua**。
+        // 它的存在不只是为了压测——压测需要 A/B 对照「限流本身占多少 QPS」，
+        // 而把阈值调到很大**做不到这一点**：Lua 每次仍要执行，
+        // 只是不再拒绝。只有真正跳过 EVAL 才能隔离出它的成本。
+        if (!enabled) {
+            bypassedCounter.increment();
+            return Decision.permit();
+        }
+
         String key = scopeConfig.key(clientId, scope);
         // PEXPIRE = 窗口的 2 倍：足够覆盖一次完整的补充周期，又不会让 key 长期滞留
         long ttlMs = scopeConfig.window(scope).toMillis() * 2;

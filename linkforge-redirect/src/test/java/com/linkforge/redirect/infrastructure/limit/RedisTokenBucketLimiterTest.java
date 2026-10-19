@@ -7,10 +7,12 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -56,10 +58,15 @@ class RedisTokenBucketLimiterTest {
     private SimpleMeterRegistry registry;
     private RedisTokenBucketLimiter limiter;
 
+    /** 脚本源码（断言「PEXPIRE 被包在 if 里」这类改代码的行为）。 */
+    private static final org.springframework.data.redis.core.script.RedisScript<List>
+            TOKEN_BUCKET_SOURCE =
+                    RedisTokenBucketLimiter.TOKEN_BUCKET;
+
     @BeforeEach
     void setUp() {
         registry = new SimpleMeterRegistry();
-        limiter = new RedisTokenBucketLimiter(redis, new RateLimitScope(20, 10, 60, 30), registry);
+        limiter = new RedisTokenBucketLimiter(redis, new RateLimitScope(20, 10, 60, 30), registry, true);
     }
 
     private void givenScriptResult(long allowed, long retryAfterMs) {
@@ -252,5 +259,88 @@ class RedisTokenBucketLimiterTest {
             verify(redis).execute(any(RedisScript.class), keys.capture(), any(Object[].class));
             assertThat(keys.getValue()).containsExactly(scopes.key(IP, RateLimitScope.CREATE));
         }
+    }
+
+    @Test
+    @DisplayName("开关关闭时**完全不执行 Lua**（不是把阈值调大——那样 EVAL 仍会跑）")
+    void disabledLimiterSkipsRedisEntirely() {
+        RedisTokenBucketLimiter off = new RedisTokenBucketLimiter(
+                redis, new RateLimitScope(20, 10, 60, 30), registry, false);
+
+        assertThat(off.tryAcquire("1.2.3.4", "redirect").allowed()).isTrue();
+        assertThat(off.tryAcquire("1.2.3.4", "redirect").allowed()).isTrue();
+
+        // ⚠️ 核心断言：一次 Redis 往返都不该有。
+        // 若只把阈值调到很大，redis.execute 仍会被调用——那就隔离不出限流的成本。
+        verify(redis, never()).execute(any(RedisScript.class), anyList(), any(Object[].class));
+        assertThat(registry.get("shortlink.ratelimit.bypassed").counter().count())
+                .as("绕过次数必须可观测，否则无法确认该实例是否真的关掉了限流")
+                .isEqualTo(2.0);
+    }
+
+    @Test
+    @DisplayName("开关关闭时 rejected 恒为 0")
+    void disabledLimiterNeverRejects() {
+        RedisTokenBucketLimiter off = new RedisTokenBucketLimiter(
+                redis, new RateLimitScope(20, 10, 60, 30), registry, false);
+        for (int i = 0; i < 100; i++) {
+            assertThat(off.tryAcquire("1.2.3.4", "redirect").allowed()).isTrue();
+        }
+        assertThat(registry.get("shortlink.ratelimit.rejected").counter().count())
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("⭐ PEXPIRE 只在**首次创建 key** 时设置，不每次刷新（DR-056）")
+    void pexpireOnlyOnFirstCreation() {
+        // ⚠️ 断言的是**脚本源码的代码结构**，不是运行时 Redis 的 TTL——
+        // 后者需要真实 Redis（层 3 的职责），而这里要防的是
+        //「有人把 PEXPIRE 挪回无条件执行」这种**改代码**的回归。
+        List<String> lines = Arrays.stream(TOKEN_BUCKET_SOURCE.getScriptAsString()
+                        .split("\\R"))
+                .map(String::trim)
+                .filter(l -> !l.isEmpty() && !l.startsWith("--"))
+                .toList();
+
+        int pexpireLine = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).startsWith("redis.call('PEXPIRE'")) {
+                pexpireLine = i;
+                break;
+            }
+        }
+        assertThat(pexpireLine)
+                .as("脚本仍应设置 TTL（否则空闲 IP 的 key 永不消失）")
+                .isGreaterThanOrEqualTo(0);
+
+        // ⚠️ 判据：PEXPIRE 必须在 if 内。往上看最近的 if，
+        // 不允许有第二个 redis.call 直接跟着（那才是「每次都执行」）。
+        String guard = pexpireLine > 0 ? lines.get(pexpireLine - 1) : "";
+        assertThat(guard)
+                .as("PEXPIRE 的上一条有效语句必须是 if 判据（首次创建的标志），"
+                        + "实际是: \"%s\"", guard)
+                .startsWith("if ")
+                .contains("false");
+        assertThat(lines.get(pexpireLine - 1))
+                .as("判据必须检查 HMGET 的未命中标记")
+                .contains("state[1]");
+    }
+
+    @Test
+    @DisplayName("⭐ 每次请求仍会 HSET（写状态必须保留，删了会让限流失效）")
+    void hsetStillRunsEveryTime() {
+        String script = TOKEN_BUCKET_SOURCE.getScriptAsString();
+
+        // ⚠️ PEXPIRE 可以省，HSET 不能省：tokens/ts 是限流状态的唯一载体。
+        // 若为了省写命令把 HSET 也删掉，桶会永远停在初始值，
+        // 限流要么完全失效（永远放行）要么完全拒绝（tokens 不再递减）。
+        int hsetCount = script.split("HSET", -1).length - 1;
+        assertThat(hsetCount)
+                .as("HSET 必须保留且在每次请求路径上")
+                .isEqualTo(1);
+        // 必须在 PEXPIRE 之前（顺序即语义：先写状态，再看要不要设 TTL）
+        assertThat(script.indexOf("HSET"))
+                .as("HSET 应在 PEXPIRE 之前")
+                .isLessThan(script.indexOf("PEXPIRE"));
     }
 }
