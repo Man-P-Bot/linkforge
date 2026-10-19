@@ -39,6 +39,15 @@
       <artifactId>micrometer-core</artifactId>
     </dependency>
 
+    <!-- Redis：阶段 2 起消费线程要写 shortlink:pv:* / shortlink:uv:* /死信队列。
+         ⚠️ 不抽到 core：Spring Boot 单上下文共享 LettuceConnectionFactory，
+         两个模块各引一份 starter 只是编译期依赖，**运行时仍然只有一个连接池**。
+         （DR-058 阶段 2 已裁决） -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
     <!-- 测试：JUnit 5 + AssertJ。scope=test，不进运行时依赖树。-->
     <dependency>
       <groupId>org.springframework.boot</groupId>

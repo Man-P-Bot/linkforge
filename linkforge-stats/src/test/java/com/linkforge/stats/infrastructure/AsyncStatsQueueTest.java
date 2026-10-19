@@ -11,6 +11,10 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+import org.mockito.Mock;
 
 /**
  * 异步统计队列的行为契约（DR-058）。
@@ -28,13 +32,16 @@ import org.junit.jupiter.api.Test;
 class AsyncStatsQueueTest {
 
     private SimpleMeterRegistry registry;
+    @Mock
+    private StringRedisTemplate redis;
+
     private AsyncStatsQueue queue;
 
     @BeforeEach
     void setUp() {
         registry = new SimpleMeterRegistry();
         // 容量设小，方便测试「队列满」这个分支
-        queue = new AsyncStatsQueue(registry, 50);
+        queue = new AsyncStatsQueue(registry, redis, 50);
         // ⚠️ 显式 start：SmartLifecycle 改造后线程不在构造器里启动。
         //    需要观察「未消费」状态的测试（N1、N3、N4）必须先 stop()。
         queue.start();
@@ -165,7 +172,7 @@ class AsyncStatsQueueTest {
     void capacityIsHonored() {
         assertThat(queue.capacity()).isEqualTo(50);
 
-        AsyncStatsQueue big = new AsyncStatsQueue(registry, 12345);
+        AsyncStatsQueue big = new AsyncStatsQueue(registry, redis, 12345);
         assertThat(big.capacity()).isEqualTo(12345);
         // ⚠️ 未 start()，无线程需要停止（构造器不再启线程）
     }

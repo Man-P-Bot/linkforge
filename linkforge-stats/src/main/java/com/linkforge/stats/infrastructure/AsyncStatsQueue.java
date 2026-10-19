@@ -3,10 +3,17 @@ package com.linkforge.stats.infrastructure;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -72,6 +79,24 @@ public class AsyncStatsQueue implements SmartLifecycle {
     public static final int DEFAULT_CAPACITY = 10000;
 
     /**
+     * 统计 key 的 TTL。
+     *
+     * <p>⚠️ <b>必须有 TTL，否则 Redis 内存只增不减</b>：
+     * key 是 {@code shortlink:pv:{code}:{yyyymmdd}}，
+     * 一天一个 code 一个 key，不设过期会让历史数据永久堆积。
+     *
+     * <p>为什么是 35 天：覆盖「当月 + 上月」（月初查上月报表仍能读到），
+     * 另留 5 天缓冲应对跨月边界的写入延迟。
+     */
+    private static final long KEY_TTL_DAYS = 35L;
+
+    private static final String PV_KEY_PREFIX = "shortlink:pv:";
+    private static final String UV_KEY_PREFIX = "shortlink:uv:";
+    private static final String DLQ_KEY_PREFIX = "shortlink:stats:dl:";
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.BASIC_ISO_DATE;
+
+    /**
      * 统计队列。
      *
      * <p>⚠️ <b>本字段是 {@code final}，天然被 Spring 容器强引用</b>，
@@ -98,6 +123,26 @@ public class AsyncStatsQueue implements SmartLifecycle {
      */
     private final Counter drainedCounter;
 
+    private final StringRedisTemplate redis;
+
+    /**
+     * flushed：<b>写入 Redis 的结果</b>，与 {@code drained} 严格分层。
+     *
+     * <p>两个维度都要拆tag：
+     * <ul>
+     *   <li>{@code target=pv|uv} —— 哪条通道失败，两者可独立重试</li>
+     *   <li>{@code result=ok|failed} —— 对账基准：
+     *       {@code drained == flushed{ok} + flushed{failed} + 仍在队列中的}
+     *       这个等式不成立就说明有数据在丢</li>
+     * </ul>
+     */
+    private final Counter flushedPvOk;
+    private final Counter flushedPvFailed;
+    private final Counter flushedUvOk;
+    private final Counter flushedUvFailed;
+    private final Timer flushPvTimer;
+    private final Timer flushUvTimer;
+
     private final Thread consumer;
     private volatile boolean running = false;
 
@@ -109,8 +154,10 @@ public class AsyncStatsQueue implements SmartLifecycle {
      *                      不必真的new 一万个元素的队列。
      */
     public AsyncStatsQueue(MeterRegistry meterRegistry,
+                           StringRedisTemplate redis,
                            @Value("${linkforge.stats.queue-capacity:"
                                    + DEFAULT_CAPACITY + "}") int capacity) {
+        this.redis = redis;
         if (capacity <= 0) {
             // ⚠️ ArrayBlockingQueue(0) 能建但永远 offer 失败（等于统计全丢），
             //负数则直接抛 IllegalArgumentException。两种都是配置错误，
@@ -142,6 +189,33 @@ public class AsyncStatsQueue implements SmartLifecycle {
                         + "⚠️**不代表已持久化**——取出时尚未写入 Redis")
                 .register(meterRegistry);
 
+        this.flushedPvOk = Counter.builder("shortlink.stats.flushed")
+                .tag("target", "pv").tag("result", "ok")
+                .description("PV 成功写入 Redis 的次数")
+                .register(meterRegistry);
+        this.flushedPvFailed = Counter.builder("shortlink.stats.flushed")
+                .tag("target", "pv").tag("result", "failed")
+                .description("PV 写入失败并进死信的次数")
+                .register(meterRegistry);
+        this.flushedUvOk = Counter.builder("shortlink.stats.flushed")
+                .tag("target", "uv").tag("result", "ok")
+                .description("UV 成功写入 Redis 的次数")
+                .register(meterRegistry);
+        this.flushedUvFailed = Counter.builder("shortlink.stats.flushed")
+                .tag("target", "uv").tag("result", "failed")
+                .description("UV 写入失败并进死信的次数")
+                .register(meterRegistry);
+        this.flushPvTimer = Timer.builder("shortlink.stats.flush.duration")
+                .tag("target", "pv")
+                .description("单批 PV 刷写耗时")
+                .publishPercentileHistogram()
+                .register(meterRegistry);
+        this.flushUvTimer = Timer.builder("shortlink.stats.flush.duration")
+                .tag("target", "uv")
+                .description("单批 UV 刷写耗时")
+                .publishPercentileHistogram()
+                .register(meterRegistry);
+
         Gauge.builder("shortlink.stats.queue.size", queue, ArrayBlockingQueue::size)
                 .description("统计队列当前积压深度。持续 > 0 说明消费端跟不上生产端")
                 .register(meterRegistry);
@@ -152,6 +226,15 @@ public class AsyncStatsQueue implements SmartLifecycle {
 
     // ------------------------------------------------------------ 生命周期
 
+    /**
+     * 启动消费线程。
+     *
+     * <p>⚠️ <b>本类不可重启</b>：{@link Thread} 只能 {@code start()} 一次，
+     * 对已 {@link #stop()} 的实例再调 {@code start()} 会抛
+     * {@code IllegalThreadStateException}。
+     * 阶段 3 的 {@code @Scheduled} 调用方<b>必须先检查 {@link #isRunning()}</b>，
+     * 否则应用上下文中途重启后会持续抛异常。
+     */
     @Override
     public void start() {
         if (running) {
@@ -190,16 +273,39 @@ public class AsyncStatsQueue implements SmartLifecycle {
         List<StatsEvent> remaining = new ArrayList<>();
         queue.drainTo(remaining);
         if (!remaining.isEmpty()) {
-            log.warn("统计队列停机时残留 {} 条未处理"
-                            + "（阶段 2 前无持久化通道，数据丢弃）",
+            // ⚠️ 阶段 2 起已有 Redis 通道：这里应当同步刷写剩余数据。
+            //    当前只告警不刷写——停机路径的补写留到阶段 3（与定时落库一起做），
+            //    因为它需要和「取出即删除」的幂等策略配套，不能各写一半。
+            log.warn("统计队列停机时残留 {} 条未处理（未刷写 Redis，数据将丢失）",
                     remaining.size());
         }
         log.info("统计队列已停止");
     }
 
+    /**
+     * @return 消费线程是否在运行。
+     *         ⚠️ <b>阶段 3 的 {@code @Scheduled} 调用方必须先检查本方法</b>
+     *         （「不可重启」的完整说明写在 {@link #start()} 上）。
+     */
     @Override
     public boolean isRunning() {
         return running;
+    }
+
+    /**
+     * 生命周期阶段：<b>最晚启动、最早停止</b>。
+     *
+     * <p>⚠️ 显式声明而非依赖 {@code SmartLifecycle} 的默认值
+     * {@code DEFAULT_PHASE = Integer.MAX_VALUE}——虽然两者当前相等，
+     * 但依赖「默认值恰好等于我想要的值」是隐患：
+     * 一旦将来有更晚启动的 Lifecycle 组件加入，顺序就会静默改变。
+     *
+     * <p>本组件需要最晚启动（Redis 客户端就绪后才消费）、
+     * 最早停止（Redis 连接池关闭前把队列排空）。
+     */
+    @Override
+    public int getPhase() {
+        return Integer.MAX_VALUE;
     }
 
     // ------------------------------------------------------------ 投递
@@ -257,26 +363,25 @@ public class AsyncStatsQueue implements SmartLifecycle {
     }
 
     /**
-     * 消费线程主循环。
+     * 消费线程主循环：取出 → 按 code 聚合 → 写 Redis（PV/UV 双通道）。
      *
-     * <p>⚠️ 当前为<b>空壳</b>：只取出、只计数、<b>不写 Redis</b>。阶段 2 在这里加批量写。
+     * <p>⚠️ <b>失败绝不重试</b>：写失败的数据进死信队列（{@code shortlink:stats:dl:{date}}），
+     * 消费线程立刻处理下一批。重试会阻塞消费线程，而队列满了会反压到主线程——
+     * 那正是DR-058 要避免的「统计拖慢跳转」。
      */
     private void consumeLoop() {
         while (running) {
             try {
-                StatsEvent first = queue.poll(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
-                if (first == null) {
+                List<StatsEvent> batch = pollBatch();
+                if (batch.isEmpty()) {
                     continue;
                 }
-                int batch = 1;
-                StatsEvent next;
-                while (batch < BATCH_SIZE && (next = queue.poll()) != null) {
-                    batch++;
-                }
-                // ⚠️ drained ≠ 已持久化。阶段 2 会在此处写 Redis。
-                drainedCounter.increment(batch);
-                log.debug("统计消费一批：{} 条", batch);
+                drainedCounter.increment(batch.size());
+                flushBatch(batch);
+                log.debug("统计刷写一批：{} 条", batch.size());
             } catch (InterruptedException e) {
+                // ⚠️ 必须重新设置中断状态：否则 stop() 里的 join(2000)
+                // 可能在中断被清除的情况下等满 2 秒才返回（DR-058 阶段 2）。
                 Thread.currentThread().interrupt();
                 log.debug("统计消费线程被中断，退出");
                 return;
@@ -285,5 +390,125 @@ public class AsyncStatsQueue implements SmartLifecycle {
                 log.error("统计消费线程异常（已继续）: {}", e.toString());
             }
         }
+    }
+
+    /** 取出最多 {@link #BATCH_SIZE} 条；队列空时阻塞至多 {@link #POLL_INTERVAL_MS}。 */
+    private List<StatsEvent> pollBatch() throws InterruptedException {
+        StatsEvent first = queue.poll(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        if (first == null) {
+            return List.of();
+        }
+        List<StatsEvent> batch = new ArrayList<>(BATCH_SIZE);
+        batch.add(first);
+        StatsEvent next;
+        while (batch.size() < BATCH_SIZE && (next = queue.poll()) != null) {
+            batch.add(next);
+        }
+        return batch;
+    }
+
+    /**
+     * 把一批事件写进Redis。
+     *
+     * <p><b>PV</b>：同 code 合并成一次 {@code INCRBY}，
+     * 100 条同一短码 = 1 次往返而非 100 次。
+     *
+     * <p><b>UV</b>：按 code 收集 visitor 数组，一次 {@code PFADD}。
+     */
+    private void flushBatch(List<StatsEvent> batch) {
+        String today = today();
+        Map<String, Long> pvByCode = new LinkedHashMap<>();
+        Map<String, List<String>> uvByCode = new LinkedHashMap<>();
+
+        for (StatsEvent e : batch) {
+            pvByCode.merge(e.code(), 1L, Long::sum);
+            // ⚠️ visitor 为 null 时不能进 UV：PFADD 会 NPE。
+            //    但 PV 不受影响——「访问发生了」与「能不能去重」是两件事。
+            if (e.visitor() != null) {
+                uvByCode.computeIfAbsent(e.code(), k -> new ArrayList<>()).add(e.visitor());
+            }
+        }
+
+        flushPv(pvByCode, today, batch);
+        flushUv(uvByCode, today, batch);
+    }
+
+    private void flushPv(Map<String, Long> pvByCode, String today, List<StatsEvent> batch) {
+        flushPvTimer.record(() -> {
+            try {
+                pvByCode.forEach((code, n) -> {
+                    String key = PV_KEY_PREFIX + code + ":" + today;
+                    // ⚠️ INCRBY + EXPIRE 非原子，但可接受：
+                    //    EXPIRE 幂等，重复执行无害；
+                    //    最坏情况是「计数成功但没设上TTL」——
+                    //    而这需要进程恰好在两条命令之间崩溃。
+                    //    若要严格，用 Lua 合并（阶段 3 与定时落库时统一处理）。
+                    redis.opsForValue().increment(key, n);
+                    redis.expire(key, KEY_TTL_DAYS, TimeUnit.DAYS);
+                });
+                // ⚠️ 计数单位是「批」，不是「条」：一次 flush 处理多个 code
+                flushedPvOk.increment();
+            } catch (Exception e) {
+                flushedPvFailed.increment();
+                pushToDlq(batch, "pv", e);
+                log.warn("PV 刷写失败，本批 {} 条已进死信: {}", batch.size(), e.toString());
+            }
+        });
+    }
+
+    private void flushUv(Map<String, List<String>> uvByCode, String today, List<StatsEvent> batch) {
+        flushUvTimer.record(() -> {
+            try {
+                uvByCode.forEach((code, visitors) -> {
+                    String key = UV_KEY_PREFIX + code + ":" + today;
+                    // ⚠️⚠️ **DR-054 回归点**：
+                    //   opsForHyperLogLog().add(String key, String... values) 是**变长参数**。
+                    //   传 String[] 会展开成多个值；
+                    //   传 List 会被当成**单个元素**序列化——
+                    //   结果是每次 PFADD 只记了一个 "[a, b, c]" 字符串，UV 恒等于 1。
+                    redis.opsForHyperLogLog()
+                            .add(key, visitors.toArray(new String[0]));
+                    redis.expire(key, KEY_TTL_DAYS, TimeUnit.DAYS);
+                });
+                flushedUvOk.increment();
+            } catch (Exception e) {
+                flushedUvFailed.increment();
+                pushToDlq(batch, "uv", e);
+                log.warn("UV 刷写失败，本批 {} 条已进死信: {}", batch.size(), e.toString());
+            }
+        });
+    }
+
+    /**
+     * 死信：整批 LPUSH 到 {@code shortlink:stats:dl:{date}}。
+     *
+     * <p>⚠️ <b>死信写入本身也可能失败</b>（Redis 挂了）。
+     * 此时只记日志——不能再往 Redis 写，那会无限递归。
+     */
+    private void pushToDlq(List<StatsEvent> batch, String target, Exception cause) {
+        try {
+            String dlqKey = DLQ_KEY_PREFIX + today();
+            List<String> payload = new ArrayList<>(batch.size());
+            for (StatsEvent e : batch) {
+                payload.add(target + "|" + e.code() + "|" + e.visitor() + "|" + e.ts());
+            }
+            redis.opsForList().rightPushAll(dlqKey, payload);
+            redis.expire(dlqKey, KEY_TTL_DAYS, TimeUnit.DAYS);
+        } catch (Exception dlqFailure) {
+            // ⚠️ 到这里数据是真的没了。只能记日志 + 让指标说话。
+            log.error("死信写入也失败，本批 {} 条**永久丢失**: target={} 原因={} / {}",
+                    batch.size(), target, cause.toString(), dlqFailure.toString());
+        }
+    }
+
+    /**
+     * 统计 key 的日期后缀。
+     *
+     * <p>⚠️ <b>当前用服务器当前日期</b>，不是 {@link StatsEvent#ts()} 反推的日期。
+     * 跨零点的批次会被算到「处理当天」而非「发生当天」，
+     * 极端情况下误差 1 天。阶段 3 做定时落库时再改成按 ts 分桶。
+     */
+    private String today() {
+        return LocalDate.now().format(DATE_FMT);
     }
 }
