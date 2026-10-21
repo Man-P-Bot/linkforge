@@ -122,6 +122,13 @@ class LinkCreationServiceTest {
             return List.of();
         }
 
+        @Override
+        public java.util.Map<String, Long> resolveIdsByShortCodes(
+                java.util.Collection<String> shortCodes) {
+            // 本测试只覆盖建链流程，不涉及统计落库
+            return java.util.Map.of();
+        }
+
         int insertCalls() {
             return insertCalls;
         }

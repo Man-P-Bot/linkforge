@@ -134,4 +134,24 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+      统计落库的短码 -> 主键映射（阶段 3）。
+
+      为什么走短链表而不是统计表：link_stats_daily 存的是 link_id（V1 迁移的设计：
+      「短码编码规则若变化，历史统计无需回填」），而 Redis 里的统计 key 以短码命名。
+
+      ⚠️ 只 select (id, short_code)：走唯一索引 uk_short_code，
+         EXPLAIN 的 Extra 应为 Using index，不回表读 2048 字节的 target_url。
+      ⚠️ 不过滤 status：软删除的短链仍有历史访问量，那部分统计不该丢。
+    -->
+    <select id="selectIdsByShortCodes"
+            resultType="com.linkforge.core.infrastructure.persistence.LinkMapper$IdShortCode">
+        SELECT id, short_code
+        FROM short_link
+        WHERE short_code IN
+        <foreach collection="shortCodes" item="code" open="(" separator="," close=")">
+            #{code}
+        </foreach>
+    </select>
+
 </mapper>

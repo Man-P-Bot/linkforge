@@ -1,7 +1,9 @@
 package com.linkforge.core.repository;
 
 import com.linkforge.core.domain.Link;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -59,6 +61,26 @@ public interface LinkRepository {
      *         调用方据此区分 404 与「已删除（200 + alreadyDeleted）」（docs/API.md §7.1）
      */
     int markDeleted(long id);
+
+    /**
+     * 批量把短码解析为主键，供统计落库使用（阶段 3）。
+     *
+     * <p>⚠️ <b>为什么需要这一步</b>：Redis 里的统计 key 以<b>短码</b>命名
+     * （{@code shortlink:pv:{code}:{date}}），而 {@code link_stats_daily} 按
+     * <b>{@code link_id}</b> 聚合（V1 迁移的设计：「短码编码规则若变化，历史统计无需回填」）。
+     * 落库前必须做一次短码 → 主键的映射。
+     *
+     * <p>放在 {@code LinkRepository} 而不是统计仓储里：查的是 {@code short_link} 表，
+     * 属于短链的读，不该让 stats 模块知道「短码和主键的关系由 short_link 表定义」。
+     *
+     * <p>⚠️ <b>不过滤 status</b>：已软删除的短链仍有历史访问量，那部分统计不该丢
+     * （口径与 {@link #findByShortCode} 一致）。
+     *
+     * @param shortCodes 待解析的短码集合，可为空
+     * @return {@code shortCode -> id} 映射；<b>查不到的短码不会出现在结果里</b>，
+     *         调用方需自行统计缺失数（对应「短链已物理不存在」的场景）
+     */
+    Map<String, Long> resolveIdsByShortCodes(Collection<String> shortCodes);
 
     /**
      * 扫描全部有效短码，供布隆过滤器重建使用（docs/ARCHITECTURE.md §7.1）。

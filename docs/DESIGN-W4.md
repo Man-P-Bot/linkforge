@@ -60,12 +60,21 @@
 
 ## 3. Redis Key 结构
 
+> ⚠️ **本节已按阶段 3 的实际实现更新**（2026-10-21）。
+
 | Key | 类型 | TTL | 说明 |
 |---|---|---|---|
-| `shortlink:pv:{code}:{yyyymmdd}` | Hash（field 可留空，用 string 语义） | **3 天** | PV 计数，按天分片，落库后自然消失 |
-| `shortlink:uv:{code}:{yyyymmdd}` | HyperLogLog | **3 天** | UV 去重，标准误差 0.81% |
-| `shortlink:stats:lock` | String（SETNX） | 30 秒 | 落库任务的分布式锁 |
-| `shortlink:stats:dl:{yyyymmdd}` | Hash | 3 天 | 死信队列：落库失败的数据 |
+| `shortlink:pv:{code}:{yyyymmdd}` | String（INCRBY 计数） | **35 天** | PV 计数，按天分片；flush 时用 GETDEL 取走即删 |
+| `shortlink:uv:{code}:{yyyymmdd}` | HyperLogLog | **35 天** | UV 去重，标准误差 0.81%；flush 时只读（PFCOUNT）不删 |
+| `shortlink:stats:dirty:{yyyymmdd}` | Set | **35 天** | 当日「有待落库的短码」，由 PV 的 Lua 写入时 SADD 登记，flush 用 SPOP 取走即删 |
+| `shortlink:stats:flush:lock` | String（SET NX EX） | 60 秒 | 落库任务的全局锁；释放用 Lua 校验 value |
+| `shortlink:stats:dl:{yyyymmdd}` | List | 35 天 | 死信队列：写 Redis 失败 / 落库 MySQL 失败 |
+
+⚠️ **TTL 从设计稿的 3 天改为 35 天**（覆盖「当月 + 上月」，月初仍能查到上月报表，
+另留 5 天缓冲应对跨月边界的写入延迟）。3 天太短：短链的访问是长尾的，
+一个热门短链三天后还在被访问，PV 会被切在两天里。
+
+⚠️ **所有统计 key 都必须有 TTL**，否则 Redis 内存只增不减。
 
 ### 3.1 内存预算（回答「108GB 从哪来」）
 
@@ -82,9 +91,13 @@ HyperLogLog 的内存与元素数**几乎无关**，取决于精度PP：
 3. **按天累积不删** —— 每天新增一批 key，30 天就是 30 倍
 
 **三条防线**（必须全部实现）：
-1. `PFADD` 时**同时设 TTL = 3 天**（落库后自动消失）
-2. 落库成功后**主动 DEL** 掉对应 key
+1. `PFADD` 时**同时设 TTL = 35 天**
+2. PV key 在 flush 时用 **GETDEL 取走即删**；UV key **不删**
+   （HLL 的值是累计基数，删掉会丢历史访客），靠 TTL 回收
 3. 加 Micrometer 指标 `shortlink.stats.uv.keys`，超阈值告警
+
+⚠️ **dirty set 也必须有 TTL**：否则「有流量但映射不到 link_id」的短码
+（例如短链被物理删除）会永久驻留，白吃内存。
 
 ### 3.2 UV 的语义边界
 
@@ -92,6 +105,10 @@ HyperLogLog 的标准误差 **0.81%**，且**不存明细**。
 
 > ⚠️ UV 只能用于**趋势展示**，不能用于精确对账或用户级查询。
 > 这条必须写进 API.md，不能被「UV 就是去重人数」的误解。
+
+⚠️ **UV 每天落一行，绝不跨天累加**。查询多日 UV 时用**日求和**，
+并在业务层标注「估算偏高」（各日 HLL 基数相加，同一访客跨天会被重复计）。
+数据库字段命名为 `uv_estimated`，让读 SQL 的人一眼看出这是估算值。
 
 ---
 
@@ -146,47 +163,126 @@ PEXPIRE shortlink:uv:{code}:{yyyymmdd} 259200000   -- 3 天
 
 ## 5. 定时落库
 
+> ⚠️ **本节已按阶段 3 的实际实现更新**（2026-10-21）。设计稿与实现有 5 处偏差，
+> 逐条列在 5.7「设计 → 实现的偏差」里。实现与设计不一致时，**以代码为准**，
+> 但偏差必须被记录而不是被遗忘——否则下一个人会按设计稿去改代码。
+
 ### 5.1 分布式锁
 
 多实例部署时，定时任务会跑多遍。**重复累加的统计无法修正**（见 5.3）。
 
 ```java
-if (!redis.setIfAbsent("shortlink:stats:lock", instanceId, 30, SECONDS)) {
-    return;   // 别的实例正在跑
-}
-try { ... } finally { redis.delete(lockKey); }
+// ⚠️ 实际实现：RedisDistributedLock.tryLock()
+// SET key value NX EX ttl —— 加锁与设过期必须是**一条命令**。
+// 拆成 SETNX + EXPIRE 时，两条之间崩溃会留下**永不过期**的锁，
+// 只能人工删 key 才能恢复。
+Boolean ok = redis.opsForValue().setIfAbsent(lockKey, instanceId, ttl);
 ```
 
-⚠️ 用 `SET NX EX` 单条命令，**不要** `SETNX` + `EXPIRE` 两条
-（中间崩溃会留下永久锁）。
+⚠️ 释放时**必须用 Lua 校验 value**：
 
-⚠️ 锁的 TTL（30 秒）必须**大于**单次落库的预期耗时，否则会出现
+```lua
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+```
+
+朴素写法会踩一个隐蔽故障：A 加锁后业务跑了 70 秒（锁已 60 秒过期），
+B 接管了锁，此时 A 执行 `DEL lock` —— **把 B 的锁删了**，
+第三个实例于是也能同时进入，三者并发落库，PV 累加出错且不可逆。
+
+⚠️ 锁的 TTL（60 秒）必须**大于**单轮落库的最坏耗时，否则会出现
 「实例 A 还在跑、锁已过期、实例 B 又进来」的并发落库。
+本实现的算术：重试退避 1s + 4s + 16s = 21s，PV/UV 两路各一次 = 42s，
+加 IO 约 45s < 60s。**改重试次数必须同步改 TTL。**
+
+⚠️ 锁的 value 必须是**每次启动都不同**的随机 UUID。若所有实例共用主机名，
+value 校验就形同虚设——A 可以删掉 B 的锁。
+
+⚠️ 拿到锁之后、真正干活之前，**再校验一次 value**（`holdsLock`）。
+这是防「超时实例继续破坏」的兜底：此时本实例已不是持有者，放弃本轮。
 
 ### 5.2 原子取出
 
-```lua
-local data = redis.call('HGETALL', KEYS[1])
-if #data > 0 then
-  redis.call('DEL', KEYS[1])
-end
-return data
+⚠️ **实际实现与设计稿不同**：设计稿写的是「HGETALL + DEL 的 Lua 脚本」，
+实现改成了 **dirty set + SPOP + GETDEL** 三个动作，理由如下。
+
+#### 5.2.1 怎么找到「今天有流量」的短码：dirty set
+
+```
+shortlink:stats:dirty:{yyyymmdd}   Set   当日「有待落库的短码」
 ```
 
-**取出与删除必须在同一条 Lua 里**。分两步的话，取出后崩溃 → 重启后重复落库 → 统计虚高。
+- **写侧登记**：PV 的 Lua 脚本（`pv_incr_by.lua`）在 `INCRBY` 的同一次执行里
+  追加 `SADD dirty {code}` —— **不增加任何往返次数**。
+- **读侧取走**：`SPOP key count`（单条命令，原子完成「取 N 个并移除」）。
+
+⚠️ **为什么不用 `SCAN shortlink:pv:*`**：
+- SCAN 是**游标遍历不是快照**，扫描期间新产生的 key 可能被漏掉（游标回绕机制决定），
+  漏掉的 key 要等 35 天 TTL 到期才自然消失；
+- 无法区分「今天有量」与「35 天内有量」，每分钟扫全量 key 是纯粹的浪费。
+
+⚠️ **为什么绝不用 `SMEMBERS` + `SREM`**：
+两者之间若有新流量登记进来，`SREM` 会把它一起删掉 ——
+那批数据**既不会被本轮处理、也不会被下一轮处理**，
+静静烂在 Redis 里直到 35 天 TTL 过期。
+这是典型的「看起来有清理逻辑」的静默数据丢失。
+
+⚠️ dirty set **也必须有 TTL**：否则「有流量但映射不到 link_id」的短码
+（例如短链被物理删除）会永久驻留，白吃内存。
+
+#### 5.2.2 取走即删：SPOP + GETDEL
+
+| 数据 | 取数命令 | 语义 |
+|---|---|---|
+| dirty set 里的短码 | `SPOP key count` | 增量，取走即删 |
+| PV 计数 | `GETDEL key`（Redis 6.2+） | 增量，取走即删 |
+| UV 基数 | `PFCOUNT key` | **累计值，只读不删** |
+
+⚠️ PV 的 `GETDEL` 必须是**一条命令**。先 GET 再 DEL 的窗口里若进程崩溃，
+下次 flush 会把**同一份增量再落一次库** → PV 翻倍。
+
+⚠️ UV 的 HLL key **不能删**：`PFCOUNT` 返回的是「当日至今的累计基数」，
+删掉会把历史访客基数清零。残留由 35 天 TTL 回收。
+下次同一短码再有流量时会重新登记 dirty，读到的仍是**更大**的累计值，
+由 MySQL 侧的 `GREATEST` 天然去重。
 
 ### 5.3 幂等策略：宁可丢，不可重
 
+⚠️ **实际实现按 `link_id` 聚合，不是 `short_code`**（V1 迁移的既定设计：
+「短码编码规则若变化，历史统计无需回填」）。
+Redis 里的 key 以短码命名，落库前必须做一次「短码 → 主键」映射：
+
 ```sql
-INSERT INTO link_stats_daily (short_code, stat_date, pv, uv)
-VALUES (?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE
-  pv = pv + VALUES(pv),
-  uv = uv + VALUES(uv)
+SELECT id, short_code FROM short_link WHERE short_code IN (...)   -- 走 uk_short_code，不回表
 ```
 
-⚠️ `ON DUPLICATE KEY UPDATE ... pv + VALUES(pv)` 是**累加**。
-因此**同一批数据绝不能落两次**。
+⚠️ 映射**不过滤 status**：软删除的短链仍有历史访问量，那部分统计不该丢。
+
+#### PV 与 UV 是两条独立的 SQL（关键）
+
+```sql
+-- PV：增量累加
+INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
+VALUES (?, ?, ?, 0, 'direct') ON DUPLICATE KEY UPDATE pv = pv + VALUES(pv)
+
+-- UV：覆盖（GREATEST）
+INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
+VALUES (?, ?, 0, ?, 'direct') ON DUPLICATE KEY UPDATE uv_estimated = GREATEST(uv_estimated, VALUES(uv_estimated))
+```
+
+⚠️ **为什么必须分成两条**（两条理由都不可妥协）：
+
+1. **累加语义相反**。PV 是「自上次落库以来新增的量」，多次落库要叠加；
+   UV 的 `PFCOUNT` 是「当日至今的基数」，**不是增量**。
+   若也用累加，一天 flush 1440 次会把同一个访客计 1440 遍。
+   `GREATEST` 既符合语义（当日值只增不减），又让重试天然幂等。
+2. **靶向重试的前提**。PV 成功、UV 失败时**只重试 UV**。
+   若合并成一条语句，重试会把已成功的 PV 再累加一遍 ——
+   而 PV 一旦多加**无法回滚**（UV 用 GREATEST，重复执行反而无害）。
+   「数据丢了」是少，「数据多了」是错，后者严重得多。
 
 > **明确取舍：宁可丢，不可重。**
 >
@@ -198,13 +294,74 @@ ON DUPLICATE KEY UPDATE
 ### 5.4 失败处理
 
 ```
-落库失败 → 写入 shortlink:stats:dl:{yyyymmdd}
-         → 下一轮优先处理死信
-         → 重试 3 次仍失败 → WARN 日志 + 计数器，不抛异常
+MySQL 落库失败 → 重试 3 次（退避 1s / 4s / 16s）
+               → 仍失败 → 写入 shortlink:stats:dl:{yyyymmdd}，payload 带 stage=mysql
+               → 下一轮 replayDlq 重放（LRANGE 窥探 + LREM 精确删除）
+               → 重放仍失败 → 保留在队列，等下一轮
 ```
 
 ⚠️ **定时任务里绝不抛未捕获异常** —— Spring 的 `@Scheduled`
-在任务抛异常后，同一任务的后续调度会被取消（单任务模式下）。
+在任务抛异常后，同一任务的后续调度会被取消（单任务模式下），
+且 Spring **不会重建**它。表现是「跑了一次之后统计再也没落过库」。
+所以 `@Scheduled` 方法体内是 **catch-all `Throwable`**（不是 `Exception`——
+`NoClassDefFoundError` 这类 Error 同样会让调度永久失效）。
+
+⚠️ **DLQ 用 `LRANGE` 窥探 + `LREM` 精确删除**，不是 `LPOP`：
+`LPOP` 一取出就出队，若取出后崩溃/失败，那条数据就没了 ——
+死信队列会退化成「一次性丢弃队列」。
+
+⚠️ **DLQ payload 必须带 `stage` 维度**：
+`stage=mysql` 表示「MySQL 落库阶段失败」（重放动作是写数据库），
+`stage=redis` 表示「Redis 写入阶段失败」（重放动作是写 Redis）。
+用错会导致 PV 凭空翻倍或 UV 被清零。
+
+⚠️ **DLQ 靶向重试的核心约束**：解析 payload 的 channel，
+`pv` 只走 `accumulatePv`、`uv` 只走 `mergeUv`。
+**绝不在一次重试里同时更新两者**。
+
+⚠️ **DLQ 的 key 用「处理当天」而非 `stat_date`**：
+DLQ 是「处理队列」，按哪一天发现失败来分桶；真正的归属日写在 payload 里。
+若按 `stat_date` 分桶，一条 3 天前失败的数据会被塞进 3 天前的队列，
+而 replay 只回看 `lookback-days` 天 —— 它就永远不会被处理了。
+
+### 5.5 运行状态守卫
+
+flush 执行前**必须先检查 `queue.isRunning()`**：
+
+- `AsyncStatsQueue` 的消费线程**不可重启**（`Thread` 只能 `start()` 一次）。
+  应用上下文重启后消费线程已死，此时继续 flush 只会持续抛异常，
+  并触发 5.4 里的「调度永久失效」。
+- 守卫的语义：**消费端不在工作，就不要做它下游的事。**
+
+### 5.6 调度线程池
+
+```yaml
+spring:
+  task:
+    scheduling:
+      pool:
+        size: 2
+```
+
+⚠️ Spring Boot 的 `@Scheduled` 默认**单线程**调度：所有 cron 任务共用一个线程，
+一个任务没跑完，后面排队的全部不执行。
+而统计落库的坏情况会跑很久（重试 21s × 2 路 = 42s）——
+数据库抖动期间，一个 42 秒的落库会**冻住整个调度器**，
+阶段 4 的过期清理、阶段 5 的报表聚合全都会被一起拖死。
+
+取 2：一个占位跑统计落库，另一个留给其它任务；
+统计落库本身靠 Redis 全局锁保证只有一个实例真正执行。
+
+### 5.7 设计 → 实现的偏差
+
+| # | 设计稿 | 实际实现 | 理由 |
+|---|---|---|---|
+| 1 | 落库按 `short_code` | 按 `link_id` | V1 迁移既定设计（编码规则变化时历史统计无需回填）；flush 时做一次批量映射 |
+| 2 | HGETALL + DEL 的 Lua | dirty set + SPOP + GETDEL | 4.2.1 / 4.2.2：HGETALL 方案无法表达「哪些短码今天有量」，且 SMEMBERS+SREM 有静默丢数据的窗口 |
+| 3 | `uv = uv + VALUES(uv)` | `uv_estimated = GREATEST(...)` | UV 是当日累计值不是增量，累加会把同一访客计 1440 遍 |
+| 4 | 字段名 `uv` | `uv_estimated` | HLL 是估算值（误差约 0.81%），字段名要让人一眼看出不能精确对账；V4 迁移完成重命名 |
+| 5 | 锁 TTL 30 秒 | 60 秒 | 单轮最坏耗时约 45s（重试 42s + IO），30s 会导致双跑 |
+| 6 | PV/UV 一条 SQL | 两条独立 SQL | 靶向重试的前提：合并会让「PV 已成功、UV 失败」的重试重复累加 PV |
 
 ---
 

@@ -94,11 +94,15 @@ public class AsyncStatsQueue implements SmartLifecycle {
      */
     private static final long KEY_TTL_DAYS = 35L;
 
-    private static final String PV_KEY_PREFIX = "shortlink:pv:";
-    private static final String UV_KEY_PREFIX = "shortlink:uv:";
-    private static final String DLQ_KEY_PREFIX = "shortlink:stats:dl:";
-
-    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.BASIC_ISO_DATE;
+    /**
+     * ⚠️ PV / UV / 死信 key 的前缀与构造<b>全部委托给 {@link StatsKeys}</b>。
+     *
+     * <p>阶段 3 新增了「写侧登记 dirty set、读侧 SPOP」的配对逻辑，
+     * 两边若各写一份字符串拼接，key 拼法一旦漂移就是<b>静默的数据滞留</b>：
+     * flush 每分钟 SPOP 一个不存在的 key，指标全 0，数据烂在 Redis 里。
+     * 所以写侧与读侧共用同一个 {@link StatsKeys}。
+     */
+    private static final DateTimeFormatter DATE_FMT = StatsKeys.DATE;
 
     /**
      * 统计队列。
@@ -585,12 +589,15 @@ public class AsyncStatsQueue implements SmartLifecycle {
             try {
                 pvByDay.forEach((day, byCode) -> {
                     String date = formatDay(day);
+                    String dirtyKey = StatsKeys.dirty(day);
                     byCode.forEach((code, n) -> {
-                        String key = PV_KEY_PREFIX + code + ":" + date;
-                        // ⚠️ F4：用 Lua 把 INCRBY + EXPIRE 合成原子操作。
+                        // ⚠️ F4：用 Lua 把 INCRBY + EXPIRE + SADD(dirty) 合成原子操作。
                         //    两条命令之间进程崩溃会留下**永不过期**的 key。
+                        //    ⚠️ KEYS[2]/KEYS[3] 是阶段 3 新增的：登记 dirty set，
+                        //    让定时落库能 SPOP 找到「今天有流量」的短码。
+                        //    放在同一个脚本里是为了**不增加往返次数**。
                         redis.execute(pvScript,
-                                List.of(key),
+                                List.of(StatsKeys.pv(code, date), dirtyKey, code),
                                 String.valueOf(n),
                                 String.valueOf(TimeUnit.DAYS.toSeconds(KEY_TTL_DAYS)));
                     });
@@ -616,7 +623,7 @@ public class AsyncStatsQueue implements SmartLifecycle {
                 uvByDay.forEach((day, byCode) -> {
                     String date = formatDay(day);
                     byCode.forEach((code, visitors) -> {
-                        String key = UV_KEY_PREFIX + code + ":" + date;
+                        String key = StatsKeys.uv(code, date);
                         // ⚠️ F4 + DR-054 回归：Lua 脚本里 ARGV 形态由脚本定义，
                         //    不存在「传 List 变单个元素」的歧义。
                         //    ARGV[1]=TTL，ARGV[2..]=visitors。
@@ -670,7 +677,7 @@ public class AsyncStatsQueue implements SmartLifecycle {
     private void pushToDlq(List<StatsEvent> batch, String target, Exception cause,
                            int eventCount) {
         try {
-            String dlqKey = DLQ_KEY_PREFIX + today();
+            String dlqKey = StatsKeys.dlq(LocalDate.now());
             List<String> payload = new ArrayList<>(batch.size());
             for (StatsEvent e : batch) {
                 payload.add(target + "|" + e.code() + "|" + e.visitor() + "|" + e.ts());
@@ -693,10 +700,10 @@ public class AsyncStatsQueue implements SmartLifecycle {
     /**
      * 统计 key 的日期后缀。
      *
-     * <p>⚠️ <b>当前用服务器当前日期</b>，不是 {@link StatsEvent#ts()} 反推的日期。
-     * 跨零点的批次会被算到「处理当天」而非「发生当天」，
-     * 极端情况下误差 1 天。阶段 3 做定时落库时再改成按 ts 分桶。
+     * @deprecated 仅供 DLQ 分桶用。PV / UV / dirty 的日期一律来自
+     *     {@link StatsEvent#ts()} 推导（F2），不取服务器当前时间。
      */
+    @Deprecated
     private String today() {
         return LocalDate.now().format(DATE_FMT);
     }

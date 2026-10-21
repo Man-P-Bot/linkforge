@@ -66,6 +66,21 @@ public interface LinkMapper {
                                                  @Param("limit") int limit);
 
     /**
+     * 批量按短码查主键（统计落库用，阶段 3）。
+     *
+     * <p>只 {@code SELECT id, short_code}，走唯一索引 {@code uk_short_code}，
+     * <b>不回表</b>读 {@code target_url}（2048 字节 × 批量 = 无谓 IO）。
+     *
+     * <p>⚠️ <b>不过滤 status</b>：软删除的短链仍有历史访问量，统计不该丢。
+     *
+     * <p>⚠️ <b>入参必须由调用方保证非空且去重</b>：{@code IN ()} 是 SQL 语法错误，
+     * MyBatis 只会把空 foreach 渲染成空括号，直接抛 SQL 异常。
+     * 去重是必要的：flush 每分钟对同一批 dirty 短码反复查询，
+     * 重复短码会让 IN 列表膨胀到超出 {@code max_allowed_packet}。
+     */
+    List<IdShortCode> selectIdsByShortCodes(@Param("shortCodes") List<String> shortCodes);
+
+    /**
      * {@code (id, shortCode)} 行。
      *
      * <p>⚠️ 必须提供两个 getter 而不只是 record 访问器：

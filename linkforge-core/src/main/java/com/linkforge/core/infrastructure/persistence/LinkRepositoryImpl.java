@@ -2,7 +2,11 @@ package com.linkforge.core.infrastructure.persistence;
 
 import com.linkforge.core.domain.Link;
 import com.linkforge.core.repository.LinkRepository;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.springframework.stereotype.Repository;
 
@@ -60,6 +64,24 @@ public class LinkRepositoryImpl implements LinkRepository {
         // 只改数据库状态。删缓存是 Cache Aside 的第二步，必须在事务提交后由上层执行
         // （docs/ARCHITECTURE.md §10），不属于仓储职责。
         return linkMapper.updateStatusToDeleted(id);
+    }
+
+    @Override
+    public Map<String, Long> resolveIdsByShortCodes(Collection<String> shortCodes) {
+        if (shortCodes == null || shortCodes.isEmpty()) {
+            return Map.of();
+        }
+        // ⚠️ 必须去重：flush 每分钟对同一批 dirty 短码反复查，
+        // 重复项会让 IN 列表无谓膨胀（短码多时可能撞上 max_allowed_packet）。
+        // 用 LinkedHashSet 保持首次出现顺序，便于测试断言稳定。
+        List<String> distinct = List.copyOf(new LinkedHashSet<>(shortCodes));
+        List<LinkMapper.IdShortCode> rows = linkMapper.selectIdsByShortCodes(distinct);
+        Map<String, Long> result = new HashMap<>(rows.size() * 2);
+        for (LinkMapper.IdShortCode row : rows) {
+            result.put(row.getShortCode(), row.getId());
+        }
+        // 查不到的短码（已物理不存在）不会出现在结果里，由调用方计数
+        return result;
     }
 
     @Override

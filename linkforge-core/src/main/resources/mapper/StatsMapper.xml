@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  StatsMapper —— link_stats_daily 表的 SQL（docs/DATABASE.md §4.3）
+
+  为什么把 SQL 集中在 XML 而不是注解里：
+    本项目要讲清楚的核心之一是「哪条 SQL 走哪个索引」，XML 便于把索引意图直接写在语句旁边。
+  索引对应关系：
+    uk_link_date_referer(link_id,stat_date,referer_domain) -> 两条 UPSERT 的冲突判定
+    idx_stat_date(stat_date)                              -> 按日期范围查询（阶段 5 的后台查询用）
+
+  ⚠️ 短码 -> 主键的映射不在这里：它查的是 short_link 表，
+     语义属于「读短链」，因此放在 LinkMapper.selectIdsByShortCodes。
+-->
+<mapper namespace="com.linkforge.core.infrastructure.persistence.StatsMapper">
+
+    <!--
+      PV 累加：INSERT ... ON DUPLICATE KEY UPDATE pv = pv + VALUES(pv)
+
+      ⚠️ 为什么必须累加：每次落库携带的是「自上次落库以来新增的浏览量」，
+      多次落库要叠加。若改成覆盖（pv = VALUES(pv)），
+      刷新期间没被 flush 掉的增量会永远丢失。
+
+      ⚠️ VALUES() 在 MySQL 8.0.20+ 已标记弃用（推荐用 AS new 别名语法），
+      但 MySQL 8.4 仍支持，且别名语法在「VALUES 多行 + 冲突更新」组合下
+      的行为差异需要额外验证。这里保持 VALUES()，并在 DR 中记录该迁移点。
+
+      ⚠️ referer_domain 固定 'direct'：当前阶段没有采集 referer，
+      未来接入 referer 维度时需要把它加入唯一键的判定与本语句的取值。
+    -->
+    <insert id="accumulatePvBatch">
+        INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
+        VALUES
+        <foreach collection="rows" item="row" separator=",">
+            (#{row.linkId}, #{row.statDate}, #{row.delta}, 0, 'direct')
+        </foreach>
+        ON DUPLICATE KEY UPDATE
+            pv = pv + VALUES(pv)
+    </insert>
+
+    <!--
+      UV 合并：INSERT ... ON DUPLICATE KEY UPDATE uv_estimated = GREATEST(uv_estimated, VALUES(uv_estimated))
+
+      ⚠️ 为什么用 GREATEST 而不是累加：
+        HLL 的 PFCOUNT 返回的是「当日至今的独立访客估算」，**不是增量**。
+        一分钟内 flush 一次、一天 1440 次，若用累加，同一个访客会被计 1440 遍。
+        当日值只增不减，取 GREATEST 既是正确语义，也让重试天然幂等
+        （重放同一个估算值不会把结果改坏）。
+
+      ⚠️ 为什么不与 PV 合并成一条语句：
+        PV 是累加语义、UV 是覆盖语义，合并后重试无法区分「PV 已成功、UV 失败」，
+        重放整条语句会把 PV 重复累加。两条语句分开，才能做靶向重试
+        （只重试失败的那一路）。见 StatsRepository 的 javadoc。
+    -->
+    <insert id="mergeUvBatch">
+        INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
+        VALUES
+        <foreach collection="rows" item="row" separator=",">
+            (#{row.linkId}, #{row.statDate}, 0, #{row.estimate}, 'direct')
+        </foreach>
+        ON DUPLICATE KEY UPDATE
+            uv_estimated = GREATEST(uv_estimated, VALUES(uv_estimated))
+    </insert>
+
+</mapper>
