@@ -16,7 +16,7 @@
 | Q1~Q5 书面回答 | ✅ 贴代码行号，见本轮汇报 |
 | Testcontainers MySQL 引入 | ✅ `org.testcontainers:mysql:1.20.6`（test scope）+ BOM 统一版本 |
 | 四个 MySQL 测试类改造 | ✅ `LinkRepositoryMyBatisTest`(20) / `StatsRepositoryMyBatisTest`(18) / `SegmentShortCodeGeneratorMysqlTest`(9) / `ExpiryCleanupMyBatisTest`(11) 全部改用一次性容器 |
-| `VALUES()` deprecated 兼容性 | ✅ 在 **MySQL 8.4 容器**上实测通过（PV 累加 / UV GREATEST / 互不清零），记录在 docs/TROUBLESHOOTING.md T-010 |
+| `VALUES()` deprecated 兼容性 | ✅ **已修复**（2026-10-24）：改用 `AS new` 别名语法，在 **MySQL 8.4 容器**上实测通过（PV 累加 / UV GREATEST / 互不清零 / 多行），T-010 已标记「已修复」 |
 | 新增 docs/TROUBLESHOOTING.md | ✅ 9 条排障记录（环境/数据库/测试方法论） |
 | `@Transactional` 自调用陷阱 | ✅ 自查发现并修复：同类自调用绕过 AOP 代理 → 事务失效 → 缓存清理退化成「事务内立即执行」 |
 
@@ -31,6 +31,8 @@
 | 布隆 | ✅ **不删除**，标准 Bloom 不支持删除；⚠️ 代价：过期短码不会被重建淘汰（多一次回源，结果仍正确） |
 | 分布式锁 | ✅ `shortlink:stats:cleanup:lock`（与统计 flush **不同**的锁，可并行） |
 | 指标 | ✅ `scanned` / `cleared` / `failed` / `cache.evicted` / `cache.evict.failed` / `duration` |
+| **扫描游标** | ✅ Redis 持久化（`shortlink:stats:cleanup:cursor:{date}`）。⚠️ **必需**：不改 status ⇒ 扫描条件永远成立，无游标则每轮只扫到同一批，后面的短码永远清不到 |
+| 批量清缓存 | ✅ 一次多键 DEL（实测 5000 条：逐条 3174ms vs 批量 60ms，**52.9x**） |
 | 时间源 | ✅ 全部走注入的 `Clock`（ARCHITECTURE §13），含阶段 3 `StatsFlushService` 的 `LocalDate.now()` 一并修正 |
 
 **⚠️ 一处关键决策：清理任务不软删除**

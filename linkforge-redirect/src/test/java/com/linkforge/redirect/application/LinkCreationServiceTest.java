@@ -131,7 +131,7 @@ class LinkCreationServiceTest {
 
         @Override
         public List<com.linkforge.core.repository.LinkRepository.ExpiredLink> scanExpired(
-                int limit, java.time.Instant now) {
+                int limit, java.time.Instant now, long afterId) {
             // 本测试只覆盖建链流程，不涉及过期清理
             return List.of();
         }

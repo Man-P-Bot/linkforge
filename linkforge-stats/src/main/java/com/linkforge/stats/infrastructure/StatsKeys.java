@@ -66,6 +66,21 @@ public final class StatsKeys {
     /** 死信队列前缀。 */
     public static final String DLQ_PREFIX = "shortlink:stats:dl:";
 
+    /**
+     * 过期清理的扫描游标前缀：{@code shortlink:stats:cleanup:cursor:{yyyymmdd}}。
+     *
+     * <p>⚠️ <b>游标是正确性必需，不是性能优化</b>：
+     * 过期清理**不修改 status**（保住 410 语义，DR-060 决策 2），
+     * 所以扫描条件 {@code status = 0 AND expire_at < ?} 对同一批行<b>永远成立</b>。
+     * 没有游标时，每轮 {@code LIMIT} 出的都是<b>同一批</b>（id 最小的那些），
+     * 后面几万条过期短码的缓存<b>永远清不到</b>。
+     *
+     * <p>游标存 Redis 而不是内存：清理任务在多实例下运行，
+     * 且进程可能重启。存内存会让「重启后从头开始」——
+     * 那意味着 id 最小的那批会被反复清理，而中间那段永远扫不到。
+     */
+    public static final String CLEANUP_CURSOR_PREFIX = "shortlink:stats:cleanup:cursor:";
+
     /** 落库任务的全局锁。 */
     public static final String FLUSH_LOCK = "shortlink:stats:flush:lock";
 
@@ -90,6 +105,15 @@ public final class StatsKeys {
 
     public static String dirty(LocalDate date) {
         return DIRTY_PREFIX + date.format(DATE);
+    }
+
+    /**
+     * 过期清理的扫描游标 key。
+     *
+     * @param date 扫描的日期（游标按天独立：跨天后从头扫新的一天）
+     */
+    public static String cleanupCursor(LocalDate date) {
+        return CLEANUP_CURSOR_PREFIX + date.format(DATE);
     }
 
     public static String dlq(LocalDate date) {

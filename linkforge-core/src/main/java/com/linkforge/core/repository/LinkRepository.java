@@ -108,9 +108,16 @@ public interface LinkRepository {
      * @param now      判定基准时刻（UTC），由调用方注入保证可测试
      * @param limit    单批上限。⚠️ <b>必须有上限</b>：无上限会在短链大量到期时
      *                 让一轮任务持有分布式锁很久，挤占其它定时任务
+     * @param afterId  <b>游标</b>：只返回 {@code id > afterId} 的行。
+     *                 ⚠️ <b>这个参数不是可选的优化，是正确性必需</b>：
+     *                 过期清理**不修改 status**（保住 410 语义，见 DR-060 决策 2），
+     *                 所以扫描条件 {@code status = 0 AND expire_at < ?} 永远成立 ——
+     *                 若没有游标，每轮都会扫到<b>同一批</b>（id 最小的那些），
+     *                 后面几万条过期短码的缓存<b>永远清不到</b>。
+     *                 游标由调用方持久化（Redis），使扫描能逐批推进。
      * @return 命中的行；按 {@code id} 升序（让清理顺序稳定，便于测试断言）
      */
-    List<ExpiredLink> scanExpired(int limit, java.time.Instant now);
+    List<ExpiredLink> scanExpired(int limit, java.time.Instant now, long afterId);
 
     /**
      * 「已过期且未删除」的短链行。

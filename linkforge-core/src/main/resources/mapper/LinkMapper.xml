@@ -175,6 +175,7 @@
         FROM short_link
         WHERE status = 0
           AND expire_at &lt; #{now}
+          AND id &gt; #{afterId}
         ORDER BY id
         LIMIT #{limit}
     </select>

@@ -449,19 +449,64 @@ V1 的 `idx_status_code (status, short_code)` **不适用**：
 ⚠️ **清理是幂等的**：因为不改 status，每一轮都会重新扫到同一批过期短码。
 这不是 bug —— 清理的副作用只有「删缓存」，删两次无害（第二次删的是不存在的 key）。
 
-### 6.4 扫描条件为何仍是 `status = 0`
+### 6.4 ⚠️ 扫描**必须有游标**（否则后面的短码永远清不到）
+
+扫描 SQL：
+
+```sql
+SELECT id, short_code, expire_at FROM short_link
+WHERE status = 0
+  AND expire_at < ?
+  AND id > ?            -- ⚠️ 游标
+ORDER BY id
+LIMIT ?
+```
+
+⚠️ **游标是正确性必需，不是性能优化。**
+
+因为本任务**不修改 status**（见 6.3），扫描条件 `status = 0 AND expire_at < ?`
+对同一批行**永远成立**。没有游标时：
+
+```
+第 1 轮：LIMIT 1000 → id 最小的 1000 条 → 清掉缓存
+第 2 轮：LIMIT 1000 → **还是** id 最小的 1000 条 → 缓存早就不在了，白跑
+```
+
+**结果：10 万条过期短码里，只有最前面 1000 条的缓存被清过。**
+
+| 项 | 约定 |
+|---|---|
+| 游标存哪 | **Redis**：`shortlink:stats:cleanup:cursor:{yyyymmdd}`，TTL 35 天 |
+| 为什么存 Redis | 任务多实例运行且进程可能重启；存内存会让「重启后从头开始」，中间那段永远扫不到 |
+| 何时推进 | **清缓存之后**（先推进再清，中途崩溃会跳过这一批） |
+| 推进到哪 | 本批的**最大 id** |
+| 读失败 | 从头扫，不中断清理（重复清一批幂等无害） |
+| 写失败 | 只记日志，不中断清理 |
+
+### 6.5 扫描条件为何仍是 `status = 0`
 
 - `status = 0`：只清理「有效但已过期」的短码。
   已被 admin 手动删除的短链（`status = 1`）在删除时就已经清过缓存了（`DeleteLinkService`），
   不需要重复清理。
 - 索引仍是 `idx_expire_status (status, expire_at)`（见 6.2），**不受「不改状态」影响**。
 
-### 6.5 缓存失效
+### 6.6 缓存失效
 
 ```java
-// L2 主动删 + L1 一起删（core 的 RedirectCacheService.evict，两级都删）
-cache.evict(shortCode);
+// ⚠️ 批量：一次多键 DEL，不是逐条 evict
+cache.evictAll(codes);
 ```
+
+实测（真实 Redis，5000 个 key）：
+
+| 方式 | 耗时 | 单条延迟 |
+|---|---|---|
+| 逐条 `delete` | **3174 ms** | 635 µs |
+| 批量 `delete(Collection)` | **60 ms** | — |
+| **加速比** | **52.9x** | |
+
+逐条删会让这一轮逼近分布式锁的 TTL —— 锁到期后另一个实例会进来重复清理
+（幂等，但浪费）。
 
 ⚠️ **本任务不写数据库，所以没有「事务提交后清缓存」的问题**
 （那是 admin 的 `DeleteLinkService` 的约束——它要改 status）。
@@ -483,7 +528,7 @@ cache.evict(shortCode);
 跳转路径命中缓存后**仍然要走一遍状态判定**（`RedirectService` 的注释明确说了这一点）。
 所以最多是「多一次无效的状态判定」，不是安全漏洞。
 
-### 6.6 布隆过滤器：**不删除**
+### 6.7 布隆过滤器：**不删除**
 
 标准布隆过滤器**不支持删除**（要删就得重算所有元素的位并重建整条链），成本 O(全部短码数)。
 
@@ -497,7 +542,7 @@ cache.evict(shortCode);
 > 但**每小时全量重建会把它重置**。
 > admin 手动删除的短链（`status = DELETED`）仍会被重建自然淘汰。
 
-### 6.7 与统计 flush 的关系
+### 6.8 与统计 flush 的关系
 
 - **不同的锁**：`shortlink:stats:flush:lock` vs `shortlink:stats:cleanup:lock`。
   两个任务操作不同的数据，且**必须能并行**（清理扫大表、flush 写统计表，串行化总时长相加）。
@@ -506,7 +551,7 @@ cache.evict(shortCode);
   ⚠️ 反过来「跳过已删除的短链」是错的——那会让「删除前最后一分钟的访问量」凭空消失，
   且没有任何指标能发现。
 
-### 6.8 与 DR-038 的一致性
+### 6.9 与 DR-038 的一致性
 
 `DELETED` 优先级高于 `EXPIRED`（DR-038 已定）。
 

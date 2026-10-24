@@ -79,7 +79,7 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
         insert(CODE_B, LocalDateTime.of(2026, 3, 21, 0, 0));   // 未过期
         insert(CODE_C, null);                                    // 永久有效
 
-        List<ExpiredLink> found = linkRepository.scanExpired(100, now);
+        List<ExpiredLink> found = linkRepository.scanExpired(100, now, 0L);
 
         assertThat(found).hasSize(1);
         assertThat(found.get(0).id()).isEqualTo(expiredId);
@@ -92,7 +92,7 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
         Instant now = Instant.parse("2026-03-20T10:00:00Z");
         insert(CODE_C, null);
 
-        assertThat(linkRepository.scanExpired(100, now))
+        assertThat(linkRepository.scanExpired(100, now, 0L))
                 .as("⚠️ SQL 里 expire_at < ? 对 NULL 求值为 NULL（不为真），"
                         + "所以永久有效的短链天然被排除")
                 .isEmpty();
@@ -105,7 +105,7 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
         long id = insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
         linkRepository.markDeleted(id);
 
-        assertThat(linkRepository.scanExpired(100, now))
+        assertThat(linkRepository.scanExpired(100, now, 0L))
                 .as("⚠️ 软删除后 status=1，扫描条件 status=0 会跳过它。"
                         + "这条断言是「清理幂等」的数据库侧保证")
                 .isEmpty();
@@ -118,7 +118,7 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
         insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
         insert(CODE_B, LocalDateTime.of(2026, 3, 19, 0, 0));
 
-        assertThat(linkRepository.scanExpired(1, now)).hasSize(1);
+        assertThat(linkRepository.scanExpired(1, now, 0L)).hasSize(1);
     }
 
     @Test
@@ -128,7 +128,7 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
         long idA = insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
         long idB = insert(CODE_B, LocalDateTime.of(2026, 3, 19, 0, 0));
 
-        List<ExpiredLink> found = linkRepository.scanExpired(100, now);
+        List<ExpiredLink> found = linkRepository.scanExpired(100, now, 0L);
 
         assertThat(found).hasSize(2);
         assertThat(found.get(0).id()).isEqualTo(Math.min(idA, idB));
@@ -238,13 +238,55 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
     // ---------------------------------------------------------------------
 
     @Test
+    @DisplayName("🎚️⭐⭐⭐ 游标生效：afterId 之后**不再重复扫**同一批")
+    void cursorPreventsRescanningSameBatch() {
+        Instant now = Instant.parse("2026-03-20T10:00:00Z");
+        long idA = insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
+        long idB = insert(CODE_B, LocalDateTime.of(2026, 3, 19, 0, 0));
+
+        // 第一轮：从头扫，拿到 idA（更小的那个）
+        List<ExpiredLink> first = linkRepository.scanExpired(1, now, 0L);
+        assertThat(first).hasSize(1);
+        long cursor = first.get(0).id();
+
+        // 第二轮：带上游标，**不再拿到同一批**
+        List<ExpiredLink> second = linkRepository.scanExpired(1, now, cursor);
+        assertThat(second)
+                .as("⚠️ 核心断言：游标之后必须扫到**新**的行。"
+                        + "若仍返回同一批，说明游标没生效 —— "
+                        + "过期清理不改 status，扫描条件永远成立，"
+                        + "没有游标则后面几万条永远清不到")
+                .hasSize(1);
+        assertThat(second.get(0).id())
+                .as("第二轮必须是另一条")
+                .isNotEqualTo(first.get(0).id());
+        assertThat(second.get(0).id()).isEqualTo(Math.max(idA, idB));
+    }
+
+    @Test
+    @DisplayName("🎚️b 游标推进到末尾后，扫描返回**空**（没有遗漏）")
+    void scanReturnsEmptyAfterCursorReachesEnd() {
+        Instant now = Instant.parse("2026-03-20T10:00:00Z");
+        insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
+        insert(CODE_B, LocalDateTime.of(2026, 3, 19, 0, 0));
+
+        long maxId = linkRepository.scanExpired(100, now, 0L).stream()
+                .mapToLong(ExpiredLink::id).max().orElseThrow();
+
+        assertThat(linkRepository.scanExpired(100, now, maxId))
+                .as("⚠️ 游标到末尾后必须扫不到东西 —— "
+                        + "否则说明有行被跳过了（那批的缓存永远清不到）")
+                .isEmpty();
+    }
+
+    @Test
     @DisplayName("🔒⭐⭐⭐ 扫描过期短链**不改变 status**（保住 410 语义）")
     void scanDoesNotChangeStatus() {
         Instant now = Instant.parse("2026-03-20T10:00:00Z");
         long id = insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
 
         // 扫描只是「读」，绝不写
-        List<ExpiredLink> found = linkRepository.scanExpired(100, now);
+        List<ExpiredLink> found = linkRepository.scanExpired(100, now, 0L);
         assertThat(found).hasSize(1);
 
         Link after = linkRepository.findByShortCode(CODE_A).orElseThrow();
@@ -263,11 +305,11 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
         insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
 
         // ⚠️ 第一次扫描
-        assertThat(linkRepository.scanExpired(100, now)).hasSize(1);
+        assertThat(linkRepository.scanExpired(100, now, 0L)).hasSize(1);
         // ⚠️ 第二次扫描——同样能扫到。
         //    因为 status 没变，所以清理是**幂等**的：
         //    清缓存做两遍也只是多删一次不存在的 key。
-        assertThat(linkRepository.scanExpired(100, now))
+        assertThat(linkRepository.scanExpired(100, now, 0L))
                 .as("⚠️ 不改状态 ⇒ 每次都会扫到。这是幂等的，"
                         + "不是 bug：清理的副作用只有「删缓存」，删两次无害")
                 .hasSize(1);
@@ -278,7 +320,7 @@ class ExpiryCleanupMyBatisTest extends MySqlContainerSupport {
     void expiredLinkStillResolvesForStats() {
         Instant now = Instant.parse("2026-03-20T10:00:00Z");
         long id = insert(CODE_A, LocalDateTime.of(2026, 3, 19, 0, 0));
-        linkRepository.scanExpired(100, now);
+        linkRepository.scanExpired(100, now, 0L);
 
         Map<String, Long> m = linkRepository.resolveIdsByShortCodes(List.of(CODE_A));
 

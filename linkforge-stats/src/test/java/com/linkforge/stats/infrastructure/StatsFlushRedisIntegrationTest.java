@@ -408,7 +408,7 @@ class StatsFlushRedisIntegrationTest {
         }
 
         @Override
-        public List<ExpiredLink> scanExpired(int limit, java.time.Instant now) {
+        public List<ExpiredLink> scanExpired(int limit, java.time.Instant now, long afterId) {
             // 本类只验 Redis 侧语义，不涉及过期清理
             return List.of();
         }

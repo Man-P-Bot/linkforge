@@ -109,8 +109,8 @@
 | `link_id` | 关联短链主表 `id` | **`BIGINT`**；**不设外键约束**；**不直接存 `short_code`** |
 | `stat_date` | 统计日期 | 按**自然日**；与 `link_id` 组成唯一键 |
 | `referer_domain` | 来源域名 | **只存域名**；**空 Referer 存字符串 `'direct'`，不存 NULL** |
-| `pv` | 当日浏览量 | 累加语义（UPSERT）：`pv = pv + VALUES(pv)` |
-| `uv_estimated` | 当日独立访客 | **HyperLogLog 估算值**，约 0.81% 误差（PRD §7.4）；覆盖语义：`GREATEST(uv_estimated, VALUES(uv_estimated))` |
+| `pv` | 当日浏览量 | 累加语义（UPSERT）：`pv = link_stats_daily.pv + new.pv`（`AS new` 别名语法，见 §8） |
+| `uv_estimated` | 当日独立访客 | **HyperLogLog 估算值**，约 0.81% 误差（PRD §7.4）；覆盖语义：`GREATEST(link_stats_daily.uv_estimated, new.uv_estimated)` |
 | `created_at` / `updated_at` | 落库与更新时间 | 便于排查落库延迟 |
 
 > ⚠️ **字段名是 `uv_estimated` 不是 `uv`**（V4 迁移完成的重命名）。

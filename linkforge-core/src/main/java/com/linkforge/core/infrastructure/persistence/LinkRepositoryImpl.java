@@ -88,7 +88,7 @@ public class LinkRepositoryImpl implements LinkRepository {
     }
 
     @Override
-    public List<ExpiredLink> scanExpired(int limit, Instant now) {
+    public List<ExpiredLink> scanExpired(int limit, Instant now, long afterId) {
         if (limit <= 0) {
             return List.of();
         }
@@ -97,7 +97,7 @@ public class LinkRepositoryImpl implements LinkRepository {
         //    这里**不做任何时区转换**——转换只发生在 Service 边界，
         //    在这里再换算一次会与驱动层对 TIMESTAMP 的解释叠加成双重换算。
         LocalDateTime nowUtc = LocalDateTime.ofInstant(now, ZoneOffset.UTC);
-        return linkMapper.selectExpired(nowUtc, limit).stream()
+        return linkMapper.selectExpired(nowUtc, afterId, limit).stream()
                 // ⚠️ Mapper 侧是可变 POJO（MyBatis 需要 setter），
                 // 这里转成不可变 record，让上层拿到的对象不可被意外修改
                 .map(row -> new ExpiredLink(row.getId(), row.getShortCode(), row.getExpireAt()))

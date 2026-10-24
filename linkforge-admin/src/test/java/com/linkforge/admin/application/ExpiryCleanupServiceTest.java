@@ -31,6 +31,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 /**
  * {@link ExpiryCleanupService} 的行为契约（阶段 4）。
@@ -59,6 +60,10 @@ class ExpiryCleanupServiceTest {
     private RedirectCacheService cache;
     @Mock
     private RedisDistributedLock lock;
+    @Mock
+    private StringRedisTemplate redis;
+    @Mock
+    private org.springframework.data.redis.core.ValueOperations<String, String> valueOps;
 
     private ExpiryCleanupService service;
 
@@ -69,12 +74,17 @@ class ExpiryCleanupServiceTest {
         when(lock.tryLock(anyString(), any())).thenReturn(true);
         when(lock.holdsLock(anyString())).thenReturn(true);
         // 默认：没有过期短链
-        when(linkRepository.scanExpired(anyInt(), any())).thenReturn(List.of());
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong())).thenReturn(List.of());
+        // 默认：没有游标（从头开始扫）
+        // ⚠️ 必须 stub opsForValue()：它返回 null 时链式调用直接 NPE，
+        //    报错点会落在 setUp 而不是「没有游标」的语义上，很难定位。
+        when(redis.opsForValue()).thenReturn(valueOps);
+        when(valueOps.get(anyString())).thenReturn(null);
         service = newService();
     }
 
     private ExpiryCleanupService newService() {
-        return new ExpiryCleanupService(linkRepository, expiryService, lock,
+        return new ExpiryCleanupService(linkRepository, expiryService, lock, redis,
                 Clock.fixed(NOW, ZoneOffset.UTC), registry, 1000, 5, 60);
     }
 
@@ -94,7 +104,7 @@ class ExpiryCleanupServiceTest {
     void scanUsesInjectedClock() {
         service.cleanup();
 
-        verify(linkRepository).scanExpired(anyInt(), eq(NOW));
+        verify(linkRepository).scanExpired(anyInt(), eq(NOW), eq(0L));
     }
 
     @Test
@@ -113,26 +123,26 @@ class ExpiryCleanupServiceTest {
         //    才会继续下一批。默认的 batchSize=1000 下 mock 只返回 2 条
         //    会被判为「库里没有更多了」而提前收敛。
         ExpiryCleanupService smallBatch = new ExpiryCleanupService(
-                linkRepository, expiryService, lock, Clock.fixed(NOW, ZoneOffset.UTC),
+                linkRepository, expiryService, lock, redis, Clock.fixed(NOW, ZoneOffset.UTC),
                 registry, 2, 5, 60);
-        when(linkRepository.scanExpired(anyInt(), any()))
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
                 .thenReturn(List.of(expired(1L, "c1"), expired(2L, "c2")));
 
         smallBatch.cleanup();
 
         // 5 批 × 每批 2 条
-        verify(linkRepository, times(5)).scanExpired(anyInt(), any());
+        verify(linkRepository, times(5)).scanExpired(anyInt(), any(), anyLong());
     }
 
     @Test
     @DisplayName("🔍d 批次不满时提前收敛（库里没有更多过期数据了）")
     void stopsEarlyWhenBatchIsNotFull() {
-        when(linkRepository.scanExpired(anyInt(), any()))
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
                 .thenReturn(List.of(expired(1L, "c1")));
 
         service.cleanup();
 
-        verify(linkRepository, times(1)).scanExpired(anyInt(), any());
+        verify(linkRepository, times(1)).scanExpired(anyInt(), any(), anyLong());
     }
 
     // ============================================ 核心契约：不改数据库
@@ -140,7 +150,7 @@ class ExpiryCleanupServiceTest {
     @Test
     @DisplayName("🗑️⭐⭐⭐ **不修改数据库**——只调 clearCaches，绝不调 markDeleted")
     void neverModifiesDatabase() {
-        when(linkRepository.scanExpired(anyInt(), any()))
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
                 .thenReturn(List.of(expired(1L, "c1"), expired(2L, "c2")));
         when(expiryService.clearCaches(any())).thenReturn(2);
 
@@ -157,7 +167,7 @@ class ExpiryCleanupServiceTest {
     @Test
     @DisplayName("🗑️b 清理成功的条数记在 cleared 指标上（**不是 deleted**）")
     void clearedCounterTracksSuccess() {
-        when(linkRepository.scanExpired(anyInt(), any()))
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
                 .thenReturn(List.of(expired(1L, "c1"), expired(2L, "c2")));
         when(expiryService.clearCaches(any())).thenReturn(2);
 
@@ -170,7 +180,7 @@ class ExpiryCleanupServiceTest {
     @Test
     @DisplayName("🗑️c 清理异常时整批放弃并计 failed（不逐条重试）")
     void cleanupFailureAbortsBatch() {
-        when(linkRepository.scanExpired(anyInt(), any()))
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
                 .thenReturn(List.of(expired(1L, "c1")));
         doThrow(new RuntimeException("缓存层炸了")).when(expiryService).clearCaches(any());
 
@@ -178,6 +188,108 @@ class ExpiryCleanupServiceTest {
 
         assertThat(counter("shortlink.cleanup.failed")).isEqualTo(1.0);
         assertThat(counter("shortlink.cleanup.cleared")).isZero();
+    }
+
+    // ============================================ 扫描游标（正确性必需）
+
+    @Test
+    @DisplayName("🎚️⭐⭐⭐ 游标推进：本批最大 id 被写回，**下一轮从它之后开始**")
+    void cursorAdvancesToLastIdOfBatch() {
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
+                .thenReturn(List.of(expired(10L, "c1"), expired(20L, "c2")));
+        when(expiryService.clearCaches(any())).thenReturn(2);
+
+        service.cleanup();
+
+        // ⚠️ 核心断言：游标写到**本批最大 id**。
+        //    若不写游标，每轮都会扫到同一批（id 最小的那些），
+        //    后面几万条过期短码的缓存**永远清不到**。
+        verify(redis.opsForValue()).set(
+                eq("shortlink:stats:cleanup:cursor:" + today()),
+                eq("20"),
+                eq(com.linkforge.stats.infrastructure.StatsKeys.KEY_TTL));
+    }
+
+    @Test
+    @DisplayName("🎚️b 游标在**清缓存之后**推进（先推进再清，中途崩溃会跳过这一批）")
+    void cursorIsWrittenAfterCacheEviction() {
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
+                .thenReturn(List.of(expired(10L, "c1")));
+        when(expiryService.clearCaches(any())).thenReturn(1);
+
+        service.cleanup();
+
+        // ⚠️ 顺序断言：先清缓存，再写游标。
+        //    若先写游标再清缓存，中途崩溃会跳过这一批 ——
+        //    那批短码的缓存永远清不到（因为下次扫描会从游标之后开始）。
+        var order = org.mockito.Mockito.inOrder(expiryService, redis.opsForValue());
+        order.verify(expiryService).clearCaches(any());
+        order.verify(redis.opsForValue()).set(anyString(), anyString(),
+                any(java.time.Duration.class));
+    }
+
+    @Test
+    @DisplayName("🎚️c 已有游标时，扫描**从游标之后**开始（不重复处理已扫过的）")
+    void scanStartsFromExistingCursor() {
+        when(redis.opsForValue().get(anyString())).thenReturn("500");
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong())).thenReturn(List.of());
+
+        service.cleanup();
+
+        verify(linkRepository).scanExpired(anyInt(), eq(NOW), eq(500L));
+    }
+
+    @Test
+    @DisplayName("🎚️d 游标在 Redis 里**持久化**（不是内存）——重启后不从头扫")
+    void cursorIsPersistedInRedis() {
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
+                .thenReturn(List.of(expired(10L, "c1")));
+        when(expiryService.clearCaches(any())).thenReturn(1);
+
+        service.cleanup();
+
+        // ⚠️ 必须写 Redis（带 TTL），不能只放内存字段。
+        //    存内存的话，进程重启后从头扫 —— id 最小的那批被反复清理，
+        //    而中间那段永远扫不到。
+        verify(redis.opsForValue()).set(
+                eq("shortlink:stats:cleanup:cursor:" + today()),
+                eq("10"),
+                eq(com.linkforge.stats.infrastructure.StatsKeys.KEY_TTL));
+    }
+
+    @Test
+    @DisplayName("🎚️e 读游标失败时**从头扫**（不能中断清理）")
+    void cursorReadFailureFallsBackToZero() {
+        when(redis.opsForValue().get(anyString()))
+                .thenThrow(new RuntimeException("Redis 挂了"));
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong())).thenReturn(List.of());
+
+        service.cleanup();
+
+        verify(linkRepository).scanExpired(anyInt(), eq(NOW), eq(0L));
+    }
+
+    @Test
+    @DisplayName("🎚️f 写游标失败只记日志，**不中断清理**（重复清一批幂等无害）")
+    void cursorWriteFailureDoesNotAbortCleanup() {
+        when(linkRepository.scanExpired(anyInt(), any(), anyLong()))
+                .thenReturn(List.of(expired(10L, "c1")));
+        when(expiryService.clearCaches(any())).thenReturn(1);
+        // ⚠️ 对 valueOps 而不是 redis.opsForValue()：
+        //    后者每次调用都返回 mock，再链式 .set() 会让 Mockito 认为
+        //    前一个 stub 没完成（UnfinishedStubbing）。
+        doThrow(new RuntimeException("Redis 挂了")).when(valueOps)
+                .set(anyString(), anyString(), any(java.time.Duration.class));
+
+        service.cleanup();
+
+        // 缓存已经清了（清理目的达成），游标写失败只是下一轮会重复一批
+        verify(expiryService).clearCaches(any());
+    }
+
+    private static String today() {
+        return java.time.LocalDate.of(2026, 3, 20)
+                .format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
     }
 
     // ============================================ 分布式锁
@@ -198,7 +310,7 @@ class ExpiryCleanupServiceTest {
 
         service.cleanup();
 
-        verify(linkRepository, never()).scanExpired(anyInt(), any());
+        verify(linkRepository, never()).scanExpired(anyInt(), any(), anyLong());
         verifyNoInteractions(expiryService);
     }
 
@@ -209,14 +321,14 @@ class ExpiryCleanupServiceTest {
 
         service.cleanup();
 
-        verify(linkRepository, never()).scanExpired(anyInt(), any());
+        verify(linkRepository, never()).scanExpired(anyInt(), any(), anyLong());
     }
 
     @Test
     @DisplayName("🔒️d 即使抛异常也释放锁（finally）")
     void lockReleasedEvenOnFailure() {
         doThrow(new RuntimeException("boom")).when(linkRepository)
-                .scanExpired(anyInt(), any());
+                .scanExpired(anyInt(), any(), anyLong());
 
         service.cleanup();
 
@@ -229,7 +341,7 @@ class ExpiryCleanupServiceTest {
     @DisplayName("🛡️⭐⭐⭐ cleanup() 遇到任何异常都不外抛（外抛会让调度永久失效）")
     void cleanupNeverThrows() {
         doThrow(new RuntimeException("Redis 炸了")).when(linkRepository)
-                .scanExpired(anyInt(), any());
+                .scanExpired(anyInt(), any(), anyLong());
         doThrow(new NoSuchMethodError("Error 的近亲")).when(lock)
                 .tryLock(anyString(), any());
 

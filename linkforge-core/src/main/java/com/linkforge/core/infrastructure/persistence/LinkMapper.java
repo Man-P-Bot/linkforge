@@ -90,8 +90,13 @@ public interface LinkMapper {
      *
      * <p>⚠️ <b>只 select 三列</b>：{@code id, short_code, expire_at}。
      * 不读 {@code target_url}（2048 字节）—— 清理任务不需要它。
+     *
+     * <p>⚠️ <b>{@code afterId} 是游标，不是可选优化</b>：
+     * 过期清理不修改 status，扫描条件永远成立，
+     * 没有游标就会每轮扫到同一批（见 {@code LinkRepository#scanExpired} 的说明）。
      */
     List<ExpiredLink> selectExpired(@Param("now") java.time.LocalDateTime now,
+                                     @Param("afterId") long afterId,
                                      @Param("limit") int limit);
 
     /**

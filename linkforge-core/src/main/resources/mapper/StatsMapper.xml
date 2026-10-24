@@ -17,18 +17,48 @@
 <mapper namespace="com.linkforge.core.infrastructure.persistence.StatsMapper">
 
     <!--
-      PV 累加：INSERT ... ON DUPLICATE KEY UPDATE pv = pv + VALUES(pv)
+      PV 累加：INSERT ... AS new ON DUPLICATE KEY UPDATE pv = link_stats_daily.pv + new.pv
 
       ⚠️ 为什么必须累加：每次落库携带的是「自上次落库以来新增的浏览量」，
-      多次落库要叠加。若改成覆盖（pv = VALUES(pv)），
-      刷新期间没被 flush 掉的增量会永远丢失。
+      多次落库要叠加。若改成覆盖（pv = new.pv），刷新期间没被 flush 掉的增量
+      会永远丢失。
+      ⚠️ 左值必须写成 `link_stats_daily.pv`（表名限定）——
+         写 `pv` 会报 "Column 'pv' in field list is ambiguous"
+         （行别名 `new` 与目标表列名同名，必须用表名消歧）。
 
-      ⚠️ VALUES() 在 MySQL 8.0.20+ 已标记弃用（推荐用 AS new 别名语法），
-      但 MySQL 8.4 仍支持，且别名语法在「VALUES 多行 + 冲突更新」组合下
-      的行为差异需要额外验证。这里保持 VALUES()，并在 DR 中记录该迁移点。
+      ✅ **已用 `AS new` 别名语法**（2026-10-24 迁移）。
+      MySQL 8.0.20 起 `VALUES(col)` 被标记 deprecated，未来 minor 版本可能移除 ——
+      那会变成「生产启动即报错」的事故。详见下方 accumulatePvBatch 的说明
+      与 docs/TROUBLESHOOTING.md T-010。
 
       ⚠️ referer_domain 固定 'direct'：当前阶段没有采集 referer，
       未来接入 referer 维度时需要把它加入唯一键的判定与本语句的取值。
+    -->
+    <!--
+      ⚠️⚠️ 为什么用 `AS new` 别名语法，而不是 `VALUES(pv)`：
+
+      MySQL 8.0.20 起，`ON DUPLICATE KEY UPDATE` 里的 `VALUES(col)` 函数
+      **被标记为 deprecated**（MySQL 官方推荐改用行别名）：
+
+        INSERT INTO t (a, b) VALUES (1, 2) AS new
+        ON DUPLICATE KEY UPDATE b = t.b + new.b
+
+      `VALUES()` 在 MySQL 8.4 上仍能执行（已实测），但未来 minor 版本可能移除 ——
+      那会变成「生产启动即报错」的事故。提前改掉，成本几乎为零。
+
+      ⚠️ 语义完全等价：`new.pv` 引用的是**正在插入的这一行**的 pv 值。
+      多行 VALUES 时，逐行处理，每行的 `new` 指向当前行 —— 与 `VALUES(pv)` 一致。
+      这点已由 StatsRepositoryMyBatisTest 的多行断言覆盖
+      （PV 三次落库 5/3/2 -> 10；UV 落 5 -> 12 -> 8 -> 12）。
+
+      ⚠️⚠️ **左值必须用「表名.列名」限定**：
+        ON DUPLICATE KEY UPDATE pv = link_stats_daily.pv + new.pv
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+      写成 `pv = pv + new.pv` 会报：
+        Column 'pv' in field list is ambiguous
+      原因：`AS new` 的行别名与**目标表的列名同名**，
+      MySQL 无法判断左边的 `pv` 指的是表还是别名 —— 必须用表名消歧。
+      （这正是 MySQL 官方文档里 `t.b + new.b` 那个例子的写法。）
     -->
     <insert id="accumulatePvBatch">
         INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
@@ -36,12 +66,14 @@
         <foreach collection="rows" item="row" separator=",">
             (#{row.linkId}, #{row.statDate}, #{row.delta}, 0, 'direct')
         </foreach>
+        AS new
         ON DUPLICATE KEY UPDATE
-            pv = pv + VALUES(pv)
+            pv = link_stats_daily.pv + new.pv
     </insert>
 
     <!--
-      UV 合并：INSERT ... ON DUPLICATE KEY UPDATE uv_estimated = GREATEST(uv_estimated, VALUES(uv_estimated))
+      UV 合并：INSERT ... AS new ON DUPLICATE KEY UPDATE
+              uv_estimated = GREATEST(link_stats_daily.uv_estimated, new.uv_estimated)
 
       ⚠️ 为什么用 GREATEST 而不是累加：
         HLL 的 PFCOUNT 返回的是「当日至今的独立访客估算」，**不是增量**。
@@ -60,8 +92,9 @@
         <foreach collection="rows" item="row" separator=",">
             (#{row.linkId}, #{row.statDate}, 0, #{row.estimate}, 'direct')
         </foreach>
+        AS new
         ON DUPLICATE KEY UPDATE
-            uv_estimated = GREATEST(uv_estimated, VALUES(uv_estimated))
+            uv_estimated = GREATEST(link_stats_daily.uv_estimated, new.uv_estimated)
     </insert>
 
 </mapper>

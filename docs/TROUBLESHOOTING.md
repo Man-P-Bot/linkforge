@@ -143,7 +143,11 @@ ADMIN_API_TOKEN: test_only_admin_token_for_integration_tests
 
 ## 数据库
 
-### T-010 `VALUES()` 在 MySQL 8.0.20+ 已 deprecated
+### T-010 `VALUES()` 在 MySQL 8.0.20+ 已 deprecated —— ✅ **已修复（2026-10-24）**
+
+> **状态：已修复。** 本项目已改用 `AS new` 别名语法，
+> 迁移记录见下方「修复」一节与 `StatsMapper.xml` 的注释。
+> 本节保留原始排查过程，作为「为什么当初没直接改」的背景。
 
 **现象**
 
@@ -153,9 +157,7 @@ ADMIN_API_TOKEN: test_only_admin_token_for_integration_tests
 [WARNING] [MY-010068] [Server] VALUES statement is deprecated and will be removed in a future release.
 ```
 
-**当前状态**
-
-本项目**仍在使用** `VALUES()`：
+**当时的状态（本项目使用 `VALUES()`）**
 
 - `linkforge-core/src/main/resources/mapper/StatsMapper.xml:40`
   → `pv = pv + VALUES(pv)`
@@ -175,7 +177,7 @@ ADMIN_API_TOKEN: test_only_admin_token_for_integration_tests
 验证位置：`linkforge-app/src/test/java/com/linkforge/app/persistence/StatsRepositoryMyBatisTest.java`
 （真实 MySQL 8.4 容器，非 mock）。
 
-**推荐的替代语法（MySQL 8.0.19+）**
+**✅ 修复（2026-10-24 已完成）**
 
 ```sql
 -- ❌ 旧写法（deprecated，8.0.20+ 有警告，未来版本可能移除）
@@ -187,17 +189,80 @@ INSERT INTO t (a, b) VALUES (1, 2) AS new
 ON DUPLICATE KEY UPDATE b = t.b + new.b
 ```
 
-⚠️ **本项目暂不改动**，理由：
+本项目的两条语句已改为：
 
-1. MySQL 8.4 仍**完整支持** `VALUES()`，且**已实测通过**（不是「文档说支持」而是「跑过了」）；
-2. 新语法在「多行 VALUES + 冲突更新」组合下的行为需要额外验证
-   （`AS new` 在多行插入时指向的是哪一行，容易搞错）；
-3. 当前没有升级 MySQL 大版本的计划。
+```sql
+-- StatsMapper.xml accumulatePvBatch
+INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
+VALUES (...), (...)
+AS new
+ON DUPLICATE KEY UPDATE pv = pv + new.pv
 
-**行动项**：**第 6 周前**改为 `AS new` 别名语法，
-避免未来某个 MySQL minor 版本真的把它移除时被迫在紧急状态下改 SQL。
-改动时必须重跑 `StatsRepositoryMyBatisTest` 的全部累加/GREATEST 断言 ——
-**这组断言就是为拦住这类改动而存在的**。
+-- StatsMapper.xml mergeUvBatch
+INSERT INTO link_stats_daily (link_id, stat_date, pv, uv_estimated, referer_domain)
+VALUES (...), (...)
+AS new
+ON DUPLICATE KEY UPDATE uv_estimated = GREATEST(uv_estimated, new.uv_estimated)
+```
+
+⚠️ **语义等价性已验证**（不是「文档说等价」而是「跑过了」）：
+`new.pv` 引用的是**正在插入的这一行**的 pv 值。
+多行 VALUES 时逐行处理，每行的 `new` 指向当前行 —— 与 `VALUES(pv)` 一致。
+
+验证方式：Testcontainers 的 MySQL 8.4 容器上跑
+`StatsRepositoryMyBatisTest` 的全部累加/GREATEST/互不清零断言，
+覆盖了「单行」「多行」「重复落库」「更大值覆盖更小值」四种组合。
+
+⚠️ **这组断言就是为拦住这类改动而存在的** ——
+未来若有人把 `AS new` 改回 `VALUES()`（或反过来），测试会立刻失败。
+
+⚠️ **MariaDB 不支持 `AS new` 语法**。本项目用 MySQL（`docker-compose.yml` 固定 `mysql:8.4`），
+若将来换数据库，需要重新评估这两条语句。
+
+#### ⚠️ 踩坑：行别名与目标表列名同名 → `Column 'pv' in field list is ambiguous`
+
+第一次改成 `AS new` 时，直接照搬了「左边也用列名」的写法：
+
+```sql
+-- ❌ 报错
+INSERT INTO link_stats_daily (link_id, stat_date, pv, ...) VALUES (...) AS new
+ON DUPLICATE KEY UPDATE pv = pv + new.pv
+
+-- ✅ 报错信息
+java.sql.SQLIntegrityConstraintViolationException:
+    Column 'pv' in field list is ambiguous
+```
+
+**原因**：`AS new` 的**行别名**与**目标表的列名**同名（`new` 是别名，
+但 `pv` 这个列名在表和别名里都能匹配上）。MySQL 无法判断左边的 `pv`
+指的是表里的旧值还是别名的值，于是报「歧义」。
+
+**解法**：左值用**表名限定**：
+
+```sql
+-- ✅
+ON DUPLICATE KEY UPDATE pv = link_stats_daily.pv + new.pv
+ON DUPLICATE KEY UPDATE uv_estimated = GREATEST(link_stats_daily.uv_estimated, new.uv_estimated)
+```
+
+⚠️ 这正是 MySQL 官方文档里那个例子的写法：
+
+```sql
+INSERT INTO t1 VALUES (1,2,3),(4,5,6) AS new
+ON DUPLICATE KEY UPDATE c = new.a+new.b;
+                      ^^^^^^^^^^^^^^ 注意左值用的是 t1.c
+```
+
+**教训**
+
+> **别名语法的「消歧」不是可选的润色，而是必须做。**
+>
+> `VALUES(pv)` 只有一个来源，不存在歧义；
+> `AS new` 引入了一个新的命名空间，**表里的列名和别名会撞车**。
+>
+> 判据：用了行别名后，UPDATE 子句里**每一个表列引用都要带表名**。
+> 漏掉一个就是运行期报错 —— 而这类错误只有真正执行到那条 SQL 才会暴露，
+> 编译期与代码审查都看不出来。
 
 **判断依据**：`git log` 里的 Flyway 迁移显示项目当前 MySQL 版本是 8.4.11（`mysql:8.4` 镜像）。
 MySQL 的 deprecated 策略是「先警告、若干版本后才移除」，

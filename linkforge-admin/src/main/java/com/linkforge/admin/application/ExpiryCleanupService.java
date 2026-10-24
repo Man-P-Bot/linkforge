@@ -1,6 +1,7 @@
 package com.linkforge.admin.application;
 
 import com.linkforge.core.repository.LinkRepository;
+import com.linkforge.stats.infrastructure.StatsKeys;
 import com.linkforge.core.repository.LinkRepository.ExpiredLink;
 import com.linkforge.stats.infrastructure.RedisDistributedLock;
 import io.micrometer.core.instrument.Counter;
@@ -9,11 +10,13 @@ import io.micrometer.core.instrument.Timer;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -109,6 +112,7 @@ public class ExpiryCleanupService {
     private final LinkRepository linkRepository;
     private final LinkExpiryService expiryService;
     private final RedisDistributedLock lock;
+    private final StringRedisTemplate redis;
     private final Clock clock;
 
     private final int batchSize;
@@ -128,6 +132,7 @@ public class ExpiryCleanupService {
     public ExpiryCleanupService(LinkRepository linkRepository,
                                 LinkExpiryService expiryService,
                                 RedisDistributedLock lock,
+                                StringRedisTemplate redis,
                                 Clock clock,
                                 MeterRegistry meterRegistry,
                                 @Value("${linkforge.cleanup.batch-size:1000}") int batchSize,
@@ -136,6 +141,7 @@ public class ExpiryCleanupService {
         this.linkRepository = linkRepository;
         this.expiryService = expiryService;
         this.lock = lock;
+        this.redis = redis;
         this.clock = clock;
         this.batchSize = batchSize;
         this.maxBatchesPerRun = maxBatchesPerRun;
@@ -204,12 +210,26 @@ public class ExpiryCleanupService {
 
     /** 持锁后的真正工作。 */
     private void doCleanup() {
+        // ⚠️ 必须用注入的 Clock（ARCHITECTURE §13：时间获取必须可注入）。
+        //    直接取系统当前时间会让「今天是哪天」无法在测试里固定。
+        LocalDate today = LocalDate.now(clock);
         Instant now = clock.instant();
         int totalScanned = 0;
         int totalCleared = 0;
 
+        // ⚠️⚠️ 游标：从上次扫到的 id 之后继续。
+        //
+        //    过期清理**不修改 status**（保住 410 语义，DR-060 决策 2），
+        //    所以扫描条件 `status = 0 AND expire_at < ?` 对同一批行**永远成立**。
+        //    没有游标时，每轮 LIMIT 出的都是**同一批**（id 最小的那些），
+        //    后面几万条过期短码的缓存**永远清不到**。
+        //    游标存 Redis（不是内存）：任务在多实例下运行且进程可能重启，
+        //    存内存会让「重启后从头开始」——那意味着 id 最小的那批被反复清理，
+        //    而中间那段永远扫不到。
+        long afterId = readCursor(today);
+
         for (int batch = 0; batch < maxBatchesPerRun; batch++) {
-            List<ExpiredLink> expired = linkRepository.scanExpired(batchSize, now);
+            List<ExpiredLink> expired = linkRepository.scanExpired(batchSize, now, afterId);
             if (expired.isEmpty()) {
                 break;
             }
@@ -220,16 +240,60 @@ public class ExpiryCleanupService {
             totalCleared += cleared;
             clearedCounter.increment(cleared);
 
+            // ⚠️ 游标推进到本批最大 id。必须在清缓存**之后**推进 ——
+            //    若先推进再清缓存，中途崩溃会跳过这一批（那批的缓存永远清不掉）。
+            afterId = expired.get(expired.size() - 1).id();
+            writeCursor(today, afterId);
+
             // ⚠️ 批次未清空说明库里还有更多过期的（batchSize 打满）。
-            //    剩下的下一轮继续——这不是丢失，扫描是幂等的。
+            //    剩下的下一轮继续——游标保证下一轮从**这批之后**开始，
+            //    不会重复处理这批。
             if (expired.size() < batchSize) {
                 break;
             }
         }
 
         if (totalScanned > 0) {
-            log.info("过期清理完成：扫描 {} 条，清缓存 {} 条（数据库状态未改动）",
-                    totalScanned, totalCleared);
+            log.info("过期清理完成：扫描 {} 条，清缓存 {} 条（数据库状态未改动，游标推进到 id={}）",
+                    totalScanned, totalCleared, afterId);
+        }
+    }
+
+    /**
+     * 读扫描游标。
+     *
+     * @return 上次扫到的最大 id；无游标时返回 0（从头开始）
+     */
+    private long readCursor(LocalDate date) {
+        try {
+            String raw = redis.opsForValue().get(StatsKeys.cleanupCursor(date));
+            if (raw == null || raw.isBlank()) {
+                return 0L;
+            }
+            return Long.parseLong(raw);
+        } catch (RuntimeException e) {
+            // ⚠️ 读游标失败**不能中断清理**：从头扫一遍虽然浪费，
+            //    但总比不清理强。而且清缓存是幂等的，重复清无害。
+            log.warn("读取过期清理游标失败，本轮从头开始扫: {}", e.getMessage());
+            return 0L;
+        }
+    }
+
+    /**
+     * 写扫描游标。
+     *
+     * <p>⚠️ 用 {@code SET key value EX ttl} 一条命令 —— 拆成 SET + EXPIRE 时，
+     * 两条之间崩溃会留下**永不过期**的游标（下次扫描会从那里继续，
+     * 而中间新增的短码会被跳过）。
+     */
+    private void writeCursor(LocalDate date, long afterId) {
+        try {
+            redis.opsForValue().set(StatsKeys.cleanupCursor(date),
+                    Long.toString(afterId), StatsKeys.KEY_TTL);
+        } catch (RuntimeException e) {
+            // ⚠️ 写游标失败：下一轮会从旧游标开始，重复清一批（幂等，无害）
+            log.warn("写入过期清理游标失败（下一轮会重复清理一批，幂等无害）: {}",
+                    e.getMessage());
         }
     }
 

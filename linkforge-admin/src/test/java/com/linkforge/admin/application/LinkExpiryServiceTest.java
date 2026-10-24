@@ -76,12 +76,14 @@ class LinkExpiryServiceTest {
     }
 
     @Test
-    @DisplayName("🗑️b 清缓存：每个短码一次 evict")
-    void evictsCacheForEachLink() {
+    @DisplayName("🗑️b 清缓存：**一次批量 evictAll**（不是逐条 evict）")
+    void evictsCacheInOneBatch() {
         service.clearCaches(List.of(expired(1L, "c1"), expired(2L, "c2")));
 
-        verify(cache).evict("c1");
-        verify(cache).evict("c2");
+        // ⚠️ 批量失效：逐条 evict 是 N 次 Redis 往返（实测 5000 条 3174 ms），
+        //    批量是 1 次（60 ms，52.9 倍差距）。
+        verify(cache).evictAll(List.of("c1", "c2"));
+        verify(cache, never()).evict(any());
     }
 
     @Test
@@ -95,7 +97,7 @@ class LinkExpiryServiceTest {
     @DisplayName("🗑️d 空集合直接返回 0")
     void emptyBatchReturnsZero() {
         assertThat(service.clearCaches(List.of())).isZero();
-        verify(cache, never()).evict(any());
+        verify(cache, never()).evictAll(any());
     }
 
     // ============================================ 缓存清理失败
@@ -103,7 +105,7 @@ class LinkExpiryServiceTest {
     @Test
     @DisplayName("🗑️🗑️⭐⭐ 清缓存失败**不抛异常**（失败只是多留到 TTL 到期）")
     void cacheEvictionFailureDoesNotThrow() {
-        doThrow(new RuntimeException("Redis 挂了")).when(cache).evict(any());
+        doThrow(new RuntimeException("Redis 挂了")).when(cache).evictAll(any());
 
         // ⚠️ 不抛异常就是通过
         assertThat(service.clearCaches(List.of(expired(1L, "c1")))).isZero();
@@ -114,15 +116,14 @@ class LinkExpiryServiceTest {
     }
 
     @Test
-    @DisplayName("🗑️🗑️b 一个短码清缓存失败**不影响**其它短码")
-    void oneEvictionFailureDoesNotBlockOthers() {
-        doThrow(new RuntimeException("Redis 挂了")).when(cache).evict("c1");
+    @DisplayName("🗑️🗑️b 批量清缓存失败时返回 0 并计指标")
+    void batchEvictionFailureIsCounted() {
+        doThrow(new RuntimeException("Redis 挂了")).when(cache).evictAll(any());
 
         assertThat(service.clearCaches(
-                List.of(expired(1L, "c1"), expired(2L, "c2")))).isEqualTo(1);
+                List.of(expired(1L, "c1"), expired(2L, "c2")))).isZero();
 
-        verify(cache).evict("c2");
-        assertThat(counter("shortlink.cleanup.cache.evict.failed")).isEqualTo(1.0);
+        assertThat(counter("shortlink.cleanup.cache.evict.failed")).isEqualTo(2.0);
     }
 
     @Test
