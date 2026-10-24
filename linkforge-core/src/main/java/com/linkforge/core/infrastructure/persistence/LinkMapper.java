@@ -81,6 +81,57 @@ public interface LinkMapper {
     List<IdShortCode> selectIdsByShortCodes(@Param("shortCodes") List<String> shortCodes);
 
     /**
+     * 扫描「已过期且未删除」的短链（阶段 4 过期清理）。
+     *
+     * <p>⚠️ <b>走 {@code idx_expire_status (status, expire_at)}</b>（V5 迁移）：
+     * {@code status} 是等值前缀、{@code expire_at} 承担范围扫描。
+     * 不加这个索引时 MySQL 只能回表过滤全部 {@code status=0} 的行 ——
+     * 实测 20 万行下 rows 从 2,000 变成 97,181（docs/TROUBLESHOOTING.md T-011）。
+     *
+     * <p>⚠️ <b>只 select 三列</b>：{@code id, short_code, expire_at}。
+     * 不读 {@code target_url}（2048 字节）—— 清理任务不需要它。
+     */
+    List<ExpiredLink> selectExpired(@Param("now") java.time.LocalDateTime now,
+                                     @Param("limit") int limit);
+
+    /**
+     * 「已过期且未删除」的短链行。
+     *
+     * <p>⚠️ 必须提供 getter 而不只是 record 访问器：
+     * MyBatis 的默认对象映射走 <b>setter</b>，record 的访问器不被识别，
+     * 结果是静默返回 {@code null} 而不是报错（{@link IdShortCode} 上已踩过一次）。
+     */
+    class ExpiredLink {
+        private long id;
+        private String shortCode;
+        private java.time.LocalDateTime expireAt;
+
+        public long getId() {
+            return id;
+        }
+
+        public void setId(long id) {
+            this.id = id;
+        }
+
+        public String getShortCode() {
+            return shortCode;
+        }
+
+        public void setShortCode(String shortCode) {
+            this.shortCode = shortCode;
+        }
+
+        public java.time.LocalDateTime getExpireAt() {
+            return expireAt;
+        }
+
+        public void setExpireAt(java.time.LocalDateTime expireAt) {
+            this.expireAt = expireAt;
+        }
+    }
+
+    /**
      * {@code (id, shortCode)} 行。
      *
      * <p>⚠️ 必须提供两个 getter 而不只是 record 访问器：

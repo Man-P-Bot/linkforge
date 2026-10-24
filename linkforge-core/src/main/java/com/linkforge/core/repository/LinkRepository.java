@@ -83,6 +83,46 @@ public interface LinkRepository {
     Map<String, Long> resolveIdsByShortCodes(Collection<String> shortCodes);
 
     /**
+     * 扫描一批「已过期且未删除」的短链（阶段 4 过期清理）。
+     *
+     * <h2>⚠️ 为什么是「扫描 + 逐条更新」而不是「一条 UPDATE ... LIMIT」</h2>
+     * 清理流程需要**两件事**：改库（软删除）+ 清缓存（删 {@code shortlink:code:{code}}）。
+     * 而缓存清理需要短码 —— 一条 {@code UPDATE ... LIMIT 500} 只能告诉你
+     * 「改了 500 行」，**不告诉你是哪 500 行**（除非再查一次）。
+     * <p>
+     * 所以拆成两步：先查出 {@code (id, shortCode)}，再逐条软删除 + 清缓存。
+     * 代价是多一次查询，收益是「改了哪些行」是明确已知的。
+     *
+     * <h2>⚠️ 索引：{@code idx_expire_status (status, expire_at)}（V5 迁移）</h2>
+     * 当前的 {@code idx_status_code (status, short_code)} <b>不适用</b>：
+     * {@code status} 是等值前缀但 {@code expire_at} 不在索引里，
+     * MySQL 只能先取出所有 {@code status=0} 的行再回表过滤 —— 那是伪索引。
+     * 实测数据见 docs/TROUBLESHOOTING.md T-011（20 万行下 rows 从 97,181 降到 2,000）。
+     *
+     * <h2>⚠️ 为什么用 {@code expire_at < ?} 而不是 {@code expire_at <= ?}</h2>
+     * 与 {@link com.linkforge.core.domain.LinkState#isExpired} 的边界口径一致：
+     * 「{@code expire_at == now} 即为已过期」。用 {@code <} 会让「恰好在当前秒到期」
+     * 的短链晚一轮才被清理 —— 清理延迟本身无害，但<b>口径漂移</b>有害：
+     * 同一个边界在两处用不同的运算符，会让人怀疑「到底哪个才是对的」。
+     *
+     * @param now      判定基准时刻（UTC），由调用方注入保证可测试
+     * @param limit    单批上限。⚠️ <b>必须有上限</b>：无上限会在短链大量到期时
+     *                 让一轮任务持有分布式锁很久，挤占其它定时任务
+     * @return 命中的行；按 {@code id} 升序（让清理顺序稳定，便于测试断言）
+     */
+    List<ExpiredLink> scanExpired(int limit, java.time.Instant now);
+
+    /**
+     * 「已过期且未删除」的短链行。
+     *
+     * @param id        内部主键
+     * @param shortCode 短码（清缓存时需要）
+     * @param expireAt  过期时间（UTC）
+     */
+    record ExpiredLink(long id, String shortCode, java.time.LocalDateTime expireAt) {
+    }
+
+    /**
      * 扫描全部有效短码，供布隆过滤器重建使用（docs/ARCHITECTURE.md §7.1）。
      *
      * <p>只返回 {@code status = ACTIVE} 且**只取必要列**（短码），

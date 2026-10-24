@@ -129,6 +129,14 @@ class LinkCreationServiceTest {
             return java.util.Map.of();
         }
 
+        @Override
+        public List<com.linkforge.core.repository.LinkRepository.ExpiredLink> scanExpired(
+                int limit, java.time.Instant now) {
+            // 本测试只覆盖建链流程，不涉及过期清理
+            return List.of();
+        }
+
+
         int insertCalls() {
             return insertCalls;
         }

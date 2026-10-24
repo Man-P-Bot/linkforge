@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -118,6 +119,7 @@ public class AsyncStatsQueue implements SmartLifecycle {
      * 它只重复赋值、从不被读，是纯冗余，已删除。
      */
     private final ArrayBlockingQueue<StatsEvent> queue;
+    private final Clock clock;
 
     private final Counter offeredCounter;
     private final Counter droppedFullCounter;
@@ -237,9 +239,11 @@ public class AsyncStatsQueue implements SmartLifecycle {
      */
     public AsyncStatsQueue(MeterRegistry meterRegistry,
                            StringRedisTemplate redis,
+                           Clock clock,
                            @Value("${linkforge.stats.queue-capacity:"
                                    + DEFAULT_CAPACITY + "}") int capacity) {
         this.redis = redis;
+        this.clock = clock;
         this.pvScript = luaScript("lua/pv_incr_by.lua");
         this.uvScript = luaScript("lua/uv_pfadd.lua");
         if (capacity <= 0) {
@@ -339,7 +343,10 @@ public class AsyncStatsQueue implements SmartLifecycle {
                                       int capacity,
                                       DefaultRedisScript<Long> pvScript,
                                       DefaultRedisScript<Long> uvScript) {
-        AsyncStatsQueue q = new AsyncStatsQueue(meterRegistry, redis, capacity);
+        // ⚠️ 静态工厂方法访问不到实例字段 clock，这里直接用系统时钟。
+        //    （本方法只用于测试替换 Lua 脚本，不涉及按天分桶的逻辑。）
+        AsyncStatsQueue q = new AsyncStatsQueue(meterRegistry, redis,
+                java.time.Clock.systemDefaultZone(), capacity);
         if (pvScript != null) {
             q.pvScript = pvScript;
         }
@@ -677,7 +684,11 @@ public class AsyncStatsQueue implements SmartLifecycle {
     private void pushToDlq(List<StatsEvent> batch, String target, Exception cause,
                            int eventCount) {
         try {
-            String dlqKey = StatsKeys.dlq(LocalDate.now());
+            // ⚠️ 用注入的 Clock（ARCHITECTURE §13：时间获取必须可注入）。
+            //    这是「死信按哪一天分桶」的口径——必须是「处理当天」，
+            //    而不是事件发生日（否则 3 天前失败的数据会进 3 天前的队列，
+            //    而 replay 只回看 lookback-days 天，它就永远不会被处理）。
+            String dlqKey = StatsKeys.dlq(LocalDate.now(clock));
             List<String> payload = new ArrayList<>(batch.size());
             for (StatsEvent e : batch) {
                 payload.add(target + "|" + e.code() + "|" + e.visitor() + "|" + e.ts());
@@ -697,14 +708,4 @@ public class AsyncStatsQueue implements SmartLifecycle {
         }
     }
 
-    /**
-     * 统计 key 的日期后缀。
-     *
-     * @deprecated 仅供 DLQ 分桶用。PV / UV / dirty 的日期一律来自
-     *     {@link StatsEvent#ts()} 推导（F2），不取服务器当前时间。
-     */
-    @Deprecated
-    private String today() {
-        return LocalDate.now().format(DATE_FMT);
-    }
 }

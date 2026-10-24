@@ -56,6 +56,18 @@ import org.springframework.data.redis.core.ValueOperations;
 @MockitoSettings(strictness = Strictness.LENIENT)
 class StatsFlushServiceTest {
 
+    /**
+     * ⚠️ 固定的时间源：让「今天是哪天」在测试里确定。
+     * 架构要求时间必须可注入（docs/ARCHITECTURE.md §13）——
+     * 直接取系统当前时间会让跨零点的批次归属日无法断言。
+     */
+    private static final java.time.Clock FIXED_CLOCK =
+            java.time.Clock.fixed(java.time.Instant.parse("2026-03-20T10:00:00Z"),
+                    java.time.ZoneOffset.UTC);
+
+    /** FIXED_CLOCK 对应的自然日。断言里的日期必须用它，不能用真实的今天。 */
+    private static final LocalDate FIXED_DATE = LocalDate.of(2026, 3, 20);
+
     private SimpleMeterRegistry registry;
 
     @Mock
@@ -79,7 +91,7 @@ class StatsFlushServiceTest {
 
     /** 退避设为 0，让重试路径的测试瞬间完成。 */
     private StatsFlushService newService() {
-        return new StatsFlushService(registry, redis, lock, links, stats, queue,
+        return new StatsFlushService(registry, redis, lock, links, stats, queue, FIXED_CLOCK,
                 500, 20, 2, 60, "0,0,0");
     }
 
@@ -305,12 +317,12 @@ class StatsFlushServiceTest {
         verify(stats).accumulatePv(pvRows.capture());
         assertThat(pvRows.getValue()).hasSize(1);
         assertThat(pvRows.getValue().iterator().next())
-                .isEqualTo(new PvRow(7L, LocalDate.now(), 3L));
+                .isEqualTo(new PvRow(7L, FIXED_DATE, 3L));
 
         var uvRows = ArgumentCaptor.forClass(java.util.Collection.class);
         verify(stats).mergeUv(uvRows.capture());
         assertThat(uvRows.getValue().iterator().next())
-                .isEqualTo(new UvRow(7L, LocalDate.now(), 11L));
+                .isEqualTo(new UvRow(7L, FIXED_DATE, 11L));
     }
 
     @Test
@@ -379,7 +391,7 @@ class StatsFlushServiceTest {
                 .as("payload 必须带 stage=mysql（Q5）与 channel=pv，否则重放方向会错")
                 .hasSize(1);
         assertThat((String) payloads.getValue().get(0))
-                .isEqualTo("v1|mysql|pv|7|" + LocalDate.now() + "|3");
+                .isEqualTo("v1|mysql|pv|7|" + FIXED_DATE + "|3");
         assertThat(counter("shortlink.stats.flush.rows", "result", "failed")).isEqualTo(1.0);
     }
 
@@ -396,7 +408,7 @@ class StatsFlushServiceTest {
         var payloads = ArgumentCaptor.forClass(List.class);
         verify(listOps).rightPushAll(eq("shortlink:stats:dl:" + today()), payloads.capture());
         assertThat((String) payloads.getValue().get(0))
-                .isEqualTo("v1|mysql|uv|7|" + LocalDate.now() + "|9");
+                .isEqualTo("v1|mysql|uv|7|" + FIXED_DATE + "|9");
     }
 
     @Test
@@ -421,7 +433,7 @@ class StatsFlushServiceTest {
     @DisplayName("🎯⭐⭐⭐ DLQ 里的 target=pv 只调 accumulatePv，**绝不调 mergeUv**")
     void dlqReplayTargetsPvOnly() {
         when(listOps.range(eq("shortlink:stats:dl:" + today()), eq(0L), eq(499L)))
-                .thenReturn(List.of("v1|mysql|pv|7|" + LocalDate.now() + "|3"));
+                .thenReturn(List.of("v1|mysql|pv|7|" + FIXED_DATE + "|3"));
 
         newService().flush();
 
@@ -429,14 +441,14 @@ class StatsFlushServiceTest {
         // ⚠️ PV 死信重放绝不能碰 UV：合并会让已成功的 UV 用错语义
         verify(stats, never()).mergeUv(any());
         verify(listOps).remove(eq("shortlink:stats:dl:" + today()), eq(1L),
-                eq("v1|mysql|pv|7|" + LocalDate.now() + "|3"));
+                eq("v1|mysql|pv|7|" + FIXED_DATE + "|3"));
     }
 
     @Test
     @DisplayName("🎯b DLQ 里的 target=uv 只调 mergeUv，**绝不调 accumulatePv**")
     void dlqReplayTargetsUvOnly() {
         when(listOps.range(eq("shortlink:stats:dl:" + today()), eq(0L), eq(499L)))
-                .thenReturn(List.of("v1|mysql|uv|7|" + LocalDate.now() + "|9"));
+                .thenReturn(List.of("v1|mysql|uv|7|" + FIXED_DATE + "|9"));
 
         newService().flush();
 
@@ -448,7 +460,7 @@ class StatsFlushServiceTest {
     @Test
     @DisplayName("🎯c DLQ 重放成功才删条目；失败保留在队列等下一轮（**不是一次性丢弃队列**）")
     void dlqEntryRemovedOnlyOnSuccess() {
-        String payload = "v1|mysql|pv|7|" + LocalDate.now() + "|3";
+        String payload = "v1|mysql|pv|7|" + FIXED_DATE + "|3";
         when(listOps.range(eq("shortlink:stats:dl:" + today()), eq(0L), eq(499L)))
                 .thenReturn(List.of(payload));
         doThrow(new RuntimeException("还是失败")).when(stats).accumulatePv(any());
@@ -464,8 +476,8 @@ class StatsFlushServiceTest {
     void dlqMixedTargetsStaySeparate() {
         when(listOps.range(eq("shortlink:stats:dl:" + today()), eq(0L), eq(499L)))
                 .thenReturn(List.of(
-                        "v1|mysql|pv|7|" + LocalDate.now() + "|3",
-                        "v1|mysql|uv|8|" + LocalDate.now() + "|9"));
+                        "v1|mysql|pv|7|" + FIXED_DATE + "|3",
+                        "v1|mysql|uv|8|" + FIXED_DATE + "|9"));
 
         newService().flush();
 
@@ -544,7 +556,7 @@ class StatsFlushServiceTest {
         newService().flush();
 
         verify(setOps).pop(eq("shortlink:stats:dirty:" + today()), eq(500L));
-        verify(setOps).pop(eq("shortlink:stats:dirty:" + fmt(LocalDate.now().minusDays(1))),
+        verify(setOps).pop(eq("shortlink:stats:dirty:" + fmt(FIXED_DATE.minusDays(1))),
                 eq(500L));
     }
 
@@ -565,13 +577,13 @@ class StatsFlushServiceTest {
     @DisplayName("⚙️ 退避表必须恰好 3 段（启动期暴露，不等运行期才发现）")
     void rejectsWrongBackoffLength() {
         org.assertj.core.api.Assertions.assertThatThrownBy(() ->
-                new StatsFlushService(registry, redis, lock, links, stats, queue,
+                new StatsFlushService(registry, redis, lock, links, stats, queue, FIXED_CLOCK,
                         500, 20, 2, 60, "1000,4000"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("3 段");
 
         org.assertj.core.api.Assertions.assertThatThrownBy(() ->
-                new StatsFlushService(registry, redis, lock, links, stats, queue,
+                new StatsFlushService(registry, redis, lock, links, stats, queue, FIXED_CLOCK,
                         500, 20, 2, 60, "1000,4000,16000,64000"))
                 .isInstanceOf(IllegalArgumentException.class);
     }
@@ -579,7 +591,7 @@ class StatsFlushServiceTest {
     @Test
     @DisplayName("⚙️b 退避为 0 时立即重试（测试用，不 sleep）")
     void zeroBackoffDoesNotSleep() {
-        StatsFlushService svc = new StatsFlushService(registry, redis, lock, links, stats, queue,
+        StatsFlushService svc = new StatsFlushService(registry, redis, lock, links, stats, queue, FIXED_CLOCK,
                 500, 20, 2, 60, "0,0,0");
 
         assertThat(svc.retryBackoffMillis()).containsExactly(0L, 0L, 0L);
@@ -588,7 +600,7 @@ class StatsFlushServiceTest {
     @Test
     @DisplayName("⚙️c 默认退避是 1s / 4s / 16s（Q5 硬性要求）")
     void defaultBackoffIsAsSpecified() {
-        StatsFlushService svc = new StatsFlushService(registry, redis, lock, links, stats, queue,
+        StatsFlushService svc = new StatsFlushService(registry, redis, lock, links, stats, queue, FIXED_CLOCK,
                 500, 20, 2, 60, "1000,4000,16000");
 
         assertThat(svc.retryBackoffMillis()).containsExactly(1000L, 4000L, 16000L);
@@ -599,6 +611,6 @@ class StatsFlushServiceTest {
     }
 
     private static String today() {
-        return fmt(LocalDate.now());
+        return fmt(FIXED_DATE);
     }
 }

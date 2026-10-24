@@ -64,6 +64,32 @@
       <artifactId>archunit-junit5</artifactId>
       <scope>test</scope>
     </dependency>
+
+    <!--
+      Testcontainers MySQL：让仓储层集成测试**不依赖宿主机 MySQL**。
+
+      ⚠️ 为什么要引这个（阶段 4 前置收口）：
+        原来的 StatsRepositoryMyBatisTest 依赖宿主机上手工建的 linkforge_test 库
+        + TEST_MYSQL_PASSWORD 环境变量。三个问题：
+          ① 干净环境（CI / 新克隆）跑不了 —— 库不存在、凭据没有；
+          ② 每次跑都连同一个库 —— 并行构建会互相污染（测试类都有 @Transactional
+             回滚，但 DDL 迁移不是事务）；
+          ③ 「测试环境与生产环境是否一致」不可控 —— 宿主机上的 MySQL 是什么版本？
+        Testcontainers 让这些全部消失：每个测试类起一个**一次性** MySQL 8.4 容器，
+        版本与生产镜像严格一致，用完即弃。
+
+      ⚠️ scope=test：绝不进生产依赖树。
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>mysql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>

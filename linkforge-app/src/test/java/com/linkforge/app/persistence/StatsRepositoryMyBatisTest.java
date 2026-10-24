@@ -40,16 +40,17 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <h2>怎么跑</h2>
  * <pre>
- * RUN_MYBATIS_IT=true MYSQL_PASSWORD=xxx .\mvnw.cmd clean install
+ * # 无需任何环境变量：Testcontainers 自动起一个 MySQL 8.4 容器
+ * RUN_MYBATIS_IT=true ./mvnw.cmd clean install
  * </pre>
- * 前置条件同 {@link LinkRepositoryMyBatisTest}（独立库 {@code linkforge_test}）。
+ * 前置条件：<b>本机有 Docker</b>（唯一要求）。
+ * 容器镜像与生产严格同版本（{@code mysql:8.4}），跑完即弃。
  */
 @SpringBootTest
 @ActiveProfiles("test")
 @Transactional
-@EnabledIfEnvironmentVariable(named = "RUN_MYBATIS_IT", matches = "true")
 @DisplayName("统计落库真实 MyBatis 集成测试（阶段 3：UPSERT 累加 + GREATEST 覆盖）")
-class StatsRepositoryMyBatisTest {
+class StatsRepositoryMyBatisTest extends MySqlContainerSupport {
 
     private static final String CODE_A = "sta0001";
     private static final String CODE_B = "sta0002";
@@ -82,17 +83,29 @@ class StatsRepositoryMyBatisTest {
         linkIdB = linkRepository.findByShortCode(CODE_B).orElseThrow().id();
     }
 
+    /**
+     * 读 {@code direct} 来源的 PV。
+     *
+     * <p>⚠️ <b>必须带 {@code referer_domain = 'direct'}</b>：
+     * 唯一键是 {@code (link_id, stat_date, referer_domain)}，
+     * 所以同一个 link_id + stat_date 下可能有**多行**（不同来源）。
+     * 不带这个条件时 {@code queryForObject} 会抛
+     * {@code IncorrectResultSizeDataAccessException}（expected 1, actual 2）——
+     * 那不是「数据错了」，而是「查询写得不够精确」。
+     */
     private long pvOf(long linkId) {
         Long v = jdbcTemplate.queryForObject(
-                "SELECT pv FROM link_stats_daily WHERE link_id = ? AND stat_date = ?",
-                Long.class, linkId, DAY);
+                "SELECT pv FROM link_stats_daily WHERE link_id = ? AND stat_date = ? "
+                        + "AND referer_domain = ?",
+                Long.class, linkId, DAY, REFERER);
         return v == null ? -1 : v;
     }
 
     private long uvOf(long linkId) {
         Long v = jdbcTemplate.queryForObject(
-                "SELECT uv_estimated FROM link_stats_daily WHERE link_id = ? AND stat_date = ?",
-                Long.class, linkId, DAY);
+                "SELECT uv_estimated FROM link_stats_daily WHERE link_id = ? AND stat_date = ? "
+                        + "AND referer_domain = ?",
+                Long.class, linkId, DAY, REFERER);
         return v == null ? -1 : v;
     }
 
@@ -154,12 +167,27 @@ class StatsRepositoryMyBatisTest {
 
         statsRepository.accumulatePv(List.of(new PvRow(linkIdA, DAY, 5)));
 
-        assertThat(pvOf(linkIdA))
+        // ⚠️ 查询必须带上 referer_domain：这个 link_id + stat_date 下有**两行**
+        //   （'direct' 与 'google.com'），只按 link_id + date 查会命中两行。
+        //   这正是「referer 参与唯一键」的证据——也是这条断言要防的回归：
+        //   若哪天有人把 referer 从唯一键里去掉，这里就会从 2 行变成 1 行。
+        Long directPv = jdbcTemplate.queryForObject(
+                "SELECT pv FROM link_stats_daily WHERE link_id = ? AND stat_date = ? "
+                        + "AND referer_domain = 'direct'", Long.class, linkIdA, DAY);
+        assertThat(directPv)
                 .as("uk_link_date_referer 含 referer_domain，'direct' 行不受 'google.com' 行影响")
                 .isEqualTo(5L);
+
         Long google = jdbcTemplate.queryForObject(
                 "SELECT pv FROM link_stats_daily WHERE referer_domain = 'google.com'", Long.class);
         assertThat(google).isEqualTo(4L);
+
+        Long rowCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM link_stats_daily WHERE link_id = ? AND stat_date = ?",
+                Long.class, linkIdA, DAY);
+        assertThat(rowCount)
+                .as("⚠️ 同一 link_id + stat_date 下必须有 2 行（两个 referer）")
+                .isEqualTo(2L);
     }
 
     // ---------------------------------------------------------------------

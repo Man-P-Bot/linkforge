@@ -55,7 +55,7 @@ class AsyncStatsQueueTest {
                 .when(redis.execute(any(org.springframework.data.redis.core.script.RedisScript.class),
                         anyList(), any(Object[].class)))
                 .thenReturn(1L);
-        queue = new AsyncStatsQueue(registry, redis, 50);
+        queue = new AsyncStatsQueue(registry, redis, java.time.Clock.systemDefaultZone(), 50);
         // ⚠️ 显式 start：SmartLifecycle 改造后线程不在构造器里启动。
         //    需要观察「未消费」状态的测试（N1、N3、N4）必须先 stop()。
         queue.start();
@@ -189,7 +189,7 @@ class AsyncStatsQueueTest {
     void capacityIsHonored() {
         assertThat(queue.capacity()).isEqualTo(50);
 
-        AsyncStatsQueue big = new AsyncStatsQueue(registry, redis, 12345);
+        AsyncStatsQueue big = new AsyncStatsQueue(registry, redis, java.time.Clock.systemDefaultZone(), 12345);
         assertThat(big.capacity()).isEqualTo(12345);
         // ⚠️ 未 start()，无线程需要停止（构造器不再启线程）
     }

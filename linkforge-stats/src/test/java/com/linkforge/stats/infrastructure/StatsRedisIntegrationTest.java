@@ -69,7 +69,7 @@ class StatsRedisIntegrationTest {
         redis = new StringRedisTemplate(factory);
         redis.afterPropertiesSet();
         registry = new SimpleMeterRegistry();
-        queue = new AsyncStatsQueue(registry, redis, 1000);
+        queue = new AsyncStatsQueue(registry, redis, java.time.Clock.systemDefaultZone(), 1000);
     }
 
     @AfterEach

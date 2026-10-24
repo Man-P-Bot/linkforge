@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linkforge.app.persistence.MySqlContainerSupport;
 import com.linkforge.core.infrastructure.cache.CacheKeys;
 import java.util.ArrayList;
 import java.util.List;
@@ -50,6 +51,15 @@ import org.springframework.test.context.ActiveProfiles;
  * 状态码 + {@code Location} 头，不是内部方法返回值。
  * 内部方法的「通过」不能证明链路通——本次事故里所有内部单测都是绿的。
  *
+ * <h2>数据库：一次性 MySQL 8.4 容器</h2>
+ * 本类继承 {@link MySqlContainerSupport}，用 <b>Testcontainers 的一次性容器</b>而不是
+ * 宿主机上的 MySQL。理由：宿主机方案需要 {@code TEST_MYSQL_PASSWORD} 环境变量，
+ * 干净环境（CI / 新克隆）跑不了——而「静默跳过」在 CI 上和「通过」长得一模一样。
+ * <p>
+ * ⚠️ Redis 仍用宿主机（{@code application-test.yml} 指向 {@code localhost:6379}）：
+ * 本类验证的是「真实 Redis + 真实 HTTP」的跳转链路，Redis 容器化反而会
+ * 让「连的是不是生产同款 Redis」变得不明确。
+ *
  * <h2>数据隔离</h2>
  * 每个 {@code @BeforeEach} 造自己的短码（带唯一前缀），
  * {@code @AfterEach} 按前缀清理。<b>刻意不用 TRUNCATE</b>——
@@ -58,7 +68,7 @@ import org.springframework.test.context.ActiveProfiles;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 @DisplayName("跳转全链路（真实 Redis + 真实 HTTP，DR-054 层 3）")
-class RedirectEndToEndTest {
+class RedirectEndToEndTest extends MySqlContainerSupport {
 
     /** 本类专用短码前缀，与其它测试不冲突。 */
     private static final String PREFIX = "e2e";
@@ -101,6 +111,20 @@ class RedirectEndToEndTest {
         }
     }
 
+    /**
+     * 后台鉴权 token。
+     *
+     * <p>⚠️ **必须用 Spring 注入，不能用 {@code System.getenv}**：
+     * {@code System.getenv} 只认进程的环境变量，绕过了 Spring 的属性源 ——
+     * 于是 {@code application-test.yml} 里配的固定 token 完全不生效，
+     * 干净环境（CI / 新克隆）下这 8 个用例全部失败。
+     *
+     * <p>注入后 test profile 的 {@code ADMIN_API_TOKEN} 与生产读的是<b>同一个</b>配置键，
+     * 只是来源不同（test profile 用固定值，生产用环境变量）。
+     */
+    @org.springframework.beans.factory.annotation.Value("${ADMIN_API_TOKEN:}")
+    private String adminToken;
+
     @Autowired
     private StringRedisTemplate redis;
 
@@ -114,7 +138,6 @@ class RedirectEndToEndTest {
     private io.micrometer.core.instrument.MeterRegistry meterRegistry;
 
     private final List<String> created = new ArrayList<>();
-    private String adminToken;
 
     /**
      * ⚠️ 客户端在 {@code @BeforeEach} 里建而**不是** {@code @PostConstruct}：
@@ -142,9 +165,9 @@ class RedirectEndToEndTest {
         });
         this.rest = t;
 
-        adminToken = System.getenv("ADMIN_API_TOKEN");
         assertThat(adminToken)
-                .as("后台删除接口需要 ADMIN_API_TOKEN；未设置时本类的场景 4 无法运行")
+                .as("后台删除接口需要 ADMIN_API_TOKEN；未设置时本类的场景 4 无法运行。"
+                        + "test profile 已在 application-test.yml 里配了固定值")
                 .isNotBlank();
     }
 

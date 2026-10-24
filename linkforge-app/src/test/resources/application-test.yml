@@ -63,6 +63,20 @@ server:
 #    @SpringBootTest 加载的是完整应用上下文，绕开它反而会让测试环境与生产环境不一致。
 SHORTLINK_BASE_URL: http://localhost:8080
 
+# ⚠️ 后台鉴权 token（阶段 4 前置收口）。
+#
+#    AdminAuthConfig 是**故意 fail-fast** 的：没配 ADMIN_API_TOKEN 就抛异常拒绝启动。
+#    那是正确的生产行为（后台接口 /admin/** 绝不能不设防），但它让测试环境
+#    **必须**提供这个变量才能启动上下文。
+#
+#    之前靠宿主机 shell 里的环境变量，干净环境（CI / 新克隆）跑不了；
+#    现在固定写在 test profile 里：测试环境的 token 没有保密价值，
+#    它只需要「非空且够长」来通过启动期校验。
+#
+#    ⚠️ 这**不是**在生产配置里放宽校验——生产仍然走环境变量，
+#    缺失时依然 fail-fast（见 AdminAuthConfig 的构造器）。
+ADMIN_API_TOKEN: test_only_admin_token_for_integration_tests
+
 logging:
   level:
     com.linkforge: INFO

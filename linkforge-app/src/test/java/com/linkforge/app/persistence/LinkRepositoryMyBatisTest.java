@@ -63,9 +63,8 @@ import org.springframework.transaction.annotation.Transactional;
 @SpringBootTest
 @ActiveProfiles("test")
 @Transactional
-@EnabledIfEnvironmentVariable(named = "RUN_MYBATIS_IT", matches = "true")
 @DisplayName("仓储层真实 MyBatis 集成测试（DR-031）")
-class LinkRepositoryMyBatisTest {
+class LinkRepositoryMyBatisTest extends MySqlContainerSupport {
 
     @Autowired
     private LinkRepository linkRepository;

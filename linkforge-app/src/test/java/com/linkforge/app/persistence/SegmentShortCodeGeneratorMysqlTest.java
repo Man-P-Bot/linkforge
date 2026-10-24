@@ -53,9 +53,8 @@ import org.springframework.test.context.ActiveProfiles;
  */
 @SpringBootTest
 @ActiveProfiles("test")
-@EnabledIfEnvironmentVariable(named = "RUN_MYBATIS_IT", matches = "true")
 @DisplayName("号段发号器真实降级路径（DR-042 / DR-043）")
-class SegmentShortCodeGeneratorMysqlTest {
+class SegmentShortCodeGeneratorMysqlTest extends MySqlContainerSupport {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;

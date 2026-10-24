@@ -72,7 +72,7 @@ class StatsFlushRedisIntegrationTest {
         redis.getConnectionFactory().getConnection().serverCommands().flushDb();
 
         registry = new SimpleMeterRegistry();
-        queue = new AsyncStatsQueue(registry, redis, 1000);
+        queue = new AsyncStatsQueue(registry, redis, java.time.Clock.systemDefaultZone(), 1000);
         // ⚠️ 必须在这里就 start：StatsFlushService 的守卫要求 queue.isRunning() == true，
         //    否则整轮 flush 会被跳过，所有断言都会「莫名其妙地全绿」。
         //    （这正是该守卫存在的意义——它拦的不只是停机，也包括测试里的误用。）
@@ -94,6 +94,7 @@ class StatsFlushRedisIntegrationTest {
 
     private StatsFlushService newService() {
         return new StatsFlushService(registry, redis, realLock, links, stats, queue,
+                java.time.Clock.systemDefaultZone(),
                 500, 20, 2, 60, "0,0,0");
     }
 
@@ -405,6 +406,13 @@ class StatsFlushRedisIntegrationTest {
             shortCodes.forEach(c -> m.put(c, (long) c.hashCode() & 0xFFFFL));
             return m;
         }
+
+        @Override
+        public List<ExpiredLink> scanExpired(int limit, java.time.Instant now) {
+            // 本类只验 Redis 侧语义，不涉及过期清理
+            return List.of();
+        }
+
 
         @Override
         public List<String> scanActiveShortCodes(long afterId, int limit) {

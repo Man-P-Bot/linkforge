@@ -367,33 +367,108 @@ spring:
 
 ## 6. 过期清理
 
-### 6.1 软删除，不物理删
+> ⚠️ **本节已按阶段 4 的实际实现更新**（2026-10-21）。
+> 完整决策与理由见 docs/DECISIONS.md DR-060。
+
+### 6.1 定时扫描（每 5 分钟），但它**不是正确性必需**
+
+跳转路径上本来就有惰性判定（`RedirectService` 每次请求都检查 `expire_at`），
+所以从「用户能不能跳过去」的角度，清理**不是必需的**——过期短链在库里放着也跳不过去。
+
+它解决的是**另外三件事**：
+1. **缓存不释放**：`shortlink:code:{code}` 的 TTL 是 1 小时 + 抖动，
+   过期短链的缓存条目会一直占着 Redis 内存；
+2. **布隆过滤器虚高**：布隆里仍留着已过期的短码 → 判「可能存在」→
+   多一次「布隆 → 缓存 → 库」三级回源 → 最终 410。这条路径比直接 410 慢；
+3. **状态一致性**：库里仍标着 ACTIVE，与「实际已失效」不符。
+
+**频率 5 分钟**：因为清理不是正确性必需，过期短链晚 5 分钟被清理用户侧完全无感；
+而每分钟扫一次 1000 万行的表是纯粹的浪费。
+
+### 6.2 扫描查询与索引
 
 ```sql
-UPDATE short_link
-SET status = 'DELETED'
-WHERE expire_at < UTC_TIMESTAMP()
-  AND status = 'ACTIVE'
-LIMIT 5000
+SELECT id, short_code, expire_at FROM short_link
+WHERE status = 0 AND expire_at < ? ORDER BY id LIMIT ?
 ```
 
-**为什么软删**：
-1. 保留记录，后台统计能查到历史
-2. 删除与「过期」是**不同的语义**——用户「过期」不等于「主动删除」
-3. 物理删除会让统计失去关联
+⚠️ **必须走 `idx_expire_status (status, expire_at)` 索引**（V5 迁移）。
 
-⚠️ **批量上限 5000**：避免长事务锁表。每轮扫完记剩余数量，下一轮继续。
+V1 的 `idx_status_code (status, short_code)` **不适用**：
+`status` 是等值前缀但 `expire_at` 不在索引里 → MySQL 只能先取出所有 `status=0` 的行
+（1000 万行里约 1% = 10 万行）**回表**读 `expire_at` 再过滤。
+这是最容易被忽略的一种「看起来用了索引、实际是全表扫」。
 
-### 6.2 缓存失效
+实测对比（20 万行、2000 条已过期、真实 MySQL 8.4）：
+
+| 索引 | type | rows 估算 |
+|---|---|---|
+| `idx_status_code (status, short_code)` | `ref` | **97,181** |
+| `idx_expire_status (status, expire_at)` | `range` | **2,000** |
+
+约 50 倍差距。详见 docs/TROUBLESHOOTING.md T-011。
+
+### 6.3 ⚠️ 只清缓存，**绝不修改数据库**
+
+过期清理**不**把短链软删除成 `status = DELETED`。理由：
+
+```
+清理前：status=ACTIVE + expire_at 已过 → LinkState.resolve → EXPIRED → 410 Gone
+软删除后：status=DELETED                    → LinkState.resolve → DELETED → 404 Not Found
+```
+
+一个纯粹的过期链接，因为被后台任务扫过一次，对外就从
+「**曾经存在但已失效**」变成了「**从未存在**」。
+
+而 410 的**全部价值**就在于告诉调用方「这个码曾经有效」
+（docs/API.md §4.4、PRD US-4）。软删除把这个信息抹掉了。
+
+⚠️ **这不是实现细节，而是对外契约的回退**——
+后台任务不该有能力改变对外可观测的语义。
+
+**因此本任务的职责收窄为**：
+
+| 项 | 处理 |
+|---|---|
+| 数据库 `status` | **完全不改**，保持 `ACTIVE` |
+| 数据库 `expire_at` | **完全不改** |
+| L2 缓存 `shortlink:code:{code}` | **清掉** |
+| L1 本地缓存 | 靠 TTL（5 分钟）兜底 |
+| 布隆过滤器 | **不动**（标准 Bloom 不支持删除） |
+| 用户可见行为 | **完全不变**：L2 miss → 回源查库 → `LinkState.resolve` 发现 `expire_at < now` → **410** |
+
+⚠️ **不需要新增 `EXPIRED` 枚举值**：给 `LinkStatus` 加第三值是保住 410 的另一种做法，
+但它要动表结构、枚举、`LinkStatusTypeHandler`、所有 `status` 过滤、还有布隆语义。
+而「不改状态」这一条路**零改动**就能达到同样的对外效果。
+
+⚠️ **代价：布隆不会淘汰过期短码**。布隆的定时重建走 `scanActiveWithId`
+（只取 `status = 0`），而过期短码的 status 仍是 `ACTIVE`，所以它永远留在布隆里。
+后果：请求过期短码时多一次回源查库（结果仍正确）。
+彻底解决需要给 `LinkStatus` 增加第三值 —— 更大的改动，本阶段不做。
+
+⚠️ **清理是幂等的**：因为不改 status，每一轮都会重新扫到同一批过期短码。
+这不是 bug —— 清理的副作用只有「删缓存」，删两次无害（第二次删的是不存在的 key）。
+
+### 6.4 扫描条件为何仍是 `status = 0`
+
+- `status = 0`：只清理「有效但已过期」的短码。
+  已被 admin 手动删除的短链（`status = 1`）在删除时就已经清过缓存了（`DeleteLinkService`），
+  不需要重复清理。
+- 索引仍是 `idx_expire_status (status, expire_at)`（见 6.2），**不受「不改状态」影响**。
+
+### 6.5 缓存失效
 
 ```java
-// L2 主动删
-redis.delete(CacheKeys.code(shortCode));
-// L1 只能等 5 分钟 TTL ⚠️ 已知限制
+// L2 主动删 + L1 一起删（core 的 RedirectCacheService.evict，两级都删）
+cache.evict(shortCode);
 ```
 
+⚠️ **本任务不写数据库，所以没有「事务提交后清缓存」的问题**
+（那是 admin 的 `DeleteLinkService` 的约束——它要改 status）。
+本任务的清缓存是**独立的、可重试的**操作：删失败就留着，TTL 到期自然消失。
+
 > **已知限制（接受并记录）**：Caffeine 的 `expireAfterWrite = 5 分钟`，
-> 软删除后 L1 里的旧值仍可能返回 302，最长持续 5 分钟。
+> 过期短链的 L1 旧值仍可能返回 302，最长持续 5 分钟。
 >
 > **不改的原因**：
 > - 为此在 L1 里存「删除时间戳」并每次判断，等于给 L1 增加一次 Redis 查询
@@ -403,11 +478,44 @@ redis.delete(CacheKeys.code(shortCode));
 > 若第 5 周需要修正，方向是「L1 存值 + 全局删除版本号，读时比对版本号」，
 > 版本号从 Redis 读但可本地缓存几秒。
 
-### 6.3 与 DR-038 的一致性
+⚠️ **但 L1 缓存旧值不会导致「过期链接还能跳」**：
+缓存里存的是 `CachedLink`，**带 status 与 expireAt 字段**，
+跳转路径命中缓存后**仍然要走一遍状态判定**（`RedirectService` 的注释明确说了这一点）。
+所以最多是「多一次无效的状态判定」，不是安全漏洞。
+
+### 6.6 布隆过滤器：**不删除**
+
+标准布隆过滤器**不支持删除**（要删就得重算所有元素的位并重建整条链），成本 O(全部短码数)。
+
+本项目**已经有**每小时一次的全量重建（`BloomFilterMaintenance`），
+但它走 `scanActiveWithId`——**只取 `status = 0` 的短码**。
+
+⚠️ **代价**：由于本任务不改 status（见 6.3），**过期短码不会被重建淘汰**。
+后果是请求过期短码时多一次回源查库（结果仍完全正确）。
+
+> **文档记录**：布隆的误判率随删除累积缓慢上升，
+> 但**每小时全量重建会把它重置**。
+> admin 手动删除的短链（`status = DELETED`）仍会被重建自然淘汰。
+
+### 6.7 与统计 flush 的关系
+
+- **不同的锁**：`shortlink:stats:flush:lock` vs `shortlink:stats:cleanup:lock`。
+  两个任务操作不同的数据，且**必须能并行**（清理扫大表、flush 写统计表，串行化总时长相加）。
+- **统计继续落到已删除短链的 link_id 上**：
+  `resolveIdsByShortCodes` 不过滤 status；统计落的是**已发生的访问**，不该被丢弃。
+  ⚠️ 反过来「跳过已删除的短链」是错的——那会让「删除前最后一分钟的访问量」凭空消失，
+  且没有任何指标能发现。
+
+### 6.8 与 DR-038 的一致性
 
 `DELETED` 优先级高于 `EXPIRED`（DR-038 已定）。
-本任务只把 `ACTIVE` → `DELETED`，不碰已经是 `DELETED` 的记录，
-因此不与该规则冲突。
+
+本任务**完全不修改 status**，所以：
+- 过期短链的 `status` 仍是 `ACTIVE` → 判定为 `EXPIRED` → **410**（与 DR-038 一致）；
+- 已删除的短链（`status = DELETED`）判定为 `DELETED` → **404**（与 DR-038 一致）。
+
+**本任务对这两条路径都不产生影响** —— 这正是「不改状态」带来的最大好处：
+对外语义完全不变，无需任何迁移期或兼容处理。
 
 ---
 

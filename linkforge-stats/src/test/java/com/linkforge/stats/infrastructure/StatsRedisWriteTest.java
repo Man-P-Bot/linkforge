@@ -60,7 +60,7 @@ class StatsRedisWriteTest {
     }
 
     private AsyncStatsQueue newQueue(int capacity) {
-        return new AsyncStatsQueue(registry, redis, capacity);
+        return new AsyncStatsQueue(registry, redis, java.time.Clock.systemDefaultZone(), capacity);
     }
 
     private static StatsEvent ev(String code, String visitor) {

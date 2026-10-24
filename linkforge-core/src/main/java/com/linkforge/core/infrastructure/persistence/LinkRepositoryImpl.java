@@ -2,6 +2,9 @@ package com.linkforge.core.infrastructure.persistence;
 
 import com.linkforge.core.domain.Link;
 import com.linkforge.core.repository.LinkRepository;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -82,6 +85,23 @@ public class LinkRepositoryImpl implements LinkRepository {
         }
         // 查不到的短码（已物理不存在）不会出现在结果里，由调用方计数
         return result;
+    }
+
+    @Override
+    public List<ExpiredLink> scanExpired(int limit, Instant now) {
+        if (limit <= 0) {
+            return List.of();
+        }
+        // ⚠️ expire_at 是 UTC 的 LocalDateTime（DR-027/DR-032）：
+        //    数据库会话时区为 UTC，读回来的就是 UTC。
+        //    这里**不做任何时区转换**——转换只发生在 Service 边界，
+        //    在这里再换算一次会与驱动层对 TIMESTAMP 的解释叠加成双重换算。
+        LocalDateTime nowUtc = LocalDateTime.ofInstant(now, ZoneOffset.UTC);
+        return linkMapper.selectExpired(nowUtc, limit).stream()
+                // ⚠️ Mapper 侧是可变 POJO（MyBatis 需要 setter），
+                // 这里转成不可变 record，让上层拿到的对象不可被意外修改
+                .map(row -> new ExpiredLink(row.getId(), row.getShortCode(), row.getExpireAt()))
+                .toList();
     }
 
     @Override

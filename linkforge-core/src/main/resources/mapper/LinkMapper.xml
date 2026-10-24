@@ -154,4 +154,29 @@
         </foreach>
     </select>
 
+    <!--
+      阶段 4 过期清理：扫描「已过期且未删除」的短链。
+
+      ⚠️ 走 idx_expire_status (status, expire_at)（V5 迁移）：
+         status 是等值前缀、expire_at 承担范围扫描 → type=range。
+         不用 idx_status_code (status, short_code)：那个索引的 status 是等值前缀
+         但 expire_at 不在里面，MySQL 只能回表过滤全部 status=0 的行
+         —— 那是伪索引（实测 20 万行下 rows 差约 50 倍，见 TROUBLESHOOTING T-011）。
+
+      ⚠️ 只 select 三列：不读 target_url（2048 字节），清理任务不需要它。
+
+      ⚠️ expire_at IS NOT NULL 由 WHERE 条件隐含：
+         SQL 里 expire_at < ? 对 NULL 求值为 NULL（不为真），所以永久有效的短链
+         （expire_at IS NULL）天然被排除，不需要显式写 IS NOT NULL。
+    -->
+    <select id="selectExpired"
+            resultType="com.linkforge.core.infrastructure.persistence.LinkMapper$ExpiredLink">
+        SELECT id, short_code, expire_at
+        FROM short_link
+        WHERE status = 0
+          AND expire_at &lt; #{now}
+        ORDER BY id
+        LIMIT #{limit}
+    </select>
+
 </mapper>

@@ -7,6 +7,7 @@ import com.linkforge.core.repository.StatsRepository.UvRow;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -134,6 +135,7 @@ public class StatsFlushService {
     private final LinkRepository links;
     private final StatsRepository stats;
     private final AsyncStatsQueue queue;
+    private final Clock clock;
 
     private final int batchSize;
     private final int maxBatchesPerRun;
@@ -173,6 +175,7 @@ public class StatsFlushService {
                              LinkRepository links,
                              StatsRepository stats,
                              AsyncStatsQueue queue,
+                             Clock clock,
                              @Value("${linkforge.stats.flush.batch-size:500}") int batchSize,
                              @Value("${linkforge.stats.flush.max-batches-per-run:20}") int maxBatchesPerRun,
                              @Value("${linkforge.stats.flush.lookback-days:2}") int lookbackDays,
@@ -184,6 +187,7 @@ public class StatsFlushService {
         this.links = links;
         this.stats = stats;
         this.queue = queue;
+        this.clock = clock;
         this.batchSize = batchSize;
         this.maxBatchesPerRun = maxBatchesPerRun;
         this.lookbackDays = lookbackDays;
@@ -351,7 +355,10 @@ public class StatsFlushService {
 
     /** 持锁后的真正工作。抛出的异常由 {@link #flush()} 的 catch-all 兜住。 */
     private void doFlush() {
-        LocalDate today = LocalDate.now();
+        // ⚠️ 必须用注入的 Clock（ARCHITECTURE §13：时间获取必须可注入）。
+        //    直接 LocalDate.now() 会让「今天是哪天」无法在测试里固定，
+        //    跨零点的批次归属日就测不了。
+        LocalDate today = LocalDate.now(clock);
         // ⚠️ 必须回看前几天：昨天 23:59 的访问会写进「昨天」的 PV key 与 dirty set，
         //    若只处理今天，那批数据永远不会被落库（昨天不会再变成今天）。
         //    默认回看 2 天（今天 + 昨天）；应用停机超过 2 天则更早的数据会滞留，

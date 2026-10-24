@@ -5,6 +5,70 @@
 
 ---
 
+## 第 4 周 — 异步统计 + 过期清理（🚧 进行中：阶段 1~4 完成，阶段 5 后台查询待做）
+
+### 阶段 4：过期清理（只清缓存）+ 前置 P0 收口（✅ 完成）
+
+**前置收口**
+
+| 项 | 结果 |
+|---|---|
+| Q1~Q5 书面回答 | ✅ 贴代码行号，见本轮汇报 |
+| Testcontainers MySQL 引入 | ✅ `org.testcontainers:mysql:1.20.6`（test scope）+ BOM 统一版本 |
+| 四个 MySQL 测试类改造 | ✅ `LinkRepositoryMyBatisTest`(20) / `StatsRepositoryMyBatisTest`(18) / `SegmentShortCodeGeneratorMysqlTest`(9) / `ExpiryCleanupMyBatisTest`(11) 全部改用一次性容器 |
+| `VALUES()` deprecated 兼容性 | ✅ 在 **MySQL 8.4 容器**上实测通过（PV 累加 / UV GREATEST / 互不清零），记录在 docs/TROUBLESHOOTING.md T-010 |
+| 新增 docs/TROUBLESHOOTING.md | ✅ 9 条排障记录（环境/数据库/测试方法论） |
+| `@Transactional` 自调用陷阱 | ✅ 自查发现并修复：同类自调用绕过 AOP 代理 → 事务失效 → 缓存清理退化成「事务内立即执行」 |
+
+**主体**
+
+| 项 | 结果 |
+|---|---|
+| 扫描策略 | 定时扫描，**每 5 分钟**（不是正确性必需 → 频率可放松） |
+| 索引 | ✅ **V5 迁移新增 `idx_expire_status (status, expire_at)`** |
+| **数据库** | ✅ **完全不修改**：`status` 保持 ACTIVE，过期判定交给读路径 → **410 语义完整保留** |
+| 缓存清理 | ✅ 清 L2（Redis）+ L1（本地，靠 TTL 兜底），失败只记指标 |
+| 布隆 | ✅ **不删除**，标准 Bloom 不支持删除；⚠️ 代价：过期短码不会被重建淘汰（多一次回源，结果仍正确） |
+| 分布式锁 | ✅ `shortlink:stats:cleanup:lock`（与统计 flush **不同**的锁，可并行） |
+| 指标 | ✅ `scanned` / `cleared` / `failed` / `cache.evicted` / `cache.evict.failed` / `duration` |
+| 时间源 | ✅ 全部走注入的 `Clock`（ARCHITECTURE §13），含阶段 3 `StatsFlushService` 的 `LocalDate.now()` 一并修正 |
+
+**⚠️ 一处关键决策：清理任务不软删除**
+
+初版实现是「把过期短链软删除成 `DELETED`」。**它是错的**：
+
+```
+清理前：status=ACTIVE + expire_at 已过 → LinkState.resolve → EXPIRED → 410 Gone
+软删除后：status=DELETED                    → LinkState.resolve → DELETED → 404 Not Found
+```
+
+410 的全部价值就在于告诉调用方「**这个码曾经有效**」。
+一个纯粹的过期链接，因为被后台任务扫过一次，对外就从「曾经存在」变成了「从未存在」。
+
+**判据：清理类任务应该只释放资源，不该重定义语义。**
+最终方案：只清缓存，数据库一个字都不改 → 对外行为**完全不变**。
+
+**⚠️ 索引实测数据**（20 万行、2000 条已过期、真实 MySQL 8.4）
+
+| 索引 | type | rows |
+|---|---|---|
+| `idx_status_code (status, short_code)` | `ref` | **97,181** |
+| `idx_expire_status (status, expire_at)` | `range` | **2,000** |
+
+约 50 倍差距。放到 1000 万行的生产表上：前者每轮扫约 500 万行，后者 2 万行。
+
+**测试环境改造**
+
+| 项 | 结果 |
+|---|---|
+| Testcontainers MySQL | ✅ `org.testcontainers:mysql:1.20.6` + BOM；4 个测试类全部改用一次性容器（MySQL 8.4，与生产同版本） |
+| E2E `RedirectEndToEndTest` | ✅ 也改用 Testcontainers；`ADMIN_API_TOKEN` 改由 Spring 注入（原 `System.getenv` 绕过 Spring 属性源，干净环境必失败） |
+| 消除的环境变量依赖 | ✅ `TEST_MYSQL_PASSWORD` / `RUN_MYBATIS_IT` / `ADMIN_API_TOKEN` 全部不再需要 |
+
+**测试**：新增 `ExpiryCleanupServiceTest`(12) + `LinkExpiryServiceTest`(7) + `ExpiryCleanupMyBatisTest`(11，真实 MySQL 8.4)
+
+---
+
 ## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D6 完成，基线已记录**）
 
 ### D5 启动验证结果（✅ 全部通过，D5 正式完成）
