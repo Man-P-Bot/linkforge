@@ -279,22 +279,28 @@ services:
   #   而宿主机的 jcmd（Windows）**无法 attach** 到容器内的 JVM
   #   （不同 PID namespace，且宿主是 Windows）。
   #
-  # 做法：用 `pid: "service:app"` 让本容器**共享 app 的进程空间**，
-  #       再用 `SYS_PTRACE` 能力 attach 进去。
-  #   这是 jattach / arthas 官方推荐的跨容器 attach 方式。
+  # ⚠️ **为什么用 nsenter 而不是直接 jcmd**：
+  #   JVM 的 attach 机制依赖目标进程 namespace 里的 `/tmp/.java_pid<pid>` socket。
+  #   直接 `jcmd 1 ...` 会报：
+  #     Unable to open socket file /tmp/.java_pid1:
+  #     target process 1 doesn't respond within 10500ms
+  #   （**实测踩过**：sidecar 有自己的 /tmp，看不到 app 的 socket。）
+  #
+  #   `nsenter -t 1 -m` 进入 app 进程的 **mount namespace**，
+  #   于是能看见 app 的 /tmp —— attach 即可成功。
+  #   ⚠️ 注意：进 mount ns 后本容器的 /opt/java 不可见，
+  #      所以 jcmd 必须先被复制进 app 容器（见 scripts/longrun-watch.sh 的说明）。
   #
   # ⚠️ **用 profile 隔离**：默认 `docker compose up -d` 不会启动它，
   #    也不会拉它的镜像（JDK 镜像比 JRE 大 ~150MB）。
-  #    只有真的需要诊断时才用：
-  #       docker compose --profile diagnose run --rm --no-deps jdk-tools \
-  #           jcmd 1 GC.class_histogram
   #
-  # ⚠️ **多数情况下不需要它**：Micrometer 已经暴露了
-  #    jvm_classes_loaded_classes（存活类数）与
-  #    jvm_classes_unloaded_classes_total（累计卸载数）。
-  #    本项目观察到 unloaded_total 恒为 0 ——
-  #    即「类加载器从未被回收」⇒ **Metaspace 增长 ≡ 累计加载了新类**，
-  #    这在**机制上**就足以判定方向，不需要 jcmd 的快照。
+  # ⚠️⚠️ **不要在长稳/压测期间跑 jcmd**：
+  #    `GC.class_histogram` 会触发一次 **full GC**，
+  #    `VM.classloader_stats` 会 attach 进目标 JVM 并可能触发类加载 ——
+  #    两者都会**污染** GC 曲线与 Metaspace 曲线。
+  #    本项目因此改用 Micrometer 的类加载指标做**无侵入**的连续量分析：
+  #      jvm_classes_loaded_classes           （已加载类数，单调递增）
+  #      jvm_classes_unloaded_classes_total    （累计卸载数，本项目恒为 0）
   #    jcmd 只在需要**具体类名分布**时才有不可替代的价值。
   # ===========================================================================
   jdk-tools:
@@ -302,13 +308,29 @@ services:
     container_name: linkforge-jdk-tools
     profiles:
       - diagnose
-    # ⚠️ 共享 app 的 PID namespace —— 这样 jcmd 能看到 app 的 JVM 进程
+    # ⚠️ 共享 app 的 PID namespace —— 这样才能看到 app 的 JVM 进程（PID 1）
     pid: "service:app"
     # ⚠️ attach 需要 ptrace 能力
     cap_add:
       - SYS_PTRACE
+    # ⚠️ 进入目标进程的 mount namespace（为了看到它的 /tmp 下的 attach socket）
+    security_opt:
+      - seccomp:unconfined
     # 诊断是一次性的，用完即退（不设 restart）
-    command: ["jcmd", "help"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "⚠️ 用途：nsenter 进 app 的 mount namespace 后执行 jcmd"
+        echo ""
+        echo "  # 1. 先把 jcmd 复制进 app 容器（它有正确的 namespace）"
+        echo "  docker cp <jdk-container>:/opt/java/openjdk linkforge-app:/opt/jdk"
+        echo ""
+        echo "  # 2. 进 app 的 mount namespace 执行"
+        echo "  nsenter -t 1 -m -- /opt/jdk/bin/jcmd 1 GC.class_histogram | head -40"
+        echo ""
+        echo "  ⚠️ 不要在长稳/压测期间执行：class_histogram 会触发 full GC。"
+        echo "     无侵入的替代方案：用 Micrometer 的 jvm_classes_* 指标。"
+        sleep infinity
     networks:
       - default
 

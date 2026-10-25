@@ -15,12 +15,25 @@
 #   jvm_classes_loaded_classes                            已加载类数（存活）
 #   jvm_classes_unloaded_classes_total                    累计卸载数
 #
-#   ⚠️ **unloaded_total = 0 是本项目最关键的一条证据**：
+#   ⚠️ **unloaded_total = 0 的含义（比想象中更精确）**：
 #      类一旦加载就**永不卸载**（除非类加载器被回收），
 #      而本项目从未回收过类加载器 —— 所以
-#      「Metaspace 增长」 ≡ 「累计加载了新类」。
-#      这条把「Metaspace 涨」与「类加载」**在机制上绑定**了，
-#      不需要 jcmd 也能判定方向。
+#      「已加载类数」单调递增，**不会回落**。
+#
+#      ⚠️⚠️ **但它不能推出「Metaspace 增长 ≡ 已加载类增长」**！
+#      本项目实测到过：**Metaspace 涨了 93KB，而 LoadedClassCount 没涨**。
+#      原因是 JDK 15+ 的 **hidden class（lambda 隐藏类）**：
+#      它们**计入 Metaspace，但不计入 LoadedClassCount**。
+#
+#      正确的表述（两层）：
+#        ① 已加载类数**只增不减** → 它是「类加载累积」的上界证据；
+#        ② Metaspace 的增长 = 已加载类 + **hidden class（lambda）** + 其它元数据。
+#      因此分析时必须看**两个增量的比值**：
+#        每类约 19KB（实测：45 类 → 0.84MB）——比值接近则是普通类；
+#        比值远大于 19KB 则**有 hidden class 贡献**（lambda 隐藏类嫌疑）。
+#
+#      ⚠️ 而 lambda 隐藏类的数量 = 代码里**不同的 lambda 调用点**数量（固定），
+#         **与请求量无关** → 若长跑后收敛（不线性增长），就**不是泄漏**。
 #
 # 用法：
 #   bash scripts/longrun-watch.sh [间隔秒] [跳变阈值MB]
@@ -94,10 +107,14 @@ diagnose() {
             echo "  CompressedClassSpace: $(query 'jvm_memory_used_bytes{area=\"nonheap\",id=\"Compressed Class Space\"}')"
             echo ""
             echo "  判读："
-            echo "    · 已加载类数涨 -> 元空间涨（正常：首次执行路径会加载新类）"
-            echo "    · 已加载类数涨但 Metaspace 不涨 -> 增长来自别处（需 jcmd 深挖）"
+            echo "    · 已加载类数涨 -> 元空间涨（普通类，约 19KB/类）"
+            echo "    · 已加载类数**不涨**但元空间涨 -> **hidden class（lambda 隐藏类）**"
+            echo "      （JDK 15+：计入 Metaspace，但不计入 LoadedClassCount）"
             echo "    · 累计卸载类数恒为 0 -> 类加载器从未被回收，"
-            echo "      所以「元空间增长」≡「累计加载了新类」，两者必然同增同减"
+            echo "      所以「已加载类数」单调递增、不会回落"
+            echo ""
+            echo "  ⚠️ lambda 隐藏类的数量 = 代码里**不同的 lambda 调用点**数量（固定），"
+            echo "     与请求量无关 -> 若长跑后收敛（不线性增长），就**不是泄漏**。"
             echo ""
             echo "  ⚠️ 要拿到类名分布，需启动 JDK sidecar："
             echo "     docker compose --profile diagnose run --rm --no-deps jdk-tools \\"
@@ -139,12 +156,25 @@ while true; do
         #    （日志行一度因此把 35KB 的增长显示成 35576MB）。
         delta_mb="$(awk -v d="${delta}" 'BEGIN{printf "%.3f", d/1048576}')"
         cls_delta=$(( cls_i - prev_class ))
+        # ⚠️ 每类的「元数据成本」= Metaspace 增量 / 类数增量。
+        #    实测基准：普通类约 19KB/类（45 类 → 0.84MB）。
+        #    比值远大于 19KB ⇒ 有 **hidden class（lambda 隐藏类）** 贡献 ——
+        #    它们计入 Metaspace 但不计入 LoadedClassCount。
+        if [ "${cls_delta}" -gt 0 ]; then
+            per_class="$(awk -v d="${delta}" -v c="${cls_delta}" 'BEGIN{printf "%.1f", d/1024/c}')"
+            per_class_txt="  ${per_class}KB/类"
+        elif [ "${delta}" -gt 0 ]; then
+            per_class_txt="  ⚠️ 类数未涨但元空间涨 —— 疑似 hidden class（lambda）"
+        else
+            per_class_txt=""
+        fi
         flag=""
         if [ "${delta}" -gt "${THRESHOLD_BYTES}" ]; then
             flag=" ⚠️ 跳变 >${THRESHOLD_MB}MB —— 触发诊断"
         fi
-        printf '[%s] Metaspace=%s (%+.3fMB)  Classes=%+d  Unloaded=%s%s\n' \
-            "${now}" "${meta_i}" "${delta_mb}" "${cls_delta}" "${unloaded}" "${flag}" >> "${LOG}"
+        printf '[%s] Metaspace=%s (%+.3fMB)  Classes=%+d  Unloaded=%s%s%s\n' \
+            "${now}" "${meta_i}" "${delta_mb}" "${cls_delta}" "${unloaded}" \
+            "${per_class_txt}" "${flag}" >> "${LOG}"
 
         if [ -n "${flag}" ]; then
             diagnose "Metaspace 跳变 ${delta_mb}MB（阈值 ${THRESHOLD_MB}MB）"
