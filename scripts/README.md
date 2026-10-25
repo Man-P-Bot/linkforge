@@ -8,6 +8,29 @@
 |---|---|
 | `bench-create.sh` | 并发造数 + 唯一性验证。产出短码清单供跳转压测使用 |
 | `wrk-redirect.lua` | wrk 跳转压测脚本。从短码清单轮询取码，统计非 302 响应 |
+| `final-bench.sh` | **第 5 周终极压测**（阶段 4）。完整流程：造数 → 停监控 → 重启 app → 等布隆 → 预热 → 3×30s 取中位数 + 60s 补充 → 恢复监控 |
+| `longrun-load.sh` | **长稳压测**（阶段 3）。低强度持续流量 `wrk -t2 -c10 -d8h`，用于 Metaspace 泄漏排查 |
+| `longrun-collect.sh` | **长稳采集**（阶段 3）。每 30 分钟从 Prometheus 采 Metaspace / 已加载类数 / meter 数三条曲线，每 2 小时附 jcmd 类加载统计 |
+| `wrk-percentile.lua` | 分位数采集辅助脚本 |
+
+### 第 5 周两个脚本的关键差异
+
+| | `final-bench.sh`（阶段 4） | `longrun-load.sh`（阶段 3） |
+|---|---|---|
+| 目的 | 测**性能上限** | 测**长时间稳定性** |
+| 并发 | `-t4 -c100`（与前三周同口径） | `-t2 -c10`（不烤机器） |
+| 时长 | 3×30s + 60s | 8 小时 |
+| 监控容器 | **必须停掉**（`/actuator/prometheus` 每次抓取都要序列化全部 meter，会污染压测） | **必须留着**（它就是数据源） |
+| 输出 | `benchmark/final/` | `benchmark/longrun/` |
+
+⚠️ **造数前必须用 bench overlay 放宽限流**：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --force-recreate app
+```
+
+否则创建接口 10/min 的默认值会让绝大多数请求返回 429
+（实测踩过：9986/10000 被限流，语料只剩 14 条）。
 
 ## 前置条件
 
