@@ -1055,3 +1055,59 @@ change_me_grafana_admin_password
 > 模板文件里加一行说明 seemed 很人性，但对「整文件即值」的消费者来说，
 > 那行说明就是密码的一部分。
 > 判据：**只要一个文件被整体当作配置值读取，它就只能有一个值。**
+
+---
+
+### T-024 Windows 的 CRLF 会让 **Secret 密码多一个 `\r`**（Windows 专有）
+
+**现象**
+
+在 Windows 上按 README 手工复制模板：
+
+```bash
+cp docker/secrets/grafana_admin_password.txt.example docker/secrets/grafana_admin_password.txt
+```
+
+然后 Grafana 登录失败。用户 `cat` 出来的密码**肉眼完全正确**，
+但用 `curl -u "admin:$(cat ...)"` 也是 401。
+
+**根因**
+
+Windows 检出的 `.example` 文件是 **CRLF** 行尾（除非 `.gitattributes` 规定 LF）。
+`cp` 是二进制复制，**保留源文件的行尾** → 真实 secret 文件也是 CRLF。
+
+而 `GF_SECURITY_ADMIN_PASSWORD__FILE` 把文件内容**原样**当密码（只去掉末尾换行，
+中间的 `\r` 留着）→ 实际密码 = `change_me_grafana_admin_password\r`。
+
+于是：
+- 用户输入的密码（复制粘贴，通常不带 `\r`）→ 不匹配；
+- `curl -u "admin:$(cat file)"` —— `$(...)` **会去掉尾部换行**，但**保留 `\r`** →
+  恰好匹配！所以 **curl 能通、浏览器登不进去**。
+
+⚠️ 这个「curl 能通但浏览器不通」的现象极具迷惑性：
+它让人以为「密码是对的，是 Grafana 的问题」。
+
+**解决**
+
+`.gitattributes` 明确指定这些文件必须是 LF：
+
+```
+.env.example            text eol=lf
+*.example                text eol=lf
+.env                     text eol=lf
+docker/secrets/*.txt     text eol=lf
+```
+
+加上 `scripts/setup-local.sh` 的**双重保险**：复制时用 `printf '%s\n'` 重写
+（而不是 `cp`），并剥离注释行 —— 生成的文件一定是 LF + 纯明文单行。
+
+**教训**
+
+> **行尾问题不只影响脚本。**
+>
+> T-019 里 CRLF 让 `/bin/sh` 崩在第一行（语法错误，很显眼）。
+> 而这里 CRLF 让**密码多一个字符**（语义错误，不显眼）——
+> 同样一个根因，两种完全不同的表现形式。
+>
+> 判据：**凡是「整文件即值」的文件**（secret、配置、密码、token），
+> 行尾必须是 LF，而且要在**生成环节**保证，而不是指望用户复制时不出错。

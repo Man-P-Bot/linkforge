@@ -30,6 +30,17 @@
 *.md    text eol=lf
 *.py    text eol=lf
 
+# ⚠️ 环境与凭据文件必须 LF（不只是脚本）：
+#   .example 是 Docker Secret 的**模板**，会被复制成真实 secret 文件。
+#   若它是 CRLF，复制出来的密码就带一个 \r —— 而
+#   GF_SECURITY_ADMIN_PASSWORD__FILE 会把整个文件当密码，
+#   于是「cat 出来的明文」与「程序实际用的密码」差一个 \r，
+#   登录失败且毫无提示（Windows 上专有的坑，Linux/macOS 上不复现）。
+.env.example  text eol=lf
+*.example      text eol=lf
+.env           text eol=lf
+docker/secrets/*.txt text eol=lf
+
 # 二进制文件：不做行尾转换
 *.jar   binary
 *.class binary
