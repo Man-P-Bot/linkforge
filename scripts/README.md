@@ -15,6 +15,7 @@
 | `setup-local.sh` | **一键初始化**（第 5 周）。生成 `.env` + Docker Secrets，并**实测校验**凭据一致性（详见 [docs/PITFALLS.md](../docs/PITFALLS.md)） |
 | `gen-prometheus-hash.sh` | 改 Prometheus 密码时**同步** bcrypt 哈希（进 git）与明文（gitignore）两处 |
 | `reset-grafana-datasource.sh` | 改密码后**重置 Grafana 数据源**（幂等）——Grafana 的 `secureJsonData` 不会被 upsert 覆盖 |
+| `staircase-bench.sh` | **阶梯加压（组 C）**。固定 `-c50`、只加 `-t`，每档 30s + 冷却 15s，找**后端的真实拐点** |
 | `wrk-percentile.lua` | 分位数采集辅助脚本 |
 
 ### 第 5 周两个脚本的关键差异
