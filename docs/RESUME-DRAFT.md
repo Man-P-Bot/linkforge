@@ -206,7 +206,32 @@ Redis 占用不到 0.5%，**远未饱和**——瓶颈不在 Redis 的计算能�
 返回**空**——而 Metaspace 的 area 其实是 **`nonheap`**。
 **空曲线看起来像「没有泄漏」，结论会完全反过来**（TROUBLESHOOTING T-020）。
 
-**⑤ 跑 8 小时长稳。** ⏳ 数据待补（见下）。
+**⑤ ⭐ 长稳跑起来后，数据推翻了我自己的一个推论。**
+
+我最初写下的是「`unloaded_total = 0` ⇒ Metaspace 增长 ≡ 累计加载了新类」，
+理由是类一旦加载就永不卸载。但运行 1 小时后的实测**不支持**它：
+
+```
+[16:10:29] Metaspace=77168928 (+0.089MB)  Classes=+0  Unloaded=0
+```
+
+**Metaspace 涨了 93KB，而 LoadedClassCount 一点没涨。**
+
+原因是 JDK 15+ 的 **hidden class（lambda 隐藏类）**——
+它们**计入 Metaspace，但不计入 LoadedClassCount**。
+修正后的表述是两层：
+- 已加载类数**只增不减**（`unloaded` 恒为 0，类加载器从未被回收）
+  → 它是「类加载累积」的**上界**证据；
+- Metaspace 增长 = 已加载类 + **hidden class（lambda）** + 其它元数据。
+
+于是分析方法也跟着变：必须看**两个增量的比值**——
+普通类约 **19KB/类**（实测 45 类 → 0.84MB），比值远大于此即有 hidden class 贡献。
+
+⭐ **而这恰好指向了我在设计阶段列的「嫌疑 3：Lambda 隐藏类累积」**。
+关键性质：lambda 隐藏类的数量 = 代码里**不同的 lambda 调用点**数量（固定），
+**与请求量无关** → 若长跑后收敛（不线性增长），就**不是泄漏**。
+
+**⑥ 跑 8 小时长稳。** ⏳ 数据待补（见下）。
 
 ### Result（结果）
 
@@ -231,6 +256,7 @@ Redis 占用不到 0.5%，**远未饱和**——瓶颈不在 Redis 的计算能�
 | 怎么确认 74MB 是基线而不是「刚好正常」？ | 对比三个数据点：干净基线 70.7MB、第 3 周长跑后 74MB、本次 8 小时长跑后的值。**关键是长跑曲线是否线性**——如果 8 小时后仍是 73~75MB 且已加载类数平稳，就是基线；如果线性增长到 100MB+，就是泄漏。 |
 | 如果 Metaspace 真在涨，第一步查什么？ | `jvm_classes_loaded_classes`。它平稳 → 是类卸载不掉（查 ClassLoader 引用）；线性增长 → `jcmd VM.classloader_stats` + `jcmd GC.class_histogram` 直接抓出新增的类名。 |
 | 为什么不直接用 arthas / async-profiler？ | 那类工具需要 attach 到生产进程，在容器里改配置的成本高于收益。**先用已有的 Micrometer 指标 + jcmd（JDK 自带）**——够用且零侵入。 |
+| 为什么不用 jcmd 一直盯着？ | ① `GC.class_histogram` 会触发 **full GC**，会污染 GC 曲线；② 容器是 **JRE 镜像不含 jcmd**，跨容器 attach 还要处理 PID/mount namespace（实测直接 jcmd 会报 `Unable to open socket file /tmp/.java_pid1`）。所以我选了 Micrometer 的 `jvm_classes_*` 指标做**无侵入连续量**分析——**趋势本来就比快照更适合回答「是否线性增长」**。 |
 
 ---
 
