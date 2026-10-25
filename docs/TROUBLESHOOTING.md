@@ -606,3 +606,289 @@ private String adminToken;
 > `System.getenv` 只在「明确要验证环境变量存在性」的场景才用。
 
 ---
+
+---
+
+### T-015 Micrometer 的 `baseUnit` 会给 Prometheus 指标名**追加后缀**
+
+**现象**
+
+在 Grafana 里查 `shortlink_meter_count`，**查不到数据**。
+但应用侧 `/actuator/prometheus` 端点里明明有：
+
+```
+shortlink_meter_count_meters{application="linkforge"} 182.0
+```
+
+**根因**
+
+Micrometer 的 `Gauge.builder(...).baseUnit("meters")` 会把单位**追加到指标名后面**：
+
+| 代码 | Prometheus 指标名 |
+|---|---|
+| `Gauge.builder("shortlink.meter.count", ...)` | `shortlink_meter_count` |
+| `Gauge.builder("shortlink.meter.count", ...).baseUnit("meters")` | `shortlink_meter_count_meters` |
+
+⚠️ 这个后缀在 Micrometer 自己的世界里是「单位」，
+但 Prometheus 生态的惯例是**把单位放在指标名里**（`..._bytes`、`..._seconds`）。
+两者叠加就会得到 `xxx_meters` 这种别扭的名字。
+
+**解决**
+
+**不设 `baseUnit`**，单位信息写在 `description` 里：
+
+```java
+Gauge.builder("shortlink.meter.count", registry, r -> r.getMeters().size())
+    .description("MeterRegistry 中的 meter 总数。...")
+    // ⚠️ 不设 baseUnit：它会让 Prometheus 名字变成 shortlink_meter_count_meters
+    .register(registry);
+```
+
+**教训**
+
+> **指标名是「对外契约」，改一次就要同步改所有查询。**
+>
+> 加指标时先想清楚最终在 Prometheus 里的名字是什么，
+> 再写代码 —— 因为 Grafana 看板、告警规则、别人的查询都依赖这个名字。
+>
+> 验证方法：`curl localhost:8080/actuator/prometheus | grep <关键词>`，
+> 看**实际暴露的名字**，不要凭代码里的名字去猜。
+
+---
+
+### T-016 `docker compose pull` 会被 Docker Hub 限速卡住（几分钟到几十分钟）
+
+**现象**
+
+```bash
+$ docker compose pull prometheus grafana
+ Image prom/prometheus:v3.5.0 Pulling
+ Image grafana/grafana:12.1.0 Pulling
+ f18232174bc9 Downloading 1.049MB
+ f18232174bc9 Downloading 1.049MB      ← 反复停在同一数字
+（45 分钟没有任何进展）
+```
+
+**根因**
+
+Docker Hub 对**匿名**拉取有速率限制。
+本机的 `~/.docker/daemon.json` 配了 `registry-mirrors`，
+但 **compose pull 与普通 `docker pull` 走的是同一条路径**，
+限速发生时两者一样慢。
+
+⚠️ 而且 `docker compose pull` 会**同时**拉多个镜像，
+每个镜像的每个层都在抢同一份带宽 —— 比单独拉一个更慢。
+
+**解决**
+
+1. **逐个镜像单独拉**（每次一个，走 mirror 更快）：
+   ```bash
+   docker pull prom/prometheus:v3.5.0
+   docker pull grafana/grafana:12.1.0
+   ```
+   实测：并发 pull 卡 45 分钟无进展；单独 pull 4 分钟完成。
+2. **不要和 build 同时跑** —— 构建本身也在拉依赖层，两边抢带宽。
+3. ⚠️ `docker manifest inspect` **不走 mirror**（它直连 registry），
+   所以它失败不代表镜像拉不下来。别用它的结果判断可达性。
+
+**教训**
+
+> **「拉不动」和「拉不到」是两回事。**
+>
+> 限速的表现是「有进度但极慢」，不是「报错」。
+> 看到反复停在同一个字节数，就是限速，不是配置错误 ——
+> 这时**换一个方式**（逐个拉、避开并发）比反复重试有效得多。
+
+---
+
+---
+
+### T-017 Grafana 的 datasource provisioning 不支持环境变量插值
+
+**现象**
+
+Prometheus 开了 Basic Auth，Grafana 的数据源健康检查一直 401：
+
+```json
+{"message":"401 Unauthorized - There was an error returned querying the Prometheus API.","status":"ERROR"}
+```
+
+在 `datasource.yml` 里写 `basicAuthPassword: $__env{PROMETHEUS_PASSWORD}`
+或 `${PROMETHEUS_PASSWORD}` 都**不生效**。
+
+**根因**
+
+Grafana 的 provisioning **不做任何变量插值** —— `secureJsonData` 里的
+`basicAuthPassword` 只接受**字面值**。实测在 Grafana 12.1.0 的
+`public/build/*.js` 里搜 `__env` 是 **0 处命中**。
+
+**解决**
+
+用一个 entrypoint 包装脚本在 Grafana 启动前**渲染**一份临时 provisioning 文件：
+
+```sh
+# 从 secret 读明文密码，用 awk 替换占位符
+awk -v pw="$PROM_PASSWORD" '
+  /^[[:space:]]*basicAuthPassword:/ {
+    match($0, /^[[:space:]]*/)
+    indent = substr($0, 1, RLENGTH)
+    print indent "basicAuthPassword: \"" pw "\""
+    next
+  }
+  { print }
+' "$TEMPLATE" > "$RENDERED"
+```
+
+⚠️ **必须保留原行缩进**：`basicAuthPassword` 是 `secureJsonData` 的**子键**。
+缩进丢了它就变成兄弟键 —— YAML 能解析，但 Grafana 拿不到密码。
+症状：`secureJsonFields` 为空、健康检查 401、**日志里毫无异常**。
+
+**教训**
+
+> **「配置生效了」和「配置被读取了」是两件事。**
+>
+> Grafana 的症状极具迷惑性：provisioning 日志一切正常，
+> 数据源也确实「存在」，只是**密码没存进去**。
+> 唯一可靠的验证是 `GET /api/datasources/1` 看 `secureJsonFields` ——
+> 它必须是 `{"basicAuthPassword": true}`，空对象就是没生效。
+
+---
+
+### T-018 Grafana provisioning 缺子目录 → **datasource 静默不加载**
+
+**现象**
+
+日志里只有：
+
+```
+logger=provisioning.dashboard ... "finished to provision dashboards"
+```
+
+**完全没有 `provisioning.datasources` 的记录** ——
+但数据源却「存在」（有 id、有 name），只是没有密码。
+
+**根因**
+
+Grafana 按固定顺序加载 provisioning 子目录，
+且**某个子目录缺失会报错并可能中断后续加载**。
+`alerting` 目录不存在时报：
+
+```
+logger=provisioning.alerting level=error msg="can't read alerting provisioning files from directory"
+```
+
+而 `datasource` 的加载排在**最后** —— 前序报错让它根本没执行。
+Grafana 用内置默认配置兜底建了一个数据源，于是「看起来有」。
+
+⚠️ 最迷惑的地方：**数据源确实存在**，所以任何「检查数据源在不在」的验证都会通过。
+
+**解决**
+
+entrypoint 里**建齐所有**子目录（哪怕是空的）：
+
+```sh
+mkdir -p /tmp/provisioning/datasources \
+         /tmp/provisioning/dashboards \
+         /tmp/provisioning/plugins \
+         /tmp/provisioning/alerting \
+         /tmp/provisioning/notifiers \
+         /tmp/provisioning/access-control
+```
+
+**教训**
+
+> **「数据源存在」不等于「数据源被正确配置」。**
+>
+> 验证配置是否真正生效，要看**字段的值**，不要看**对象是否存在**。
+> 这里如果只看 `GET /api/datasources`（返回了一个 Prometheus 数据源），
+> 就会误判为「配置成功」。
+
+---
+
+### T-019 Windows 的 CRLF 行尾会让 `/bin/sh` 脚本崩在第一行
+
+**现象**
+
+Grafana 容器反复重启，日志：
+
+```
+/etc/grafana/entrypoint.sh: line 26: : not found
+/etc/grafana/entrypoint.sh: set: line 27: illegal option -
+```
+
+**根因**
+
+在 Windows 上用编辑器/工具写的 `.sh` 文件是 **CRLF** 行尾。
+`/bin/sh` 读到 `set -e\r` 时，把 `\r` 当成参数的一部分 → `illegal option -`。
+
+⚠️ 症状出现在**第 26/27 行**，而真正的错误在**文件开头**——
+`set -e` 那行就已经坏了，只是错误信息指向后续行。
+
+**解决**
+
+确保是 LF 行尾：
+
+```python
+s = io.open(p, encoding="utf-8", newline="").read()
+s = s.replace("\r\n", "\n").replace("\r", "\n")
+io.open(p, "w", encoding="utf-8", newline="\n").write(s)
+```
+
+⚠️ 更根本的做法：在 `.gitattributes` 里强制
+```
+*.sh text eol=lf
+```
+否则每个从 Windows clone 仓库的人都会踩。
+
+**教训**
+
+> **跨平台的行尾问题在容器里表现为「脚本语法错误」，但报错位置会误导。**
+>
+> `illegal option -` 这条信息指向 `set` 命令，而 `set` 本身没问题 ——
+> 真正的问题是它后面多了个 `\r`。
+
+---
+
+### T-020 Micrometer 的 `jvm.memory.used` 里，Metaspace 的 `area` 是 **nonheap**
+
+**现象**
+
+查 `jvm_memory_used_bytes{area="metaspace"}` —— **返回空**。
+明明 JVM 明明有 Metaspace（`jcmd` 能看到），Prometheus 也确实在采集 `jvm.memory.used`。
+
+**根因**
+
+Micrometer 的 `jvm.memory.used` 把内存池分成 `heap` 与 `nonheap` 两类。
+**Metaspace 与 Compressed Class Space 都归在 `nonheap`**：
+
+```
+area=heap     id=G1 Eden Space
+area=heap     id=G1 Old Gen
+area=heap     id=G1 Survivor Space
+area=nonheap  id=Metaspace
+area=nonheap  id=Compressed Class Space
+area=nonheap  id=CodeHeap 'profiled nmethods'
+...
+```
+
+没有 `area="metaspace"` 这个值 —— 查它是**语法合法但语义不存在**。
+
+**正确写法**
+
+```promql
+jvm_memory_used_bytes{area="nonheap", id="Metaspace"}
+```
+
+**教训**
+
+> **PromQL 查不到数据时，先确认「这个 label 组合是否存在」，
+> 而不是立刻怀疑采集出了问题。**
+>
+> 最快的验证：`GET /api/v1/query?query=jvm_memory_used_bytes`，
+> 把返回的**所有** label 组合看一遍。
+>
+> ⚠️ 这条尤其重要：本项目第 5 周要用 Metaspace 曲线做长稳排查 ——
+> 如果查询写错，得到的会是「空曲线」，而空曲线**看起来像「没有泄漏」**，
+> 结论会完全反过来。
+
+---

@@ -145,6 +145,155 @@ services:
       # 首次启动要等 JVM 起来 + Flyway 迁移完成，start_period 内失败不计入 retries
       start_period: 60s
 
+  # ===========================================================================
+  # prometheus —— 指标采集（第 5 周）
+  #
+  # 为什么用「文件挂载」而不是 `command: prometheus --config.file=...` 内联：
+  #   配置文件进 git，配置变更可 review、可回滚。
+  #   内联在 compose 里会让 yaml 变成一大坨，且 prometheus.yml 无法被 IDE 校验。
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: linkforge-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # ⚠️ Web 端点 Basic Auth（第 5 周）：
+      #    9090 映射到了宿主机，不开认证的话任何人都能查全部指标、
+      #    甚至调 /api/v1/admin/tsdb/delete_series **删历史数据**。
+      #    Grafana 有密码而 Prometheus 没有，是不一致的暴露面。
+      #    ⚠️ 只保护 Web 端点，**不影响 Prometheus 抓取 app**（抓取不需要认证）。
+      - --web.config.file=/etc/prometheus/web.config.yml
+      # ⚠️ TSDB 落盘目录：重启后指标不丢（否则重启即「历史曲线消失」）
+      - --storage.tsdb.path=/prometheus
+      # 保留 15 天。第 5 周的长稳测试要回看 8~24 小时的曲线，够用。
+      - --storage.tsdb.retention.time=15d
+      # 允许 POST 改配置（reload），改完 prometheus.yml 后
+      # `curl -X POST localhost:9090/-/reload` 生效，不用重启容器。
+      - --web.enable-lifecycle
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # ⚠️ web.config.yml 里是 **bcrypt 哈希**（不是明文），所以它可以进 git。
+      #    明文密码在 docker/secrets/prometheus_basic_auth.txt（gitignore）。
+      - ./docker/prometheus/web.config.yml:/etc/prometheus/web.config.yml:ro
+      - prometheus-data:/prometheus
+    # ⚠️ 只暴露给宿主机（人看），Prometheus 抓 app 走**容器网络内部**。
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    secrets:
+      # ⚠️ healthcheck 需要明文密码（Prometheus 用的是 bcrypt 哈希，
+      #    wget 无法用哈希做 Basic Auth）
+      - prometheus_basic_auth
+    healthcheck:
+      # ⚠️ 用 wget 而不是 curl：prom/prometheus 镜像基于 busybox，
+      #    有 wget 但没有 curl。
+      #
+      # ⚠️ **必须带 Basic Auth**：开了 --web.config.file 之后，
+      #    连 /-/healthy 这个「健康检查端点」也要认证（实测 401）。
+      #    不带凭据的话 healthcheck 永远失败，容器一直显示 unhealthy
+      #    ——而 Prometheus 本身完全正常（这是个「假故障」）。
+      #
+      #    ⚠️ **为什么用 --header 而不是 --user/--password**：
+      #    prom/prometheus 镜像是 BusyBox，busybox wget 只有
+      #    [-cqS] [--spider] [-O] [-o] [--header] [--post-data] ...
+      #    **不支持 --user/--password**（GNU wget 才有）。
+      #    实测 busybox 会报 "unrecognized option `--password=...'"。
+      #    改用 --header 传 Authorization: Basic <base64>。
+      #
+      #    ⚠️ 用 $$ 而不是 $：这是 compose 文件，要转义给容器内的 shell。
+      # ⚠️ **用单引号包住整条命令**：
+      #    命令里有双引号（--header 的值）、单引号（printf 的格式串）、
+      #    以及 $$ 转义，三层嵌套在 YAML 折叠后极易引号失衡
+      #    （实测报 "syntax error: unexpected end of file"）。
+      #    改成「单引号包外层 + printf 用双引号」后就没有歧义了。
+      test:
+        - CMD-SHELL
+        - 'wget --spider -q --header "Authorization: Basic $$(printf "linkforge:%s" $$(cat /run/secrets/prometheus_basic_auth) | base64)" http://localhost:9090/-/healthy'
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - default
+
+  # ===========================================================================
+  # grafana —— 看板（第 5 周）
+  #
+  # ⚠️ **全声明式**：datasource + dashboard 都用 provisioning 文件挂载，
+  #    不点 UI。手工在 UI 里配的东西只存在数据库里，换个环境就要重配。
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: linkforge-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      # ⚠️ **密码走 secret 文件，不走环境变量**：
+      #    环境变量能被 `docker inspect` 看到，secret 挂载的文件看不到。
+      #    Grafana 原生支持 GF_SECURITY_ADMIN_PASSWORD__FILE。
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      # 禁止自助注册：本项目没有用户体系
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 无外部署时 Grafana 默认不允许外部访问登录页
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3000}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    # ⚠️ entrypoint 包装：Grafana 的 provisioning **不支持环境变量插值**，
+    #    数据源密码必须用字面值。entrypoint.sh 在启动前从 secret 读出明文密码，
+    #    渲染一份临时 datasource 文件（权限 600）到 /tmp/provisioning。
+    #    详见 docker/grafana/entrypoint.sh 的注释。
+    entrypoint: ["/bin/sh", "/etc/grafana/entrypoint.sh"]
+    secrets:
+      - grafana_admin_password
+      # Prometheus 的 Basic Auth 明文密码（与 web.config.yml 的 bcrypt 哈希配套）
+      - prometheus_basic_auth
+    volumes:
+      # provisioning：数据源 + 看板提供者声明
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      # entrypoint 脚本（只读挂载）
+      - ./docker/grafana/entrypoint.sh:/etc/grafana/entrypoint.sh:ro
+      # 看板 JSON 本体
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Grafana 自己的数据（用户、设置、告警状态）持久化
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - default
+
 volumes:
   mysql-data:
     name: linkforge-mysql-data
+  prometheus-data:
+    name: linkforge-prometheus-data
+  grafana-data:
+    name: linkforge-grafana-data
+
+# =============================================================================
+# Docker secrets（第 5 周）
+#
+# ⚠️ **为什么用 secrets 而不是环境变量**：
+#    环境变量能被 `docker inspect` / `docker compose config` 看到明文；
+#    secrets 挂载的是文件，容器外看不到内容。
+#
+# ⚠️ **真实文件不进 git**（.gitignore 已排除 docker/secrets/*），
+#    仓库里只有 .example 模板。新机器 clone 后：
+#      cp docker/secrets/grafana_admin_password.txt.example \
+#         docker/secrets/grafana_admin_password.txt
+#      cp docker/secrets/prometheus_basic_auth.txt.example \
+#         docker/secrets/prometheus_basic_auth.txt
+# =============================================================================
+secrets:
+  grafana_admin_password:
+    file: ./docker/secrets/grafana_admin_password.txt
+  prometheus_basic_auth:
+    file: ./docker/secrets/prometheus_basic_auth.txt

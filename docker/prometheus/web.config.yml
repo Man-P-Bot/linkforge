@@ -1,0 +1,38 @@
+# =============================================================================
+# Prometheus Web 认证配置（第 5 周）
+#
+# ⚠️ **为什么要认证**：Prometheus 的 9090 端口映射到了宿主机。
+#    不开认证的话，任何能访问宿主机 9090 的人都能：
+#      ① 看全部指标（含业务指标、容量数据）
+#      ② 通过 /api/v1/query 任意查询
+#      ③ 通过 /api/v1/admin/tsdb/delete_series **删除历史数据**
+#    Grafana 有密码而 Prometheus 没有，是不一致的暴露面。
+#
+# ⚠️ **为什么用 secret 而不是把哈希写在这里**：
+#    这个文件里是 **bcrypt 哈希**，不是明文 —— 即使它进了 git，
+#    攻击者也拿不到明文密码（bcrypt 的强度足够）。
+#    但**明文密码**（docker/secrets/prometheus_basic_auth.txt 的旧格式）
+#    绝不能进 git，所以它走 secret 挂载。
+#
+#    两者分工：
+#      - docker/secrets/prometheus_basic_auth.txt（secret，gitignore）
+#        = 明文密码，给人用（curl -u linkforge:<明文>）
+#      - docker/prometheus/web.config.yml（进 git）
+#        = bcrypt 哈希，给 Prometheus 用
+#
+# ⚠️ **改密码的完整流程**：
+#    1. 生成新哈希（需要 docker）：
+#       docker run --rm httpd:alpine htpasswd -nbB linkforge '<新明文>'
+#    2. 把输出粘进本文件的 basic_auth_users
+#    3. 更新 docker/secrets/prometheus_basic_auth.txt（明文，给人用）
+#    4. docker compose up -d --force-recreate prometheus
+#
+# ⚠️ **Grafana 的数据源不受影响**：它走 **容器网络内部**访问 Prometheus。
+#    ⚠️ **web.config.yml 的 basic_auth_users 只保护 Web 端点，
+#    不影响 Prometheus 抓取目标**（抓取不需要认证）——
+#    若将来 app 端点也加认证，要在 app 的 scrape_config 里加 basic_auth。
+# =============================================================================
+
+basic_auth_users:
+  # 用户名: bcrypt 哈希（cost=5，htpasswd -nbB 的默认）
+  linkforge: $2y$05$cTCQS38/VEyqk5EfSGSRjeGpcohrj2HcXTYBDZUD0d5D9yLMNJtha

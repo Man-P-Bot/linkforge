@@ -1,0 +1,378 @@
+{
+  "uid": "linkforge-core",
+  "title": "LinkForge 核心看板",
+  "description": "第 5 周监控栈。按「先看是否正常，再看是否够快」的排障顺序排列。",
+  "tags": [
+    "linkforge",
+    "w5"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 6,
+  "refresh": "15s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "editable": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "① 流量与延迟（先看是否正常）",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 100,
+      "type": "timeseries",
+      "title": "跳转 QPS（所有 HTTP 请求）",
+      "description": "rate() 窗口 1 分钟。突降 = 服务挂了或被限流。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(http_server_requests_seconds_count{application=\"linkforge\"}[1m]))",
+          "legendFormat": "total"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(http_server_requests_seconds_count{application=\"linkforge\", uri=~\"/.*\"}[1m]))",
+          "legendFormat": "redirect-ish"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 101,
+      "type": "timeseries",
+      "title": "P99 延迟（应用侧直方图分位数）",
+      "description": "histogram_quantile(0.99) over _bucket。管理端点开 percentiles-histogram 后可用。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket{application=\"linkforge\"}[5m])) by (le))",
+          "legendFormat": "P99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket{application=\"linkforge\"}[5m])) by (le))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.50, sum(rate(http_server_requests_seconds_bucket{application=\"linkforge\"}[5m])) by (le))",
+          "legendFormat": "P50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "② 缓存与限流（第 2 周的核心成果，防劣化）",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 200,
+      "type": "timeseries",
+      "title": "缓存命中率（L1 本地）",
+      "description": "L1 命中 / (L1 命中 + L2 未命中回源)。掉了说明两级缓存被绕过。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(shortlink_cache_local_hit_total{application=\"linkforge\"}[5m])) / clamp_min(sum(rate(shortlink_cache_local_hit_total{application=\"linkforge\"}[5m])) + sum(rate(shortlink_cache_miss_total{application=\"linkforge\"}[5m])), 1e-9)",
+          "legendFormat": "L1 hit rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 201,
+      "type": "timeseries",
+      "title": "限流拒绝数 / 秒",
+      "description": "压测时阈值已放宽到 100 万/s，此处应为 0。生产持续 > 0 = 有人在刷。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(shortlink_ratelimit_rejected_total{application=\"linkforge\"}[1m]))",
+          "legendFormat": "rejected/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(shortlink_ratelimit_degraded_total{application=\"linkforge\"}[1m]))",
+          "legendFormat": "degraded/s (Redis 故障降级)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 202,
+      "type": "timeseries",
+      "title": "错误率（5xx 占比）",
+      "description": "5xx 是硬故障，比 QPS 更早暴露问题。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(http_server_requests_seconds_count{application=\"linkforge\", status=~\"5..\"}[5m])) / clamp_min(sum(rate(http_server_requests_seconds_count{application=\"linkforge\"}[5m])), 1e-9)",
+          "legendFormat": "5xx ratio"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(http_server_requests_seconds_count{application=\"linkforge\", status=~\"4..\"}[5m])) / clamp_min(sum(rate(http_server_requests_seconds_count{application=\"linkforge\"}[5m])), 1e-9)",
+          "legendFormat": "4xx ratio (含 404/410，正常)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "③ 运行时与长稳（DR-057 Metaspace 排查）",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 300,
+      "type": "timeseries",
+      "title": "JVM 内存（Metaspace / Heap / Code Cache）",
+      "description": "Metaspace 涨 = 类加载多；Heap 涨 = 对象多。两者机制不同，不要混谈。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "jvm_memory_used_bytes{application=\"linkforge\", area=\"nonheap\", id=\"Metaspace\"}",
+          "legendFormat": "metaspace"
+        },
+        {
+          "refId": "B",
+          "expr": "jvm_memory_used_bytes{application=\"linkforge\", area=\"heap\"}",
+          "legendFormat": "heap"
+        },
+        {
+          "refId": "C",
+          "expr": "jvm_memory_used_bytes{application=\"linkforge\", area=\"nonheap\", id=~\"CodeHeap.*\"}",
+          "legendFormat": "code cache"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 301,
+      "type": "timeseries",
+      "title": "已加载类数 / GC 次数",
+      "description": "LoadedClassCount 是元空间排查的直接证据：线性增长 = 在持续加载新类。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "jvm_classes_loaded_classes{application=\"linkforge\"}",
+          "legendFormat": "loaded classes"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(jvm_gc_pause_seconds_count{application=\"linkforge\"}[5m])",
+          "legendFormat": "GC pauses/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 302,
+      "type": "timeseries",
+      "title": "Meter 数量（高基数 tag 的哨兵）",
+      "description": "shortlink.meter.count = MeterRegistry 里的 meter 总数。线性增长 = 出现了高基数 tag（如 http.server.requests 的 path tag），会导致堆增长与 Prometheus series 爆炸。平稳 = 没有动态 tag。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "linkforge-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "shortlink_meter_count{application=\"linkforge\"}",
+          "legendFormat": "meter count"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": {
+              "type": "opacity"
+            }
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

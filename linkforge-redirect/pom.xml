@@ -73,6 +73,25 @@
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
+    <!--
+      Prometheus 格式的指标注册表（第 5 周监控栈）。
+
+      ⚠️ **为什么必须显式引入**：actuator starter 只带 micrometer-core，
+      它**不包含**任何「把指标翻译成 Prometheus 文本格式」的实现。
+      缺了它，/actuator/prometheus 端点会 404（端点存在但没有 registry）。
+
+      ⚠️ **版本不写**：由 spring-boot-dependencies (Boot 3.5.8) 管理，
+      与 actuator 带的 micrometer-core 版本严格一致 —— 版本错配会出现
+      「NoSuchMethodError」这类运行期错误，而不是编译期错误。
+
+      ⚠️ **加在这里而不是 app**：actuator 本来就在 redirect（它带 web starter），
+      两者放一起才一致。app 依赖 redirect，会传递拿到本依赖。
+    -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+
     <!-- 单测：发号器边界用例 -->
     <dependency>
       <groupId>org.springframework.boot</groupId>

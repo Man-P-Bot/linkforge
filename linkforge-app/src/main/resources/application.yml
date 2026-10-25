@@ -167,10 +167,14 @@ management:
   endpoints:
     web:
       exposure:
-        # ⚠️ 刻意只暴露 metrics 与 health，不开 '*'。
+        # ⚠️ 刻意只暴露 metrics / health / prometheus，**不开 '*'**。
         # env / configprops / heapdump 会泄露数据库口令、JVM 内存镜像等内容，
         # 本项目没有网络隔离层，必须显式最小化。
-        include: metrics,health
+        #
+        # ⚠️ prometheus 端点（第 5 周新增）：它是 metrics 的**另一种格式**
+        # （Prometheus 文本格式而非 JSON），泄露面与 metrics 同级 ——
+        # 只含指标名/tag/数值，不含配置项与堆转储。所以可以安全暴露。
+        include: metrics,health,prometheus
   endpoint:
     health:
       # 显式暴露 readiness 供 compose healthcheck 用（ROADMAP 第 5 周 TODO 的兑现）：
@@ -178,7 +182,40 @@ management:
       probes:
         enabled: true
       show-details: never
+    prometheus:
+      # 显式声明：让「Prometheus 抓取源」这件事在配置文件里可见，
+      # 而不是依赖 Boot 的默认值（3.5 默认 true，但默认值不该是「隐式契约」）。
+      enabled: true
   metrics:
     tags:
       # 第 5 周 Prometheus 按 application 维度区分时用
       application: linkforge
+    # ⚠️⚠️ **绝对不要开 `http.server.requests` 的 `path` tag**
+    #
+    # Spring Boot 3 的 `http.server.requests` 默认 tag 集合是：
+    #   uri（**URI 模板**，如 /{code}）、status、method、outcome、exception
+    # 而 `path`（**实际路径**，如 /0000Q0u）默认是**关闭**的。
+    #
+    # 开了它会怎样：每个被访问过的短码都会成为一个新的 tag 值 →
+    #   ① meter 数量随**请求量**线性增长（不是随代码路径增长）
+    #   ② 堆持续增长（每个 Meter 都是普通堆对象）
+    #   ③ Prometheus 每次抓取要序列化全部 meter，CPU 与内存双重压力
+    #   ④ 更糟：Prometheus 自己会因为 series 爆炸而 OOM
+    #
+    # 本项目的短码是**每条短链唯一**的，`path` 的基数 = 短码总数 = 无界。
+    # 这正是 DR-057 怀疑的「Micrometer 动态 Tag」的真实机制 ——
+    # 但它影响的是**堆**，不是 Metaspace（类加载）。
+    #
+    # 若将来确实需要按路径统计，用 `uri`（模板，基数固定）就够了。
+    distribution:
+      # ⚠️ 分位数直方图：让 P99 能从 Prometheus 侧直接算出来。
+      #    没有它，Prometheus 只能拿到 count/sum，P99 要靠应用侧预聚合。
+      #
+      #    ⚠️ **代价**：每个 Timer 会有几十个 bucket。
+      #    本项目 Timer 数量固定（10 个左右），总开销可忽略。
+      #
+      #    ⚠️ **不配 percentiles**：分位数交给 Prometheus 算（histogram_quantile），
+      #    应用侧只暴露 bucket —— 避免应用侧算出 P99 后丢掉了分布信息。
+      percentiles-histogram:
+        http.server.requests: true
+        shortlink.cleanup.duration: true

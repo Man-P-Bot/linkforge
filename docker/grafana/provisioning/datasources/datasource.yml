@@ -1,0 +1,59 @@
+# =============================================================================
+# Grafana 数据源声明（第 5 周）
+#
+# ⚠️ **全声明式，不点 UI**：
+#   手工在 UI 里加数据源 = 配置只存在数据库里 = 换个环境就要重配一遍。
+#   声明式 provisioning 让「docker compose up -d」之后看板直接可用。
+#
+# ⚠️ 这个文件里**没有**任何凭据：Prometheus 在 compose 网络内且未开认证，
+#    Grafana 通过服务名 `prometheus:9090` 直连。
+#    若将来 Prometheus 开了 Basic Auth，凭据走 docker secret + file_sd 配置，
+#    绝不写进这个文件（它会进 git）。
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # ⚠️ **必须指定固定 uid**：provisioning 自动生成的 uid 是随机的
+    #    （实测 PBFA97CFB590B2093），每次重建数据源都可能变 ——
+    #    硬编码在看板里的 uid 就会在重建后失效，症状是「面板全 No data」。
+    #    固定 uid 让看板与数据源解耦于「创建顺序」。
+    uid: linkforge-prometheus
+    type: prometheus
+    access: proxy
+    # ⚠️ 服务名 + 容器端口，不是宿主机映射端口（DR-003）
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    # ⚠️ Prometheus 的 Web 端点开了 Basic Auth（第 5 周），
+    #    Grafana 作为客户端必须带凭据，否则所有面板都是 "No data"。
+    #
+    basicAuth: true
+    basicAuthUser: linkforge
+    # ⚠️ **这里是占位符，真实密码由 entrypoint.sh 从 secret 注入**。
+    #
+    #    为什么不能直接写明文：Grafana 的 provisioning **不支持环境变量插值**
+    #    （$__env{} / ${VAR} 都不生效），basicAuthPassword 只接受字面值。
+    #    而 Prometheus 的密码要与 docker/secrets/prometheus_basic_auth.txt 一致，
+    #    那个文件是 secret、不进 git。
+    #
+    #    所以：entrypoint.sh 启动前用 awk 把下面的占位符替换成 secret 里的明文，
+    #    渲染到 /tmp/provisioning/datasources/datasource.yml（权限 600），
+    #    Grafana 再从那里加载。
+    #
+    #    ⚠️ 直接写明文的后果（实测）：datasource 健康检查返回
+    #       401 "Authentication to data source failed"，所有面板 No data。
+    secureJsonData:
+      basicAuthPassword: __PROMETHEUS_PASSWORD_FROM_SECRET__
+    # ⚠️ **version 字段是「upsert」开关，必须写**：
+    #    Grafana 的 provisioning 靠它判断「这个数据源是否已经配置过」。
+    #    不写 version 时，**已存在的数据源不会被更新** ——
+    #    表现为 secureJsonFields 是空的（密码没存进去），
+    #    数据源健康检查 401，而 provisioning 日志里一切正常。
+    #    写上 version: 1 之后，provisioning 会真正更新它。
+    version: 1
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 对齐
+      timeInterval: 15s
+      httpMethod: POST

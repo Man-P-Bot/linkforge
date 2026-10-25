@@ -528,7 +528,7 @@ wrk 压测容器                      （第 5 周）
 
 ---
 
-## 17. 待确认问题清单
+## 16bis. 待确认问题清单
 
 | 编号 | 问题 | 归属文档 | 影响周次 |
 |---|---|---|---|
@@ -539,3 +539,95 @@ wrk 压测容器                      （第 5 周）
 | A-5 | 本地缓存 `maximumSize` / `expireAfterWrite` 的具体取值 | ARCHITECTURE（第 2 周实测后回填） | 第 2 周 |
 | A-6 | 限流阈值最终取值；令牌桶 vs 滑动窗口的对比结论 | ARCHITECTURE（第 3 周压测后回填） | 第 3 周 |
 | A-7 | Maven 本地仓库选址（沙箱写入限制的最终解法） | DECISIONS / 第 0 周 | 第 0 周 |
+
+---
+
+## 17. 监控栈（第 5 周）
+
+### 17.1 组件与拓扑
+
+```
+                    ┌──────────────── linkforge_default 网络 ────────────────┐
+                    │                                                        │
+  wrk（压测）  ──────┼──→ app:8080 ──→ redis:6379                            │
+                    │      │                                                 │
+  prometheus ───────┼──────┴──→ app:8080/actuator/prometheus                │
+                    │                                                        │
+  grafana ──────────┼──→ prometheus:9090                                    │
+                    └────────────────────────────────────────────────────────┘
+```
+
+| 组件 | 版本 | 镜像 | 端口 | 凭据 |
+|---|---|---|---|---|
+| Prometheus | 3.5.0 | `prom/prometheus:v3.5.0` | 9090 | Docker secret（预留） |
+| Grafana | 12.1.0 | `grafana/grafana:12.1.0` | 3000 | Docker secret（已启用） |
+
+### 17.2 为什么全部声明式，不用 UI
+
+- **Prometheus 配置**：`docker/prometheus/prometheus.yml` 挂载进容器
+- **Grafana 数据源**：`docker/grafana/provisioning/datasources/datasource.yml`
+- **Grafana 看板**：`docker/grafana/provisioning/dashboards/dashboard.yml` + `docker/grafana/dashboards/*.json`
+
+理由：手工在 UI 里配的东西**只存在 Grafana 的数据库里**，
+换个环境（CI / 别人的机器 / 重建容器）就要重配一遍。
+声明式让「`docker compose up -d` 之后看板直接可用」。
+
+⚠️ `allowUiUpdates: false`：看板是**代码**的一部分。
+允许 UI 改会让人在界面上拖出一个「本地版本」，
+而仓库里的 JSON 仍是旧的 —— 两者不一致时没人知道哪个是真的。
+
+### 17.3 凭据：Docker Secrets
+
+| 组件 | 传递方式 | 可见性 |
+|---|---|---|
+| Grafana admin 密码 | `GF_SECURITY_ADMIN_PASSWORD__FILE` + secret 挂载 | `docker inspect` **看不到** |
+| Prometheus Basic Auth | secret 挂载（预留，当前未启用） | `docker inspect` **看不到** |
+
+⚠️ 真实文件被 `.gitignore` 排除（`docker/secrets/*`），仓库里只有 `.example` 模板。
+新机器 clone 后需手工复制：
+
+```bash
+cp docker/secrets/grafana_admin_password.txt.example docker/secrets/grafana_admin_password.txt
+cp docker/secrets/prometheus_basic_auth.txt.example docker/secrets/prometheus_basic_auth.txt
+```
+
+### 17.4 ⚠️ Actuator 暴露面的最小化
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics,health,prometheus   # ⚠️ 绝不开 '*'
+```
+
+| 端点 | 是否暴露 | 理由 |
+|---|---|---|
+| `metrics` | ✅ | JSON 格式的指标，只含数值与 tag |
+| `health` | ✅ | 探针用；`show-details: never` 不泄露依赖细节 |
+| `prometheus` | ✅ | metrics 的**另一种格式**（Prometheus 文本），泄露面同级 |
+| `env` / `configprops` | ❌ | **泄露数据库口令** |
+| `heapdump` | ❌ | 内存镜像，含敏感数据 |
+| `loggers` | ❌ | 可被用来改日志级别 |
+| `*` | ❌ | 一次性放开上面所有 |
+
+### 17.5 ⚠️ 绝对不要开 `http.server.requests` 的 `path` tag
+
+Spring Boot 3 的 `http.server.requests` 默认 tag 集合：
+`uri`（**URI 模板**，如 `/{code}`）、`status`、`method`、`outcome`、`exception`。
+
+`path`（**实际路径**，如 `/0000Q0u`）**默认关闭**，必须保持关闭。
+
+开了它会怎样——每个被访问过的短码都是一个新 tag 值：
+
+1. meter 数量随**请求量**线性增长（不是随代码路径增长）；
+2. 堆持续增长（每个 Meter 都是普通堆对象）；
+3. Prometheus 每次抓取要序列化全部 meter，CPU 与内存双重压力；
+4. Prometheus 自己可能因 series 爆炸而 OOM。
+
+本项目的短码**每条短链唯一**，`path` 的基数 = 短码总数 = **无界**。
+
+> 这正是 DR-057 怀疑的「Micrometer 动态 Tag」的真实机制 ——
+> 但它影响的是**堆**，不是 Metaspace（类加载）。见 DR-061。
+
+需要按路径统计时用 `uri`（模板，基数固定）就够了。

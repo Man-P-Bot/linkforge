@@ -71,6 +71,43 @@
 
 ---
 
+## 第 5 周 — 监控、部署与终极压测（🚧 进行中：阶段 1 监控栈已落地）
+
+### 阶段 1：监控栈与 Secrets（✅ 完成）
+
+| 项 | 结果 |
+|---|---|
+| Prometheus registry | ✅ `io.micrometer:micrometer-registry-prometheus:1.15.6`（版本由 Boot 管理，不写死） |
+| Actuator 端点 | ✅ `include: metrics,health,prometheus`（**绝不开 `*`**，env/configprops/heapdump 会泄露口令） |
+| 直方图 | ✅ `percentiles-histogram` for `http.server.requests` + `shortlink.cleanup.duration`（P99 交给 Prometheus 算） |
+| **path tag** | ✅ **保持关闭**并写明理由（`uri` 是模板基数有限；`path` 是实际路径 → 每个短码一个 tag → meter 数线性增长 → 堆涨 + Prometheus series 爆炸） |
+| Prometheus 服务 | ✅ `prom/prometheus:v3.5.0`，15s 抓取，TSDB 落盘 + 15 天保留 |
+| Grafana 服务 | ✅ `grafana/grafana:12.1.0`，**全声明式**（datasource + dashboard provisioning） |
+| Secrets | ✅ Grafana admin 密码走 `GF_SECURITY_ADMIN_PASSWORD__FILE` + secret 挂载（`docker inspect` 看不到） |
+| Prometheus 认证 | ✅ Basic Auth（bcrypt 哈希在 `docker/prometheus/web.config.yml`，进 git；明文在 secret，gitignore） |
+| 凭据生成 | ✅ `docker run --rm httpd:alpine htpasswd -nbB <user> <pass>`（本机无 bcrypt 工具，promtool 3.5 也移除了该子命令） |
+| Meter 数量 Gauge | ✅ `shortlink.meter.count`（长稳排查的可观测性基础） |
+
+**⚠️ 核心看板 5 个指标**（`docker/grafana/dashboards/linkforge-core.json`，11 个面板）
+
+| # | 指标 | 作用 |
+|---|---|---|
+| 1 | 跳转 QPS | 一切的总入口；突降 = 挂了或被限流 |
+| 2 | P99 延迟 | 与第 2、3 周直接可比 |
+| 3 | L1 缓存命中率 | 第 2 周的核心成果，掉了说明缓存被绕过 |
+| 4 | 限流拒绝数 | 压测时必须为 0；生产非 0 = 有人在刷 |
+| 5 | 错误率（5xx / 4xx 分开） | 5xx 是硬故障；4xx 含正常的 404/410，必须分开看 |
+
+附加：JVM 内存（Metaspace/Heap/Code Cache）、已加载类数 + GC 次数、**meter 数量**（长稳排查）。
+
+### 阶段 2~4：待做
+
+- 阶段 2：看板导入验证（配置已就位，待 Grafana 镜像就绪后验证）
+- 阶段 3：8 小时长稳测试（Metaspace 排查）
+- 阶段 4：终极压测（同配置基线 + 调优版并列）
+
+---
+
 ## 第 1 周 — MVP 跑通（无缓存）+ 性能基线（🚧 进行中：**D1~D6 完成，基线已记录**）
 
 ### D5 启动验证结果（✅ 全部通过，D5 正式完成）

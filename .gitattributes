@@ -1,0 +1,36 @@
+# =============================================================================
+# 行尾规范（第 5 周）
+#
+# ⚠️ 为什么必须显式声明：
+#   Windows 检出的文件是 CRLF，Linux/Docker 里是 LF。
+#   容器里的 /bin/sh 读 CRLF 脚本会把 `set -e\r` 解析成
+#   `set -e` + 非法参数 `\r` -> "illegal option -"，
+#   且报错位置指向**后续行**，极具误导性（见 docs/TROUBLESHOOTING.md T-019）。
+#
+# 规则：
+#   *.sh text eol=lf        —— 必须在容器里执行的脚本，强制 LF
+#   *.java text eol=lf      —— Java 源文件用 LF（JDK 本身两种都能编译，但统一更好）
+#   *.xml text eol=lf
+#   *.yml text eol=lf       —— compose / k8s manifest
+#   *.sql text eol=lf
+#
+# ⚠️ `text` 而非 `text=auto`：auto 会让 Git 猜，
+#   而「猜错」的表现是「在 Windows 上好好的，在容器里炸」——
+#   那是最难排查的一类问题。显式指定没有猜测空间。
+# =============================================================================
+
+*.sh    text eol=lf
+*.java  text eol=lf
+*.xml   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.sql   text eol=lf
+*.lua   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.py    text eol=lf
+
+# 二进制文件：不做行尾转换
+*.jar   binary
+*.class binary
+*.rdb   binary

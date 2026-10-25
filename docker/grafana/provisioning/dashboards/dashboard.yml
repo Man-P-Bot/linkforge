@@ -1,0 +1,28 @@
+# =============================================================================
+# Grafana 看板声明（第 5 周）
+#
+# ⚠️ 为什么用「provider」而不是 `grafana-cli` 导入：
+#   provider 在 Grafana 启动时扫描目录并 upsert 看板 ——
+#   改完 JSON 重启容器即生效，且**幂等**（同 uid 覆盖而非重复创建）。
+#   `grafana-cli` 是命令式的一次性导入，每次改看板都要手动执行，易漏。
+#
+# ⚠️ `allowUiUpdates: false`：看板是**代码**的一部分，
+#   允许 UI 改会让人在界面上拖出一个「本地版本」，
+#   而仓库里的 JSON 仍是旧的 —— 两者不一致时没人知道哪个是真的。
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: 'linkforge'
+    orgId: 1
+    folder: 'LinkForge'
+    type: file
+    disableDeletion: false
+    # ⚠️ 改完 JSON 重启容器即生效
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      # 看板 JSON 存放目录（compose 里挂载到 /var/lib/grafana/dashboards）
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
