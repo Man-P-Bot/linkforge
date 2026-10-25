@@ -49,7 +49,27 @@ echo "   并发/线程: $CONNECTIONS / $THREADS"
 echo "   语料     : $CODE_LIST ($(wc -l < "$CODE_LIST") 条)"
 echo "   目标     : http://app:8080（compose 网络内服务名）"
 echo "════════════════════════════════════════════════════"
+echo ""
+echo "  手动停止（Ctrl+C 也会自动执行）："
+echo "    docker rm -f linkforge-longrun-wrk"
+echo "  查看进度："
+echo "    docker logs -f linkforge-longrun-wrk"
+echo ""
 
+# ⚠️ 兜底清理：Ctrl+C / Ctrl+\ / 脚本被 kill 时，
+#    容器**不会**因为 `--rm` 而自动删除（--rm 只在容器**正常退出**时生效）。
+#    不清理的话，它会继续吃 CPU 直到 8 小时结束 —— 压测已经停了，流量还在打，
+#    这会污染后续的所有测量。
+cleanup() {
+    echo ""
+    echo "==> 清理长稳压测容器"
+    docker rm -f linkforge-longrun-wrk >/dev/null 2>&1 || true
+    echo "==> 已清理"
+}
+trap cleanup EXIT INT TERM
+
+# ⚠️ `--rm` 让容器在**正常退出**时自动删除（8 小时跑完的场景）。
+#    异常中断（Ctrl+C）由上面的 trap 兜底。
 MSYS_NO_PATHCONV=1 docker run --rm --network "$NETWORK" \
     --name linkforge-longrun-wrk \
     -v "${SCRIPT_W}:/scripts:ro" \

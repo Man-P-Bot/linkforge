@@ -892,3 +892,166 @@ jvm_memory_used_bytes{area="nonheap", id="Metaspace"}
 > 结论会完全反过来。
 
 ---
+
+---
+
+### T-021 Docker Compose v2 在 Secret 文件**缺失**时不报错（静默故障）
+
+**现象**
+
+新 clone 的仓库跑 `docker compose up -d`，**一切正常**：
+
+```
+linkforge-app          Up (healthy)
+linkforge-prometheus   Up (healthy)
+linkforge-grafana      Up (healthy)
+```
+
+但：
+- Grafana 登不进去（admin 密码为空）；
+- Prometheus 的 Basic Auth 永远 401（连 healthcheck 都过不了，
+  但如果 healthcheck 没带凭据，它反而「正常」）。
+
+**根因**
+
+Compose v2 的 `secrets: { file: ./path }` 在文件**不存在**时**不报错**——
+它会挂一个**空目录**到 `/run/secrets/<name>`，容器照常启动。
+
+实测（最小复现）：
+
+```yaml
+services:
+  dummy:
+    image: busybox:1.36
+    secrets: [my_secret]
+secrets:
+  my_secret:
+    file: ./secrets/my_secret.txt   # ← 文件不存在
+```
+
+```
+$ docker compose up -d
+ Container clonetest2-dummy-1 Started     ← 成功！
+```
+
+⚠️ **危害在于它是静默的**：容器状态全是 healthy，没有任何日志提示。
+`docker compose config` 也不会报错（它只校验 YAML 结构，不检查文件存在性）。
+
+**解决**
+
+`scripts/setup-local.sh` 在启动前**显式生成** secret 文件（从 `.example` 模板），
+并做三项校验：
+
+1. Prometheus 的「明文密码」与「web.config.yml 里的 bcrypt 哈希」是否匹配；
+2. Grafana 的数据源健康检查是否 OK；
+3. secret 文件是否为纯明文单行（见 T-023）。
+
+> **教训**
+>
+> **「容器全绿」不等于「服务可用」。**
+>
+> 这个故障最难发现的地方在于：任何**只检查存在性**的验证都会通过
+> （容器在跑、端口在听、healthcheck 通过）。
+> 唯一可靠的验证是**检查功能**——真的拿凭据去请求一次。
+
+---
+
+### T-022 Grafana 的 `secureJsonData` **不会**被 upsert 覆盖（改密码必踩）
+
+**现象**
+
+改了 Prometheus 的密码并重建了 Prometheus：
+
+```
+$ curl -u "linkforge:新密码" http://localhost:9090/-/healthy
+HTTP 200                                    ← Prometheus 侧正常
+$ curl -u "admin:xxx" http://localhost:3000/api/datasources/1/health
+{"status":"ERROR", ...}                     ← Grafana 数据源失败
+```
+
+而且 Grafana 日志里 **provisioning 一切正常**，看板全是 No data。
+
+**根因**
+
+Grafana 的 datasource provisioning 对 `secureJsonData` 的处理是：
+**仅当数据源不存在时才写入密码**。
+
+这是 Grafana 的**刻意设计** —— 避免每次容器启动都用明文去覆盖已加密的密码
+（已存储的是密文，provisioning 里的是明文）。
+
+于是数据源已存在时（存在 Grafana 的数据卷里）：
+- `basicAuth: true` / `basicAuthUser` 会被 upsert 更新；
+- `secureJsonData.basicAuthPassword` **保持旧值不动**。
+
+⚠️ **迷惑性**：`GET /api/datasources/1` 显示
+`"secureJsonFields": {"basicAuthPassword": true}` —— 字段**确实存在**，
+只是内容是**旧密码**。看字段是否存在无法判断密码对不对。
+
+**解决**
+
+`scripts/reset-grafana-datasource.sh`（幂等）：
+
+1. 先试 API 删除数据源 —— provisioning 创建的是 `readOnly` 数据源，会 **403**；
+2. 403 则降级为「删 Grafana 数据卷重建」。
+
+⚠️ 降级会丢失**手工改过**的看板；本项目的看板全部是 provisioning 的
+（`docker/grafana/dashboards/*.json`），重建后自动恢复，所以对本项目无损。
+
+**改密码的完整流程**（`scripts/gen-prometheus-hash.sh` 的输出里也写了）：
+
+```bash
+bash scripts/gen-prometheus-hash.sh '新密码'      # 同步哈希 + 明文
+docker compose up -d --force-recreate prometheus  # ① Prometheus 加载新哈希
+bash scripts/reset-grafana-datasource.sh           # ② 重置 Grafana 数据源
+```
+
+> **教训**
+>
+> **「改了密码」是跨两个系统的操作，而配置同步往往不是自动的。**
+>
+> Prometheus 用哈希（进 git），Grafana 用密文（存数据库），
+> 明文只在 secret 文件里 —— 三份数据，必须显式同步。
+> 脚本化的价值不只是「省几行命令」，而是**把顺序写死**（漏了第 ② 步的后果极隐蔽）。
+
+---
+
+### T-023 Secret 文件必须是**纯明文单行**（注释会被当成密码）
+
+**现象**
+
+`docker/secrets/grafana_admin_password.txt` 是从带注释的模板复制的：
+
+```
+# Grafana admin 密码
+# 复制为 grafana_admin_password.txt 后修改。
+# ⚠️ 真实文件被 .gitignore 排除，不会进 git。
+change_me_grafana_admin_password
+```
+
+用户 `cat` 出这个文件，把**最后一行**当密码输入 → 登录失败。
+
+**根因**
+
+`GF_SECURITY_ADMIN_PASSWORD__FILE` 会把 secret 文件的**整个内容**当成密码，
+**包括每一行注释和中间的换行**。
+
+于是「用户看到的明文」与「程序实际使用的密码」**根本不是同一个字符串**。
+
+同样的问题会影响 Prometheus：
+- healthcheck 用 `$(cat /run/secrets/prometheus_basic_auth)` 构造 Basic Auth，
+  多行内容会让认证头畸形 → healthcheck 永远失败。
+
+**解决**
+
+**secret 真实文件 = 纯明文单行，一行不多。**
+
+- `.example` 模板也只放纯明文（说明文字移到 `setup-local.sh` 的输出与 README）；
+- `setup-local.sh` 复制时**剥离注释行**（兼容手写的带注释模板）。
+
+> **教训**
+>
+> **「给人看的文件」与「给程序用的文件」不是一回事。**
+>
+> 模板文件里加一行说明 seemed 很人性，但对「整文件即值」的消费者来说，
+> 那行说明就是密码的一部分。
+> 判据：**只要一个文件被整体当作配置值读取，它就只能有一个值。**

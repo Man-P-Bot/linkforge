@@ -35,4 +35,4 @@
 
 basic_auth_users:
   # 用户名: bcrypt 哈希（cost=5，htpasswd -nbB 的默认）
-  linkforge: $2y$05$cTCQS38/VEyqk5EfSGSRjeGpcohrj2HcXTYBDZUD0d5D9yLMNJtha
+  linkforge: $2y$05$EaKz.yYFrzlZ2Y/MNRJTuObGQtTfoBxrRTQ/1ZuVm1IlcM/2gSM96

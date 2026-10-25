@@ -7,7 +7,7 @@
 
 ## 当前进度
 
-**第 0 周：环境收口 —— 已完成。**
+**第 5 周：监控、部署与终极压测 —— 进行中（阶段 1~3 已完成）。**
 
 | 项 | 状态 |
 |---|---|
@@ -15,6 +15,9 @@
 | 构建 | Maven Wrapper（**Maven 3.9.12**），本地仓库在项目内 `.mvn-repo` |
 | MySQL | `mysql:8.4`（容器内 3306，**宿主机映射 3307**） |
 | Redis | `redis:7.4`（宿主机 6379，已启用 RDB） |
+| 监控 | Prometheus `v3.5.0` + Grafana `12.1.0`（全声明式 provisioning） |
+| 部署 | Docker Compose **一键起全套 5 个容器** |
+| 测试 | **611 全绿**（含 58 个真实 MySQL 容器测试 + 20 个真实 Redis 集成测试） |
 
 **前置需求**：Docker Desktop 已启动；`JAVA_HOME` 指向 **JDK 17**。
 
@@ -22,12 +25,46 @@
 
 ## 快速开始
 
+### 方式一：Docker Compose 一键起全套（推荐，含监控栈）
+
+```bash
+# 1. 初始化本地环境（生成 .env + Docker Secrets，并校验凭据一致性）
+bash scripts/setup-local.sh
+
+# 2. 启动全套 5 个容器
+docker compose up -d
+docker compose ps        # 期望 5 个服务全部 healthy
+
+# 3. 验证监控链路
+curl -u "linkforge:$(cat docker/secrets/prometheus_basic_auth.txt)" \
+     http://localhost:9090/api/v1/targets           # 期望 health="up"
+curl -u "admin:$(cat docker/secrets/grafana_admin_password.txt)" \
+     http://localhost:3000/api/datasources/1/health  # 期望 status="OK"
+```
+
+| 服务 | 地址 | 凭据 |
+|---|---|---|
+| 应用 | http://localhost:8080 | 无（公开接口） |
+| Prometheus | http://localhost:9090 | 用户名 `linkforge`，密码 `cat docker/secrets/prometheus_basic_auth.txt` |
+| Grafana | http://localhost:3000 | 用户名 `admin`，密码 `cat docker/secrets/grafana_admin_password.txt` |
+| MySQL | localhost:3307 | 见 `.env` |
+| Redis | localhost:6379 | 无密码（**已知风险**，见 [docs/PROGRESS.md](docs/PROGRESS.md)） |
+
+> ⚠️ **`setup-local.sh` 不是可选的装饰**。Docker Compose v2 在 Secret 文件**缺失**时
+> **不报错**——它会挂一个空目录进去，容器照常启动：
+> Grafana 的 admin 密码变空（登不进去）、Prometheus 的明文密码为空（永远 401），
+> 而**没有任何错误提示**。`setup-local.sh` 把这个静默故障变成启动前的显式校验。
+
+### 方式二：本地跑应用（开发调试用）
+
 ```powershell
 # 1. 准备环境变量（.env 只放本地占位值，已被 .gitignore 忽略）
 Copy-Item .env.example .env
+Copy-Item docker/secrets/grafana_admin_password.txt.example docker/secrets/grafana_admin_password.txt
+Copy-Item docker/secrets/prometheus_basic_auth.txt.example docker/secrets/prometheus_basic_auth.txt
 
 # 2. 启动 MySQL 与 Redis
-docker compose up -d
+docker compose up -d mysql redis
 docker compose ps          # 期望 linkforge-mysql、linkforge-redis 均 healthy
 
 # 3. 验证 Redis
@@ -54,6 +91,23 @@ docker compose exec redis redis-cli ping        # 期望 PONG
 > `jdbc:mysql://localhost:3307/linkforge?...`，应用进容器后由 compose 覆盖为
 > `jdbc:mysql://mysql:3306/linkforge?...`。另外 `MYSQL_USER` / `MYSQL_PASSWORD` 也由环境变量注入，
 > 代码里不硬编码任何账号密码。
+
+### 改监控凭据
+
+```bash
+# 生成 bcrypt 哈希，并同步「哈希（进 git）」与「明文（gitignore）」两处
+bash scripts/gen-prometheus-hash.sh '你的新密码'
+
+# ⚠️ 密码改完必须重建 Prometheus **并重置 Grafana 数据源**
+docker compose up -d --force-recreate prometheus
+bash scripts/reset-grafana-datasource.sh
+```
+
+> ⚠️ **第二步不能省**：Grafana 的 datasource provisioning **不会覆盖已存在数据源的
+> `secureJsonData`**（Grafana 刻意设计：避免每次启动都用明文覆盖已加密的密码）。
+> 于是 Prometheus 用了新密码、Grafana 数据源里存的还是**旧密码的密文** →
+> 数据源 401、面板全 No data，而 provisioning 日志一切正常。
+> 详见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
 ---
 
