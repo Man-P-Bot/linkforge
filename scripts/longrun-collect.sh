@@ -47,13 +47,20 @@ echo "长稳采集开始：$START_ISO  时长=${DURATION}s 间隔=${INTERVAL}s" 
 echo "输出：$LOG / $CSV" | tee -a "$LOG"
 
 # CSV 表头
-echo "timestamp,elapsed_sec,metaspace_bytes,heap_bytes,classes_loaded,meter_count,gc_count,pv_total" > "$CSV"
+echo "timestamp,elapsed_sec,metaspace_bytes,heap_bytes,classes_loaded,meter_count,gc_count,gc_full_count,pv_total,scrape_total" > "$CSV"
 
 # 取一个 Prometheus 指标的当前值。
 # ⚠️ 用 instant query（/api/v1/query）而不是 range query —— 采集要的是「此刻的值」。
 # ⚠️ 认证失败时返回空串而不是让脚本崩：一个采样点失败不该中断整个 8 小时采集。
 prom_query() {
     local q="$1"
+    # ⚠️⚠️ **必须把查询里的双引号换成单引号**。
+    #   `--data-urlencode "query=$q"` 是双引号包裹的，
+    #   而 $q 里若含双引号（比如 label 匹配器 uri="/actuator/prometheus"），
+    #   **shell 会把它当作结束引号** -> 参数被拆散 -> curl 收到残缺的查询 ->
+    #   Prometheus 返回空或报错，而脚本**不报错**（只取到空串）。
+    #   PromQL 的 string literal 单双引号等价（标准 SQL 风格），换成单引号即可。
+    q="${q//\"/\'}"
     if [ -n "$PROM_PASS" ]; then
         curl -s --max-time 15 -u "$PROM_USER:$PROM_PASS" \
             --data-urlencode "query=$q" "$PROM_URL/api/v1/query" 2>/dev/null
@@ -86,14 +93,30 @@ sample_once() {
     heap=$(prom_query 'jvm_memory_used_bytes{area="heap"}' | extract_value)
     classes=$(prom_query 'jvm_classes_loaded_classes' | extract_value)
     meter=$(prom_query 'shortlink_meter_count' | extract_value)
-    gc=$(prom_query 'jvm_gc_pause_seconds_count' | extract_value)
-    pv=$(prom_query 'http_server_requests_seconds_count{uri=~"/.*"}' | extract_value)
+    # ⚠️⚠️ **GC 必须对所有 cause 求和，不能取 r[0]**。
+    #   `jvm_gc_pause_seconds_count` 有**多条 series**（每个 GC cause 一条）：
+    #     cause="G1 Evacuation Pause"     -> 真正的 young GC（本项目 8 小时 14,387 次）
+    #     cause="Metadata GC Threshold"    -> 元空间专用 GC（本项目 8 小时 1 次）
+    #   而 `extract_value` 取 r[0]（label 排序第一条）拿到的是
+    #   **Metadata GC Threshold**（count=1）——
+    #   于是「8 小时只 GC 了 1 次」这个结论**完全错误**（差了 4 个数量级）。
+    #   修复：用 sum() 聚合，并**额外单列** Full GC 的计数。
+    gc=$(prom_query 'sum(jvm_gc_pause_seconds_count)' | extract_value)
+    gc_full=$(prom_query 'sum(jvm_gc_pause_seconds_count{action=~".*major.*"})' | extract_value)
+    # ⚠️ **PV 必须是跳转端点的总数**，不能用 r[0]：
+    #   `http_server_requests_seconds_count{uri=~"/.*"}` 的 r[0] 是
+    #   `/actuator/prometheus`（Prometheus 每 15s 抓一次），
+    #   它跟业务 PV 毫无关系。必须显式限定 uri=~"/{code}"。
+    pv=$(prom_query "sum(http_server_requests_seconds_count{uri=~'/{code}'})" | extract_value)
+    # 抓取端点的请求数（用于验证采集链路本身的健康度）
+    pv_scrape=$(prom_query "sum(http_server_requests_seconds_count{uri='/actuator/prometheus'})" | extract_value)
 
-    local line="$(date -Iseconds),$elapsed,$metaspace,$heap,$classes,$meter,$gc,$pv"
+    local line="$(date -Iseconds),$elapsed,$metaspace,$heap,$classes,$meter,$gc,$gc_full,$pv,$pv_scrape"
     echo "$line" >> "$CSV"
 
-    printf "[%6ss] Metaspace=%-12s Heap=%-12s Classes=%-9s Meters=%-6s GC=%s\n" \
-        "$elapsed" "${metaspace:-N/A}" "${heap:-N/A}" "${classes:-N/A}" "${meter:-N/A}" "${gc:-N/A}" | tee -a "$LOG"
+    printf "[%6ss] Metaspace=%-12s Heap=%-12s Classes=%-9s Meters=%-6s GC=%-8s FullGC=%-6s PV=%-12s Scrape=%s\n" \
+        "$elapsed" "${metaspace:-N/A}" "${heap:-N/A}" "${classes:-N/A}" "${meter:-N/A}" \
+        "${gc:-N/A}" "${gc_full:-N/A}" "${pv:-N/A}" "${pv_scrape:-N/A}" | tee -a "$LOG"
 
     # ⚠️ 同时记一份 jcmd 的类加载统计（每 2 小时一次，太频繁会拖慢 JVM）。
     if [ $((elapsed % 7200)) -eq 0 ] && [ "$elapsed" -gt 0 ]; then
