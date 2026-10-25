@@ -270,6 +270,48 @@ services:
     networks:
       - default
 
+  # ===========================================================================
+  # jdk-tools —— 诊断工具容器（**默认不启动**，仅在需要 jcmd 深挖时用）
+  #
+  # 为什么需要它：
+  #   应用镜像用的是 **JRE**（eclipse-temurin:17-jre-jammy），
+  #   **不含 JDK 工具**（jcmd / jstack / jmap 都没有）。
+  #   而宿主机的 jcmd（Windows）**无法 attach** 到容器内的 JVM
+  #   （不同 PID namespace，且宿主是 Windows）。
+  #
+  # 做法：用 `pid: "service:app"` 让本容器**共享 app 的进程空间**，
+  #       再用 `SYS_PTRACE` 能力 attach 进去。
+  #   这是 jattach / arthas 官方推荐的跨容器 attach 方式。
+  #
+  # ⚠️ **用 profile 隔离**：默认 `docker compose up -d` 不会启动它，
+  #    也不会拉它的镜像（JDK 镜像比 JRE 大 ~150MB）。
+  #    只有真的需要诊断时才用：
+  #       docker compose --profile diagnose run --rm --no-deps jdk-tools \
+  #           jcmd 1 GC.class_histogram
+  #
+  # ⚠️ **多数情况下不需要它**：Micrometer 已经暴露了
+  #    jvm_classes_loaded_classes（存活类数）与
+  #    jvm_classes_unloaded_classes_total（累计卸载数）。
+  #    本项目观察到 unloaded_total 恒为 0 ——
+  #    即「类加载器从未被回收」⇒ **Metaspace 增长 ≡ 累计加载了新类**，
+  #    这在**机制上**就足以判定方向，不需要 jcmd 的快照。
+  #    jcmd 只在需要**具体类名分布**时才有不可替代的价值。
+  # ===========================================================================
+  jdk-tools:
+    image: eclipse-temurin:17-jdk-jammy
+    container_name: linkforge-jdk-tools
+    profiles:
+      - diagnose
+    # ⚠️ 共享 app 的 PID namespace —— 这样 jcmd 能看到 app 的 JVM 进程
+    pid: "service:app"
+    # ⚠️ attach 需要 ptrace 能力
+    cap_add:
+      - SYS_PTRACE
+    # 诊断是一次性的，用完即退（不设 restart）
+    command: ["jcmd", "help"]
+    networks:
+      - default
+
 volumes:
   mysql-data:
     name: linkforge-mysql-data

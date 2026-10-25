@@ -54,6 +54,19 @@ curl -u "admin:$(cat docker/secrets/grafana_admin_password.txt)" \
 > **不报错**——它会挂一个空目录进去，容器照常启动：
 > Grafana 的 admin 密码变空（登不进去）、Prometheus 的明文密码为空（永远 401），
 > 而**没有任何错误提示**。`setup-local.sh` 把这个静默故障变成启动前的显式校验。
+>
+> 📌 **本项目提供一键启动脚本 `scripts/setup-local.sh`，已为你自动规避了 4 个常见的
+> Docker 部署静默故障（详见 [docs/PITFALLS.md](docs/PITFALLS.md)）**：
+>
+> | # | 故障 | 为什么危险 |
+> |---|---|---|
+> | 1 | Compose 在 Secret 文件**缺失**时**不报错** | 容器全 healthy，但密码是空的，**没有任何提示** |
+> | 2 | Grafana 的 `secureJsonData` **不会被 upsert 覆盖** | 改密码后数据源 401、面板全 No data，而 **provisioning 日志一切正常** |
+> | 3 | Secret 文件带了注释 → **注释成了密码的一部分** | 用户看到的明文 ≠ 程序实际用的密码 |
+> | 4 | Windows 的 CRLF → **密码多一个 `\r`** | `curl` 能通、**浏览器登不进去**，最易误判 |
+>
+> 这 4 条的共同点是：**静态检查全过 ≠ 功能可用**。
+> 所以 `setup-local.sh` 的校验全部是**功能级**的——真的拿凭据请求一次。
 
 ### 方式二：本地跑应用（开发调试用）
 
@@ -192,3 +205,7 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 | [API.md](docs/API.md) | 接口契约、错误码、版本策略 |
 | [DECISIONS.md](docs/DECISIONS.md) | 决策记录 DR-001 起 |
 | [PROGRESS.md](docs/PROGRESS.md) | 进度台账 |
+| [PERFORMANCE.md](docs/PERFORMANCE.md) | 压测数据、口径声明、资源水位 |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 排障手册：20 条踩过的坑（现象 → 根因 → 解法） |
+| [PITFALLS.md](docs/PITFALLS.md) | **防呆清单**：4 个 Docker 部署静默故障的共性判据 + 自动化防线 + 一分钟自检 |
+| [RESUME-DRAFT.md](docs/RESUME-DRAFT.md) | 简历素材草稿（STAR 法则，3 个可追问的技术故事） |

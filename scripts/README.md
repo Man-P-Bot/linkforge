@@ -11,6 +11,10 @@
 | `final-bench.sh` | **第 5 周终极压测**（阶段 4）。完整流程：造数 → 停监控 → 重启 app → 等布隆 → 预热 → 3×30s 取中位数 + 60s 补充 → 恢复监控 |
 | `longrun-load.sh` | **长稳压测**（阶段 3）。低强度持续流量 `wrk -t2 -c10 -d8h`，用于 Metaspace 泄漏排查 |
 | `longrun-collect.sh` | **长稳采集**（阶段 3）。每 30 分钟从 Prometheus 采 Metaspace / 已加载类数 / meter 数三条曲线，每 2 小时附 jcmd 类加载统计 |
+| `longrun-watch.sh` | **长稳看护**（阶段 3）。每 60 秒读 Prometheus，**Metaspace 单次跳变 > 5MB 立即抓类加载分布** |
+| `setup-local.sh` | **一键初始化**（第 5 周）。生成 `.env` + Docker Secrets，并**实测校验**凭据一致性（详见 [docs/PITFALLS.md](../docs/PITFALLS.md)） |
+| `gen-prometheus-hash.sh` | 改 Prometheus 密码时**同步** bcrypt 哈希（进 git）与明文（gitignore）两处 |
+| `reset-grafana-datasource.sh` | 改密码后**重置 Grafana 数据源**（幂等）——Grafana 的 `secureJsonData` 不会被 upsert 覆盖 |
 | `wrk-percentile.lua` | 分位数采集辅助脚本 |
 
 ### 第 5 周两个脚本的关键差异
