@@ -5,8 +5,8 @@
 # 目的：让「没有任何密钥、刚 clone 仓库的人」敲一条命令就能起起全套。
 #
 # 它做四件事：
-#   1. .env.example  -> .env（已存在则跳过，不覆盖用户改动）
-#   2. docker/secrets/*.example -> 真实 secret 文件（已存在则跳过）
+#   1. .env.example  -> .env（已存在则跳过，**绝不覆盖**；已存在但不可用则报错）
+#   2. docker/secrets/*.example -> 真实 secret 文件（同上）
 #   3. 校验 Prometheus 的「明文密码」与「bcrypt 哈希」是否匹配
 #   4. 打印访问方式（含初始密码的获取命令）
 #
@@ -20,8 +20,19 @@
 #   这是一个「静默故障」：一切看起来正常，但用不了。
 #   本脚本把它变成「启动前的一次显式校验」。
 #
+# ⚠️ 为什么「已存在」不等于「可用」（本版本新增的关键修复）：
+#   早先的实现是「文件存在就跳过」。但**存在但内容是坏的**同样会静默失败：
+#     - .env 为空 / 缺关键变量 -> Compose 与 Spring 在**启动时**才报错，
+#       报错信息是一长串变量清单或占位符异常，不告诉用户「少了哪一行」；
+#     - secret 文件为空 / 只有注释 -> Grafana 拿到空密码，容器照样 healthy，
+#       但 admin 登不进去。
+#   「存在即跳过」会把这类坏状态**永久固化**下来，用户永远不知道为什么登不上。
+#   因此现在的语义是：**存在且可用 -> 跳过；存在但不可用 -> 明确报错并停止**，
+#   任何情况下都不静默覆盖。
+#
 # 用法：
-#   bash scripts/setup-local.sh
+#   bash scripts/setup-local.sh            # 幂等：已存在就跳过
+#   bash scripts/setup-local.sh --force    # 强制重建（先把旧文件备份成 *.bak）
 #
 # 跨平台：Git Bash / Linux / macOS 均可（纯 POSIX sh 语法）。
 # =============================================================================
@@ -32,22 +43,150 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
+# -----------------------------------------------------------------------------
+# 0. 参数与通用工具
+# -----------------------------------------------------------------------------
+FORCE=0
+
+usage() {
+    cat << 'USAGE'
+用法：
+    bash scripts/setup-local.sh            幂等初始化：已存在的 .env / secret 一律跳过
+    bash scripts/setup-local.sh --force    强制重建（先把旧文件备份成 *.bak 再重建）
+
+⚠️ 默认行为**永不覆盖**已有配置。
+   只有 --force 才会重建，且重建前一定先把旧文件备份成 <name>.<时间戳>.bak。
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) FORCE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "[参数] ❌ 未知参数：$1"
+            echo ""
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# 备份一个已存在的文件（只在 --force 时调用）。
+# ⚠️ 备份名**必须以 .bak 结尾**：
+#    .gitignore 只忽略 `*.bak`，若命名成 `.env.bak.20260101` 就不匹配任何忽略规则 ——
+#    一份含 MySQL 密码的备份被误提交，是最坏的结果。
+#    现在这个命名（.env.<时间戳>.bak）同时命中 `*.bak` 与 `.env.*`，双保险。
+backup_file() {
+    local target="$1"
+    [ -f "${target}" ] || return 0
+    local stamp bak
+    stamp="$(date +%Y%m%d%H%M%S)"
+    bak="${target}.${stamp}.bak"
+    cp -p "${target}" "${bak}"
+    echo "      ↺ 已备份 ${target} -> ${bak}（确认无误后可自行删除）"
+}
+
+# 从 KEY=VALUE 文件里读取某个键的值（取第一处生效的）。
+# 用 awk 而不是 sed：
+#   - sed 里写 s/^KEY=// 时，KEY 若含正则元字符会出错；
+#   - awk 能顺带跳过注释行、空行与 `export ` 前缀。
+env_get() {
+    local key="$1" file="$2"
+    [ -f "${file}" ] || return 0
+    awk -v key="${key}" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+            eq = index(line, "=")
+            if (eq == 0) next
+            k = substr(line, 1, eq - 1)
+            v = substr(line, eq + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            if (k == key) { print v; exit }
+        }
+    ' "${file}" | tr -d '\r'
+}
+
 echo "==> LinkForge 本地环境初始化"
 echo "    仓库根目录: ${ROOT_DIR}"
+if [ "${FORCE}" -eq 1 ]; then
+    echo "    ⚠️  --force：已存在的 .env / secret 会被**备份后重建**"
+fi
 echo ""
 
 # -----------------------------------------------------------------------------
 # 1. .env
 # -----------------------------------------------------------------------------
-if [ -f ".env" ]; then
-    echo "[1/4] ✅ .env 已存在 —— 跳过（不覆盖你的改动）"
-else
-    if [ ! -f ".env.example" ]; then
-        echo "[1/4] ❌ 找不到 .env.example —— 仓库不完整？"
+ENV_FILE=".env"
+ENV_EXAMPLE=".env.example"
+
+# 关键变量清单 = docker-compose.yml 里 `:?` 硬失败项 与 scripts/run-local.ps1
+# 的 $required 两者的**并集**，少任何一个都起不来：
+#   - compose 用 `:?` 的：MYSQL_ROOT_PASSWORD / MYSQL_DATABASE / MYSQL_USER /
+#     MYSQL_PASSWORD / SHORTLINK_BASE_URL / ADMIN_API_TOKEN
+#   - run-local.ps1 额外要：SPRING_DATASOURCE_URL
+#
+# ⚠️ 为什么要在这一步查：这两处都是**启动时**才报错，
+#    一个是 Compose 的长串变量清单，一个是 Spring 的占位符异常，
+#    都不告诉用户「.env 里少了哪一行」。这里直接点名。
+ENV_REQUIRED_KEYS="MYSQL_ROOT_PASSWORD MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD SPRING_DATASOURCE_URL SHORTLINK_BASE_URL ADMIN_API_TOKEN"
+
+# 返回 0 = 可用；非 0 = 不可用（原因打印到 stdout）
+check_env_usable() {
+    local file="$1"
+    local missing="" key value
+    if [ ! -s "${file}" ]; then
+        echo "文件为空"
+        return 1
+    fi
+    for key in ${ENV_REQUIRED_KEYS}; do
+        value="$(env_get "${key}" "${file}")"
+        if [ -z "${value}" ]; then
+            missing="${missing} ${key}"
+        fi
+    done
+    if [ -n "${missing}" ]; then
+        echo "缺少必需变量（或值为空）：${missing}"
+        return 1
+    fi
+    return 0
+}
+
+if [ -e "${ENV_FILE}" ] && [ ! -f "${ENV_FILE}" ]; then
+    # 目录 / 指向目录的符号链接 / 设备文件等
+    echo "[1/4] ❌ ${ENV_FILE} 存在但不是普通文件（目录？符号链接？）"
+    echo "         为安全起见不做任何写入，请手动检查后重跑。"
+    exit 1
+fi
+
+if [ -f "${ENV_FILE}" ] && [ "${FORCE}" -eq 0 ]; then
+    env_reason="$(check_env_usable "${ENV_FILE}" || true)"
+    if [ -z "${env_reason}" ]; then
+        echo "[1/4] ✅ 检测到已存在的 ${ENV_FILE}，跳过生成，保留现有配置"
+    else
+        echo "[1/4] ❌ 检测到已存在的 ${ENV_FILE}，但它**不可用**：${env_reason}"
+        echo "         不会静默覆盖你的文件。修复二选一："
+        echo "           ① 手动补齐上述变量后重跑本脚本"
+        echo "           ② 确认要推倒重来：bash scripts/setup-local.sh --force"
+        echo "              （会先把旧文件备份成 *.bak 再重建）"
         exit 1
     fi
-    cp ".env.example" ".env"
-    echo "[1/4] ✅ 已从 .env.example 生成 .env"
+else
+    if [ ! -f "${ENV_EXAMPLE}" ]; then
+        echo "[1/4] ❌ 找不到 ${ENV_EXAMPLE} —— 仓库不完整？"
+        exit 1
+    fi
+    if [ "${FORCE}" -eq 1 ] && [ -f "${ENV_FILE}" ]; then
+        backup_file "${ENV_FILE}"
+    fi
+    cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+    # .env 里有数据库密码：仅本人可读写
+    chmod 600 "${ENV_FILE}" 2>/dev/null || true
+    echo "[1/4] ✅ 已从 ${ENV_EXAMPLE} 生成 ${ENV_FILE}"
 fi
 
 # -----------------------------------------------------------------------------
@@ -64,11 +203,37 @@ fi
 #    （Docker Secrets 的官方示例也是纯内容，无注释。）
 mkdir -p "docker/secrets"
 created=0
+kept=0
 for example in docker/secrets/*.example; do
     [ -e "${example}" ] || continue
     target="${example%.example}"
-    if [ -f "${target}" ]; then
-        echo "[2/4] ✅ ${target} 已存在 —— 跳过"
+
+    if [ -e "${target}" ] && [ ! -f "${target}" ]; then
+        echo "[2/4] ❌ ${target} 存在但不是普通文件 —— 不做任何写入"
+        exit 1
+    fi
+
+    if [ -f "${target}" ] && [ "${FORCE}" -eq 0 ]; then
+        # 已存在 -> **校验内容**，而不是无脑跳过。
+        # ⚠️ 为什么必须校验：Compose 在 secret 文件**缺失**时不报错；
+        #    但「文件存在而内容是空的」同样让 Grafana 拿到空密码 ->
+        #    容器照常 healthy，但 admin 登不进去，且没有任何错误提示。
+        #    「存在即跳过」会把这种坏状态**永久固化**下来。
+        secret_lines="$(grep -v '^[[:space:]]*#' "${target}" | grep -v '^[[:space:]]*$' | tr -d '\r' || true)"
+        if [ -z "${secret_lines}" ]; then
+            echo "[2/4] ❌ ${target} 已存在但内容为空 / 只有注释"
+            echo "         Grafana 会把空字符串当密码 -> 容器能起、但**登不进去**（静默故障）"
+            echo "         不会静默覆盖。修复二选一："
+            echo "           ① 手动写入一行明文密码"
+            echo "           ② 确认要重建：bash scripts/setup-local.sh --force"
+            exit 1
+        fi
+        line_count="$(printf '%s\n' "${secret_lines}" | awk 'END{print NR}')"
+        if [ "${line_count}" -gt 1 ]; then
+            echo "[2/4] ⚠️  ${target} 含 ${line_count} 行内容 —— Grafana 会把**整段**当密码，确认这是你想要的"
+        fi
+        echo "[2/4] ✅ 检测到已存在的 ${target}，跳过生成，保留现有内容"
+        kept=$((kept + 1))
     else
         # 取「最后一行非注释、非空」的内容作为明文（兼容带注释头的旧模板）
         plain_only="$(grep -v '^[[:space:]]*#' "${example}" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '\r')"
@@ -76,12 +241,22 @@ for example in docker/secrets/*.example; do
             echo "[2/4] ❌ ${example} 里找不到明文（全是注释？）"
             exit 1
         fi
-        printf '%s\n' "${plain_only}" > "${target}"
+        if [ "${FORCE}" -eq 1 ] && [ -f "${target}" ]; then
+            backup_file "${target}"
+        fi
+        # 先写临时文件再 mv：避免写到一半被 Ctrl-C 打断，
+        # 留下一个「半截 secret」—— 那比重建更难排查。
+        printf '%s\n' "${plain_only}" > "${target}.tmp"
+        mv "${target}.tmp" "${target}"
+        chmod 600 "${target}" 2>/dev/null || true
         echo "[2/4] ✅ 已从模板生成 ${target}（已剥离注释，只保留明文单行）"
         created=$((created + 1))
     fi
 done
-if [ "${created}" -eq 0 ]; then
+
+if [ "${created}" -eq 0 ] && [ "${kept}" -gt 0 ]; then
+    echo "[2/4] ✅ 所有 secret 均已就绪（未改动任何现有凭据）"
+elif [ "${created}" -eq 0 ]; then
     echo "[2/4] ✅ 所有 secret 均已就绪"
 fi
 
