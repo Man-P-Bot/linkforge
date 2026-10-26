@@ -19,12 +19,33 @@
   - [T-001 Maven Wrapper 报 "extracted distribution has no bin/mvn"](#t-001-maven-wrapper-报-extracted-distribution-has-no-binmvn)
   - [T-002 Testcontainers 拉取 ryuk 镜像卡死](#t-002-testcontainers-拉取-ryuk-镜像卡死)
   - [T-003 Spring 上下文启动失败：ADMIN_API_TOKEN 未设置](#t-003-spring-上下文启动失败admin_api_token-未设置)
+  - [T-019 Windows 的 CRLF 行尾会让 `/bin/sh` 脚本崩在第一行](#t-019-windows-的-crlf-行尾会让-binsh-脚本崩在第一行)
 - [数据库](#数据库)
-  - [T-010 `VALUES()` 在 MySQL 8.0.20+ 已 deprecated](#t-010-values-在-mysql-8020-已-deprecated)
+  - [T-010 `VALUES()` 在 MySQL 8.0.20+ 已 deprecated —— 已修复（2026-10-24）](#t-010-values-在-mysql-8020-已-deprecated--已修复2026-10-24)
   - [T-011 过期扫描查询走全表扫描](#t-011-过期扫描查询走全表扫描)
-  - [T-012 `IncorrectResultSizeDataAccessException`：查询少了一个维度](#t-012-incorrectresultSizedataaccessexception查询少了一个维度)
+  - [T-011b 小表上 EXPLAIN 的 `key` 不可信 —— 断言必须换个方式](#t-011b-小表上-explain-的-key-不可信--断言必须换个方式)
+  - [T-011c `information_schema.statistics` 是**每列一行**](#t-011c-information_schemastatistics-是每列一行)
+  - [T-012 `IncorrectResultSizeDataAccessException`：查询少了一个维度](#t-012-incorrectresultsizedataaccessexception查询少了一个维度)
 - [Redis](#redis)
-- [测试](#测试)
+  - [T-028 统计的 HLL key 驻留 35 天，而不是「当天」→ 内存上界比设计高 35 倍](#t-028-统计的-hll-key-驻留-35-天而不是当天-内存上界比设计高-35-倍)
+- [缓存与布隆](#缓存与布隆)
+  - [T-027 布隆重建的「原子切换」覆盖了重建期间新建的短码 → 假阴性 404](#t-027-布隆重建的原子切换覆盖了重建期间新建的短码--假阴性-404)
+- [监控与可观测性](#监控与可观测性)
+  - [T-015 Micrometer 的 `baseUnit` 会给 Prometheus 指标名**追加后缀**](#t-015-micrometer-的-baseunit-会给-prometheus-指标名追加后缀)
+  - [T-017 Grafana 的 datasource provisioning 不支持环境变量插值](#t-017-grafana-的-datasource-provisioning-不支持环境变量插值)
+  - [T-018 Grafana provisioning 缺子目录 → **datasource 静默不加载**](#t-018-grafana-provisioning-缺子目录--datasource-静默不加载)
+  - [T-020 Micrometer 的 `jvm.memory.used` 里，Metaspace 的 `area` 是 **nonheap**](#t-020-micrometer-的-jvmmemoryused-里metaspace-的-area-是-nonheap)
+  - [T-022 Grafana 的 `secureJsonData` **不会**被 upsert 覆盖（改密码必踩）](#t-022-grafana-的-securejsondata-不会被-upsert-覆盖改密码必踩)
+- [部署与 Docker Secrets](#部署与-docker-secrets)
+  - [T-021 Docker Compose v2 在 Secret 文件**缺失**时不报错（静默故障）](#t-021-docker-compose-v2-在-secret-文件缺失时不报错静默故障)
+  - [T-023 Secret 文件必须是**纯明文单行**（注释会被当成密码）](#t-023-secret-文件必须是纯明文单行注释会被当成密码)
+  - [T-024 Windows 的 CRLF 会让 **Secret 密码多一个 `\r`**（Windows 专有）](#t-024-windows-的-crlf-会让-secret-密码多一个-rwindows-专有)
+- [测试与压测工具](#测试与压测工具)
+  - [T-013 Testcontainers 的 `@Container` 注解会让**多个测试类互相踩死**](#t-013-testcontainers-的-container-注解会让多个测试类互相踩死)
+  - [T-014 `System.getenv` 会**绕过 Spring 的属性源**](#t-014-systemgetenv-会绕过-spring-的属性源)
+  - [T-016 `docker compose pull` 会被 Docker Hub 限速卡住（几分钟到几十分钟）](#t-016-docker-compose-pull-会被-docker-hub-限速卡住几分钟到几十分钟)
+  - [T-025 从带标签的输出里取数：**不要用「会匹配到标签本身」的正则**](#t-025-从带标签的输出里取数不要用会匹配到标签本身的正则)
+  - [T-026 用 Docker 镜像加速拉取，绕开 Docker Hub 限速](#t-026-用-docker-镜像加速拉取绕开-docker-hub-限速)
 
 ---
 
@@ -146,9 +167,53 @@ ADMIN_API_TOKEN: test_only_admin_token_for_integration_tests
 
 ---
 
+### T-019 Windows 的 CRLF 行尾会让 `/bin/sh` 脚本崩在第一行
+
+**现象**
+
+Grafana 容器反复重启，日志：
+
+```
+/etc/grafana/entrypoint.sh: line 26: : not found
+/etc/grafana/entrypoint.sh: set: line 27: illegal option -
+```
+
+**根因**
+
+在 Windows 上用编辑器/工具写的 `.sh` 文件是 **CRLF** 行尾。
+`/bin/sh` 读到 `set -e\r` 时，把 `\r` 当成参数的一部分 → `illegal option -`。
+
+⚠️ 症状出现在**第 26/27 行**，而真正的错误在**文件开头**——
+`set -e` 那行就已经坏了，只是错误信息指向后续行。
+
+**解决**
+
+确保是 LF 行尾：
+
+```python
+s = io.open(p, encoding="utf-8", newline="").read()
+s = s.replace("\r\n", "\n").replace("\r", "\n")
+io.open(p, "w", encoding="utf-8", newline="\n").write(s)
+```
+
+⚠️ 更根本的做法：在 `.gitattributes` 里强制
+```
+*.sh text eol=lf
+```
+否则每个从 Windows clone 仓库的人都会踩。
+
+**教训**
+
+> **跨平台的行尾问题在容器里表现为「脚本语法错误」，但报错位置会误导。**
+>
+> `illegal option -` 这条信息指向 `set` 命令，而 `set` 本身没问题 ——
+> 真正的问题是它后面多了个 `\r`。
+
+---
+
 ## 数据库
 
-### T-010 `VALUES()` 在 MySQL 8.0.20+ 已 deprecated —— ✅ **已修复（2026-10-24）**
+### T-010 `VALUES()` 在 MySQL 8.0.20+ 已 deprecated —— 已修复（2026-10-24）
 
 > **状态：已修复。** 本项目已改用 `AS new` 别名语法，
 > 迁移记录见下方「修复」一节与 `StatsMapper.xml` 的注释。
@@ -386,7 +451,9 @@ expected: "idx_expire_status"
 ⚠️ **所以「断言 EXPLAIN 的 `key` 等于某个索引」这种写法，在小表上必然不稳定**——
 它测的是「表的行数够不够大」，不是「索引对不对」。
 
-**正确的断言方式**（与数据量无关）：
+**解决**
+
+正确的断言方式（与数据量无关）：
 
 ```java
 // ① 优化器有资格用它
@@ -489,15 +556,558 @@ Incorrect result size: expected 1, actual 2
 
 ## Redis
 
-（本阶段暂无）
+### T-028 统计的 HLL key 驻留 35 天，而不是「当天」→ 内存上界比设计高 35 倍
+
+**现象**
+
+按 `docs/DATABASE.md` §9.2 的估算，HLL（HyperLogLog）内存上界约 **1.2GB**（10 万活跃链路 × 12KB）。
+但在 Redis 里实际看到的 HLL key 数量远超预期，内存占用也比设计高一个量级。
+
+**根因**
+
+设计要求「HLL key 只在当天存活，落库后立即释放」，
+但**实现只做了一半**：
+
+| 设计要求 | 实现 | 出处 |
+|---|---|---|
+| 落库后释放 UV key | ❌ **不释放**：flush 用 `PFCOUNT`（只读）取 UV 估算值 | `StatsFlushService` 落库流程 |
+| TTL 到当天结束即过期 | ❌ **TTL 是 35 天** | `StatsKeys.KEY_TTL = Duration.ofDays(35)` |
+| 双重保证（TTL + 落库清理） | ⚠️ 只有 TTL 一重 | — |
+
+对照 **PV key** 就更明显：PV 用的是 `GETDEL`（「取走即删」），
+所以 PV key 落库后**当场消失**；UV 只 `PFCOUNT` 不删，于是**留到 TTL 到期**。
+
+**实际驻留上界**：35 天 × 10 万活跃链路 × 12KB ≈ **42GB**，
+是 §9.2 原估（1.2GB）的 **35 倍**。
+
+**为什么现在没炸**：真实负载下活跃链路数远低于 PRD 的 10 万假设
+（压测语料只有 1 万条），且 Redis 有 `maxmemory` 保护。
+**但这是「量还没到」，不是「设计对了」。**
+
+**解决**
+
+⚠️ **本条尚未修复**。推荐做法（与 T-027 一起做更划算）：
+
+1. flush 成功后**主动删除**当日 UV key（对齐 PV 的「取走即删」）；
+2. 把 UV key 的 TTL 改成「当天结束 + 余量」，而不是固定 35 天；
+3. 保留 35 天 TTL 作为**兜底**（防止漏删的 key 永久驻留）；
+4. 补一个**内存上界监控**：Redis `used_memory` + HLL key 数量，
+   并在 Grafana 里画出来 —— 上界问题应该在**发生前**被看见。
+
+**教训**
+
+> **「取走即删」是累加型统计能安全重试的前提**（见 §8.2）。
+> 但它只对**增量**成立：UV 是**累计估算**，`PFCOUNT` 天然是只读的，
+> 于是「取走即删」这条链路在 UV 上断了 ——
+> **同一个设计里，两种语义需要两种处理方式，不能只实现一种。**
 
 ---
 
-## 测试
 
-（本阶段暂无）
+## 缓存与布隆
+
+> 这一节的坑都围绕「缓存/布隆的正确性」，而不是「性能」。
+> 性能类结论在 `docs/PERFORMANCE.md`，决策理由在 `docs/DECISIONS.md`。
+
+### T-027 布隆重建的「原子切换」覆盖了重建期间新建的短码 → 假阴性 404
+
+**现象**
+
+一个**刚创建**的短码，第一次访问就返回 **404**。
+但短码明明刚写进 MySQL，`status=0`、未过期、`expire_at IS NULL`。
+
+**什么情况下出现**
+
+| 条件 | 说明 |
+|---|---|
+| 时间窗口 | 恰好落在**布隆定时重建的运行期间**（默认每小时一次） |
+| 短码创建时刻 | 在重建的数据库扫描**游标越过该短码 id 之后** |
+| 复现频率 | 窗口很窄（分钟级），所以表现为「偶发」 |
+
+**根因**
+
+重建是「双缓冲 + 原子切换」，但**写穿没有双写**：
+
+| 环节 | 实际实现 | 出处 |
+|---|---|---|
+| 创建时写穿 | 只写**现行 key** `shortlink:bloom` | `RedisBloomFilter.put()` |
+| 重建 | 只写 `:building`，最后 `RENAME` **覆盖**现行 key | `RedisBloomFilter.rebuild()` |
+| 重建扫描 | 按 `id > afterId` 游标分批扫全库 | `BloomFilterMaintenance.rebuild()` |
+
+时间线：
+
+```
+t0  重建开始：扫 id <= 1000，写入 :building
+t1  重建扫过 id=1000，游标继续往上走
+t2  用户创建短码 id=1001  →  put() 写进【现行 key】
+t3  重建扫到 id=1001（也可能没扫到，取决于扫描进度）
+t4  RENAME :building → shortlink:bloom   ← 现行 key 被【覆盖】
+t5  访问 id=1001 → 布隆判「不存在」→ 404
+```
+
+⚠️ **关键**：`RENAME` 是**覆盖**语义（Redis 的 `RENAME` 覆盖目标 key），
+不是合并。`:building` 里没有的位，切换后就**彻底没了**。
+
+**为什么这条设计当初是对的、现在错了**
+
+原始设计（DR-007）明确要求「构建期间，创建操作的写穿**同时写新旧两份**」。
+**代码里从来没实现这个双写** —— 文档写了，设计是对的，实现漏了。
+这是「文档与实现不一致」的一个典型：设计评审通过 ≠ 实现完成。
+
+⚠️ **这条其实早就被发现过**（`docs/DECISIONS.md` **DR-055**，第 3 周压测前实测到），
+但当时给出的处置是「v1 先绕过，v2 再优化」：
+压测脚本造数后**必须等日志出现「布隆全量重建完成：N 条」才能开始打流量**。
+第 6 周收尾核对时发现：**DR-007 的正文至今仍写着「写穿同时写新旧两份」**，
+读者会以为双写已经实现 —— 这是**文档与实现不一致**，本条就是来补这个洞的。
+
+**解决**
+
+⚠️ **本条尚未修复**，是第 6 周收尾审计新发现的问题。三种修法：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **A（推荐）** | 引入 `rebuilding` 状态标志；标志为真时 `put()` **同时写现行 key 与 `:building`** | 需要一个跨实例可见的状态（Redis key 或 DB 标志） |
+| B | 重建结束时不做覆盖式 `RENAME`，而是把**现行 key 的位并入** `:building` 再切换 | `SETBIT` 逐位并集成本高（9500 万位），需要改用 `BITOP` |
+| C | 缩短重建间隔，缩小窗口 | 只降低概率，不消除问题；且重建本身有开销 |
+
+**推荐的验证方式**（修复后必须补）：
+
+1. 在测试里**卡住**重建（mock 住扫描，让它停在游标中间）；
+2. 期间创建一个新短码；
+3. 放行重建完成；
+4. 断言该短码**仍能被布隆判为存在**（或至少：跳转不返回 404）。
+
+**教训**
+
+> **「双缓冲 + 原子切换」这个模式本身是对的，
+> 前提是切换前新数据已经进了新缓冲。**
+>
+> 没有双写，双缓冲只是把「删除即丢」换成了「切换即丢」——
+> 窗口从「DEL 到 RENAME 之间」变成了「整个重建期间」。
 
 ---
+
+## 监控与可观测性
+
+### T-015 Micrometer 的 `baseUnit` 会给 Prometheus 指标名**追加后缀**
+
+**现象**
+
+在 Grafana 里查 `shortlink_meter_count`，**查不到数据**。
+但应用侧 `/actuator/prometheus` 端点里明明有：
+
+```
+shortlink_meter_count_meters{application="linkforge"} 182.0
+```
+
+**根因**
+
+Micrometer 的 `Gauge.builder(...).baseUnit("meters")` 会把单位**追加到指标名后面**：
+
+| 代码 | Prometheus 指标名 |
+|---|---|
+| `Gauge.builder("shortlink.meter.count", ...)` | `shortlink_meter_count` |
+| `Gauge.builder("shortlink.meter.count", ...).baseUnit("meters")` | `shortlink_meter_count_meters` |
+
+⚠️ 这个后缀在 Micrometer 自己的世界里是「单位」，
+但 Prometheus 生态的惯例是**把单位放在指标名里**（`..._bytes`、`..._seconds`）。
+两者叠加就会得到 `xxx_meters` 这种别扭的名字。
+
+**解决**
+
+**不设 `baseUnit`**，单位信息写在 `description` 里：
+
+```java
+Gauge.builder("shortlink.meter.count", registry, r -> r.getMeters().size())
+    .description("MeterRegistry 中的 meter 总数。...")
+    // ⚠️ 不设 baseUnit：它会让 Prometheus 名字变成 shortlink_meter_count_meters
+    .register(registry);
+```
+
+**教训**
+
+> **指标名是「对外契约」，改一次就要同步改所有查询。**
+>
+> 加指标时先想清楚最终在 Prometheus 里的名字是什么，
+> 再写代码 —— 因为 Grafana 看板、告警规则、别人的查询都依赖这个名字。
+>
+> 验证方法：`curl localhost:8080/actuator/prometheus | grep <关键词>`，
+> 看**实际暴露的名字**，不要凭代码里的名字去猜。
+
+---
+
+### T-017 Grafana 的 datasource provisioning 不支持环境变量插值
+
+**现象**
+
+Prometheus 开了 Basic Auth，Grafana 的数据源健康检查一直 401：
+
+```json
+{"message":"401 Unauthorized - There was an error returned querying the Prometheus API.","status":"ERROR"}
+```
+
+在 `datasource.yml` 里写 `basicAuthPassword: $__env{PROMETHEUS_PASSWORD}`
+或 `${PROMETHEUS_PASSWORD}` 都**不生效**。
+
+**根因**
+
+Grafana 的 provisioning **不做任何变量插值** —— `secureJsonData` 里的
+`basicAuthPassword` 只接受**字面值**。实测在 Grafana 12.1.0 的
+`public/build/*.js` 里搜 `__env` 是 **0 处命中**。
+
+**解决**
+
+用一个 entrypoint 包装脚本在 Grafana 启动前**渲染**一份临时 provisioning 文件：
+
+```sh
+# 从 secret 读明文密码，用 awk 替换占位符
+awk -v pw="$PROM_PASSWORD" '
+  /^[[:space:]]*basicAuthPassword:/ {
+    match($0, /^[[:space:]]*/)
+    indent = substr($0, 1, RLENGTH)
+    print indent "basicAuthPassword: \"" pw "\""
+    next
+  }
+  { print }
+' "$TEMPLATE" > "$RENDERED"
+```
+
+⚠️ **必须保留原行缩进**：`basicAuthPassword` 是 `secureJsonData` 的**子键**。
+缩进丢了它就变成兄弟键 —— YAML 能解析，但 Grafana 拿不到密码。
+症状：`secureJsonFields` 为空、健康检查 401、**日志里毫无异常**。
+
+**教训**
+
+> **「配置生效了」和「配置被读取了」是两件事。**
+>
+> Grafana 的症状极具迷惑性：provisioning 日志一切正常，
+> 数据源也确实「存在」，只是**密码没存进去**。
+> 唯一可靠的验证是 `GET /api/datasources/1` 看 `secureJsonFields` ——
+> 它必须是 `{"basicAuthPassword": true}`，空对象就是没生效。
+
+---
+
+### T-018 Grafana provisioning 缺子目录 → **datasource 静默不加载**
+
+**现象**
+
+日志里只有：
+
+```
+logger=provisioning.dashboard ... "finished to provision dashboards"
+```
+
+**完全没有 `provisioning.datasources` 的记录** ——
+但数据源却「存在」（有 id、有 name），只是没有密码。
+
+**根因**
+
+Grafana 按固定顺序加载 provisioning 子目录，
+且**某个子目录缺失会报错并可能中断后续加载**。
+`alerting` 目录不存在时报：
+
+```
+logger=provisioning.alerting level=error msg="can't read alerting provisioning files from directory"
+```
+
+而 `datasource` 的加载排在**最后** —— 前序报错让它根本没执行。
+Grafana 用内置默认配置兜底建了一个数据源，于是「看起来有」。
+
+⚠️ 最迷惑的地方：**数据源确实存在**，所以任何「检查数据源在不在」的验证都会通过。
+
+**解决**
+
+entrypoint 里**建齐所有**子目录（哪怕是空的）：
+
+```sh
+mkdir -p /tmp/provisioning/datasources \
+         /tmp/provisioning/dashboards \
+         /tmp/provisioning/plugins \
+         /tmp/provisioning/alerting \
+         /tmp/provisioning/notifiers \
+         /tmp/provisioning/access-control
+```
+
+**教训**
+
+> **「数据源存在」不等于「数据源被正确配置」。**
+>
+> 验证配置是否真正生效，要看**字段的值**，不要看**对象是否存在**。
+> 这里如果只看 `GET /api/datasources`（返回了一个 Prometheus 数据源），
+> 就会误判为「配置成功」。
+
+---
+
+### T-020 Micrometer 的 `jvm.memory.used` 里，Metaspace 的 `area` 是 **nonheap**
+
+**现象**
+
+查 `jvm_memory_used_bytes{area="metaspace"}` —— **返回空**。
+明明 JVM 明明有 Metaspace（`jcmd` 能看到），Prometheus 也确实在采集 `jvm.memory.used`。
+
+**根因**
+
+Micrometer 的 `jvm.memory.used` 把内存池分成 `heap` 与 `nonheap` 两类。
+**Metaspace 与 Compressed Class Space 都归在 `nonheap`**：
+
+```
+area=heap     id=G1 Eden Space
+area=heap     id=G1 Old Gen
+area=heap     id=G1 Survivor Space
+area=nonheap  id=Metaspace
+area=nonheap  id=Compressed Class Space
+area=nonheap  id=CodeHeap 'profiled nmethods'
+...
+```
+
+没有 `area="metaspace"` 这个值 —— 查它是**语法合法但语义不存在**。
+
+**解决**
+
+正确写法：
+
+```promql
+jvm_memory_used_bytes{area="nonheap", id="Metaspace"}
+```
+
+**教训**
+
+> **PromQL 查不到数据时，先确认「这个 label 组合是否存在」，
+> 而不是立刻怀疑采集出了问题。**
+>
+> 最快的验证：`GET /api/v1/query?query=jvm_memory_used_bytes`，
+> 把返回的**所有** label 组合看一遍。
+>
+> ⚠️ 这条尤其重要：本项目第 5 周要用 Metaspace 曲线做长稳排查 ——
+> 如果查询写错，得到的会是「空曲线」，而空曲线**看起来像「没有泄漏」**，
+> 结论会完全反过来。
+
+---
+
+---
+
+### T-022 Grafana 的 `secureJsonData` **不会**被 upsert 覆盖（改密码必踩）
+
+**现象**
+
+改了 Prometheus 的密码并重建了 Prometheus：
+
+```
+$ curl -u "linkforge:新密码" http://localhost:9090/-/healthy
+HTTP 200                                    ← Prometheus 侧正常
+$ curl -u "admin:xxx" http://localhost:3000/api/datasources/1/health
+{"status":"ERROR", ...}                     ← Grafana 数据源失败
+```
+
+而且 Grafana 日志里 **provisioning 一切正常**，看板全是 No data。
+
+**根因**
+
+Grafana 的 datasource provisioning 对 `secureJsonData` 的处理是：
+**仅当数据源不存在时才写入密码**。
+
+这是 Grafana 的**刻意设计** —— 避免每次容器启动都用明文去覆盖已加密的密码
+（已存储的是密文，provisioning 里的是明文）。
+
+于是数据源已存在时（存在 Grafana 的数据卷里）：
+- `basicAuth: true` / `basicAuthUser` 会被 upsert 更新；
+- `secureJsonData.basicAuthPassword` **保持旧值不动**。
+
+⚠️ **迷惑性**：`GET /api/datasources/1` 显示
+`"secureJsonFields": {"basicAuthPassword": true}` —— 字段**确实存在**，
+只是内容是**旧密码**。看字段是否存在无法判断密码对不对。
+
+**解决**
+
+`scripts/reset-grafana-datasource.sh`（幂等）：
+
+1. 先试 API 删除数据源 —— provisioning 创建的是 `readOnly` 数据源，会 **403**；
+2. 403 则降级为「删 Grafana 数据卷重建」。
+
+⚠️ 降级会丢失**手工改过**的看板；本项目的看板全部是 provisioning 的
+（`docker/grafana/dashboards/*.json`），重建后自动恢复，所以对本项目无损。
+
+**改密码的完整流程**（`scripts/gen-prometheus-hash.sh` 的输出里也写了）：
+
+```bash
+bash scripts/gen-prometheus-hash.sh '新密码'      # 同步哈希 + 明文
+docker compose up -d --force-recreate prometheus  # ① Prometheus 加载新哈希
+bash scripts/reset-grafana-datasource.sh           # ② 重置 Grafana 数据源
+```
+
+> **教训**
+>
+> **「改了密码」是跨两个系统的操作，而配置同步往往不是自动的。**
+>
+> Prometheus 用哈希（进 git），Grafana 用密文（存数据库），
+> 明文只在 secret 文件里 —— 三份数据，必须显式同步。
+> 脚本化的价值不只是「省几行命令」，而是**把顺序写死**（漏了第 ② 步的后果极隐蔽）。
+
+---
+
+## 部署与 Docker Secrets
+
+### T-021 Docker Compose v2 在 Secret 文件**缺失**时不报错（静默故障）
+
+**现象**
+
+新 clone 的仓库跑 `docker compose up -d`，**一切正常**：
+
+```
+linkforge-app          Up (healthy)
+linkforge-prometheus   Up (healthy)
+linkforge-grafana      Up (healthy)
+```
+
+但：
+- Grafana 登不进去（admin 密码为空）；
+- Prometheus 的 Basic Auth 永远 401（连 healthcheck 都过不了，
+  但如果 healthcheck 没带凭据，它反而「正常」）。
+
+**根因**
+
+Compose v2 的 `secrets: { file: ./path }` 在文件**不存在**时**不报错**——
+它会挂一个**空目录**到 `/run/secrets/<name>`，容器照常启动。
+
+实测（最小复现）：
+
+```yaml
+services:
+  dummy:
+    image: busybox:1.36
+    secrets: [my_secret]
+secrets:
+  my_secret:
+    file: ./secrets/my_secret.txt   # ← 文件不存在
+```
+
+```
+$ docker compose up -d
+ Container clonetest2-dummy-1 Started     ← 成功！
+```
+
+⚠️ **危害在于它是静默的**：容器状态全是 healthy，没有任何日志提示。
+`docker compose config` 也不会报错（它只校验 YAML 结构，不检查文件存在性）。
+
+**解决**
+
+`scripts/setup-local.sh` 在启动前**显式生成** secret 文件（从 `.example` 模板），
+并做三项校验：
+
+1. Prometheus 的「明文密码」与「web.config.yml 里的 bcrypt 哈希」是否匹配；
+2. Grafana 的数据源健康检查是否 OK；
+3. secret 文件是否为纯明文单行（见 T-023）。
+
+> **教训**
+>
+> **「容器全绿」不等于「服务可用」。**
+>
+> 这个故障最难发现的地方在于：任何**只检查存在性**的验证都会通过
+> （容器在跑、端口在听、healthcheck 通过）。
+> 唯一可靠的验证是**检查功能**——真的拿凭据去请求一次。
+
+---
+
+### T-023 Secret 文件必须是**纯明文单行**（注释会被当成密码）
+
+**现象**
+
+`docker/secrets/grafana_admin_password.txt` 是从带注释的模板复制的：
+
+```
+# Grafana admin 密码
+# 复制为 grafana_admin_password.txt 后修改。
+# ⚠️ 真实文件被 .gitignore 排除，不会进 git。
+change_me_grafana_admin_password
+```
+
+用户 `cat` 出这个文件，把**最后一行**当密码输入 → 登录失败。
+
+**根因**
+
+`GF_SECURITY_ADMIN_PASSWORD__FILE` 会把 secret 文件的**整个内容**当成密码，
+**包括每一行注释和中间的换行**。
+
+于是「用户看到的明文」与「程序实际使用的密码」**根本不是同一个字符串**。
+
+同样的问题会影响 Prometheus：
+- healthcheck 用 `$(cat /run/secrets/prometheus_basic_auth)` 构造 Basic Auth，
+  多行内容会让认证头畸形 → healthcheck 永远失败。
+
+**解决**
+
+**secret 真实文件 = 纯明文单行，一行不多。**
+
+- `.example` 模板也只放纯明文（说明文字移到 `setup-local.sh` 的输出与 README）；
+- `setup-local.sh` 复制时**剥离注释行**（兼容手写的带注释模板）。
+
+> **教训**
+>
+> **「给人看的文件」与「给程序用的文件」不是一回事。**
+>
+> 模板文件里加一行说明 seemed 很人性，但对「整文件即值」的消费者来说，
+> 那行说明就是密码的一部分。
+> 判据：**只要一个文件被整体当作配置值读取，它就只能有一个值。**
+
+---
+
+### T-024 Windows 的 CRLF 会让 **Secret 密码多一个 `\r`**（Windows 专有）
+
+**现象**
+
+在 Windows 上按 README 手工复制模板：
+
+```bash
+cp docker/secrets/grafana_admin_password.txt.example docker/secrets/grafana_admin_password.txt
+```
+
+然后 Grafana 登录失败。用户 `cat` 出来的密码**肉眼完全正确**，
+但用 `curl -u "admin:$(cat ...)"` 也是 401。
+
+**根因**
+
+Windows 检出的 `.example` 文件是 **CRLF** 行尾（除非 `.gitattributes` 规定 LF）。
+`cp` 是二进制复制，**保留源文件的行尾** → 真实 secret 文件也是 CRLF。
+
+而 `GF_SECURITY_ADMIN_PASSWORD__FILE` 把文件内容**原样**当密码（只去掉末尾换行，
+中间的 `\r` 留着）→ 实际密码 = `change_me_grafana_admin_password\r`。
+
+于是：
+- 用户输入的密码（复制粘贴，通常不带 `\r`）→ 不匹配；
+- `curl -u "admin:$(cat file)"` —— `$(...)` **会去掉尾部换行**，但**保留 `\r`** →
+  恰好匹配！所以 **curl 能通、浏览器登不进去**。
+
+⚠️ 这个「curl 能通但浏览器不通」的现象极具迷惑性：
+它让人以为「密码是对的，是 Grafana 的问题」。
+
+**解决**
+
+`.gitattributes` 明确指定这些文件必须是 LF：
+
+```
+.env.example            text eol=lf
+*.example                text eol=lf
+.env                     text eol=lf
+docker/secrets/*.txt     text eol=lf
+```
+
+加上 `scripts/setup-local.sh` 的**双重保险**：复制时用 `printf '%s\n'` 重写
+（而不是 `cp`），并剥离注释行 —— 生成的文件一定是 LF + 纯明文单行。
+
+**教训**
+
+> **行尾问题不只影响脚本。**
+>
+> T-019 里 CRLF 让 `/bin/sh` 崩在第一行（语法错误，很显眼）。
+> 而这里 CRLF 让**密码多一个字符**（语义错误，不显眼）——
+> 同样一个根因，两种完全不同的表现形式。
+>
+> 判据：**凡是「整文件即值」的文件**（secret、配置、密码、token），
+> 行尾必须是 LF，而且要在**生成环节**保证，而不是指望用户复制时不出错。
+
+---
+
+## 测试与压测工具
 
 ### T-013 Testcontainers 的 `@Container` 注解会让**多个测试类互相踩死**
 
@@ -614,53 +1224,6 @@ private String adminToken;
 
 ---
 
-### T-015 Micrometer 的 `baseUnit` 会给 Prometheus 指标名**追加后缀**
-
-**现象**
-
-在 Grafana 里查 `shortlink_meter_count`，**查不到数据**。
-但应用侧 `/actuator/prometheus` 端点里明明有：
-
-```
-shortlink_meter_count_meters{application="linkforge"} 182.0
-```
-
-**根因**
-
-Micrometer 的 `Gauge.builder(...).baseUnit("meters")` 会把单位**追加到指标名后面**：
-
-| 代码 | Prometheus 指标名 |
-|---|---|
-| `Gauge.builder("shortlink.meter.count", ...)` | `shortlink_meter_count` |
-| `Gauge.builder("shortlink.meter.count", ...).baseUnit("meters")` | `shortlink_meter_count_meters` |
-
-⚠️ 这个后缀在 Micrometer 自己的世界里是「单位」，
-但 Prometheus 生态的惯例是**把单位放在指标名里**（`..._bytes`、`..._seconds`）。
-两者叠加就会得到 `xxx_meters` 这种别扭的名字。
-
-**解决**
-
-**不设 `baseUnit`**，单位信息写在 `description` 里：
-
-```java
-Gauge.builder("shortlink.meter.count", registry, r -> r.getMeters().size())
-    .description("MeterRegistry 中的 meter 总数。...")
-    // ⚠️ 不设 baseUnit：它会让 Prometheus 名字变成 shortlink_meter_count_meters
-    .register(registry);
-```
-
-**教训**
-
-> **指标名是「对外契约」，改一次就要同步改所有查询。**
->
-> 加指标时先想清楚最终在 Prometheus 里的名字是什么，
-> 再写代码 —— 因为 Grafana 看板、告警规则、别人的查询都依赖这个名字。
->
-> 验证方法：`curl localhost:8080/actuator/prometheus | grep <关键词>`，
-> 看**实际暴露的名字**，不要凭代码里的名字去猜。
-
----
-
 ### T-016 `docker compose pull` 会被 Docker Hub 限速卡住（几分钟到几十分钟）
 
 **现象**
@@ -705,417 +1268,6 @@ Docker Hub 对**匿名**拉取有速率限制。
 > 这时**换一个方式**（逐个拉、避开并发）比反复重试有效得多。
 
 ---
-
----
-
-### T-017 Grafana 的 datasource provisioning 不支持环境变量插值
-
-**现象**
-
-Prometheus 开了 Basic Auth，Grafana 的数据源健康检查一直 401：
-
-```json
-{"message":"401 Unauthorized - There was an error returned querying the Prometheus API.","status":"ERROR"}
-```
-
-在 `datasource.yml` 里写 `basicAuthPassword: $__env{PROMETHEUS_PASSWORD}`
-或 `${PROMETHEUS_PASSWORD}` 都**不生效**。
-
-**根因**
-
-Grafana 的 provisioning **不做任何变量插值** —— `secureJsonData` 里的
-`basicAuthPassword` 只接受**字面值**。实测在 Grafana 12.1.0 的
-`public/build/*.js` 里搜 `__env` 是 **0 处命中**。
-
-**解决**
-
-用一个 entrypoint 包装脚本在 Grafana 启动前**渲染**一份临时 provisioning 文件：
-
-```sh
-# 从 secret 读明文密码，用 awk 替换占位符
-awk -v pw="$PROM_PASSWORD" '
-  /^[[:space:]]*basicAuthPassword:/ {
-    match($0, /^[[:space:]]*/)
-    indent = substr($0, 1, RLENGTH)
-    print indent "basicAuthPassword: \"" pw "\""
-    next
-  }
-  { print }
-' "$TEMPLATE" > "$RENDERED"
-```
-
-⚠️ **必须保留原行缩进**：`basicAuthPassword` 是 `secureJsonData` 的**子键**。
-缩进丢了它就变成兄弟键 —— YAML 能解析，但 Grafana 拿不到密码。
-症状：`secureJsonFields` 为空、健康检查 401、**日志里毫无异常**。
-
-**教训**
-
-> **「配置生效了」和「配置被读取了」是两件事。**
->
-> Grafana 的症状极具迷惑性：provisioning 日志一切正常，
-> 数据源也确实「存在」，只是**密码没存进去**。
-> 唯一可靠的验证是 `GET /api/datasources/1` 看 `secureJsonFields` ——
-> 它必须是 `{"basicAuthPassword": true}`，空对象就是没生效。
-
----
-
-### T-018 Grafana provisioning 缺子目录 → **datasource 静默不加载**
-
-**现象**
-
-日志里只有：
-
-```
-logger=provisioning.dashboard ... "finished to provision dashboards"
-```
-
-**完全没有 `provisioning.datasources` 的记录** ——
-但数据源却「存在」（有 id、有 name），只是没有密码。
-
-**根因**
-
-Grafana 按固定顺序加载 provisioning 子目录，
-且**某个子目录缺失会报错并可能中断后续加载**。
-`alerting` 目录不存在时报：
-
-```
-logger=provisioning.alerting level=error msg="can't read alerting provisioning files from directory"
-```
-
-而 `datasource` 的加载排在**最后** —— 前序报错让它根本没执行。
-Grafana 用内置默认配置兜底建了一个数据源，于是「看起来有」。
-
-⚠️ 最迷惑的地方：**数据源确实存在**，所以任何「检查数据源在不在」的验证都会通过。
-
-**解决**
-
-entrypoint 里**建齐所有**子目录（哪怕是空的）：
-
-```sh
-mkdir -p /tmp/provisioning/datasources \
-         /tmp/provisioning/dashboards \
-         /tmp/provisioning/plugins \
-         /tmp/provisioning/alerting \
-         /tmp/provisioning/notifiers \
-         /tmp/provisioning/access-control
-```
-
-**教训**
-
-> **「数据源存在」不等于「数据源被正确配置」。**
->
-> 验证配置是否真正生效，要看**字段的值**，不要看**对象是否存在**。
-> 这里如果只看 `GET /api/datasources`（返回了一个 Prometheus 数据源），
-> 就会误判为「配置成功」。
-
----
-
-### T-019 Windows 的 CRLF 行尾会让 `/bin/sh` 脚本崩在第一行
-
-**现象**
-
-Grafana 容器反复重启，日志：
-
-```
-/etc/grafana/entrypoint.sh: line 26: : not found
-/etc/grafana/entrypoint.sh: set: line 27: illegal option -
-```
-
-**根因**
-
-在 Windows 上用编辑器/工具写的 `.sh` 文件是 **CRLF** 行尾。
-`/bin/sh` 读到 `set -e\r` 时，把 `\r` 当成参数的一部分 → `illegal option -`。
-
-⚠️ 症状出现在**第 26/27 行**，而真正的错误在**文件开头**——
-`set -e` 那行就已经坏了，只是错误信息指向后续行。
-
-**解决**
-
-确保是 LF 行尾：
-
-```python
-s = io.open(p, encoding="utf-8", newline="").read()
-s = s.replace("\r\n", "\n").replace("\r", "\n")
-io.open(p, "w", encoding="utf-8", newline="\n").write(s)
-```
-
-⚠️ 更根本的做法：在 `.gitattributes` 里强制
-```
-*.sh text eol=lf
-```
-否则每个从 Windows clone 仓库的人都会踩。
-
-**教训**
-
-> **跨平台的行尾问题在容器里表现为「脚本语法错误」，但报错位置会误导。**
->
-> `illegal option -` 这条信息指向 `set` 命令，而 `set` 本身没问题 ——
-> 真正的问题是它后面多了个 `\r`。
-
----
-
-### T-020 Micrometer 的 `jvm.memory.used` 里，Metaspace 的 `area` 是 **nonheap**
-
-**现象**
-
-查 `jvm_memory_used_bytes{area="metaspace"}` —— **返回空**。
-明明 JVM 明明有 Metaspace（`jcmd` 能看到），Prometheus 也确实在采集 `jvm.memory.used`。
-
-**根因**
-
-Micrometer 的 `jvm.memory.used` 把内存池分成 `heap` 与 `nonheap` 两类。
-**Metaspace 与 Compressed Class Space 都归在 `nonheap`**：
-
-```
-area=heap     id=G1 Eden Space
-area=heap     id=G1 Old Gen
-area=heap     id=G1 Survivor Space
-area=nonheap  id=Metaspace
-area=nonheap  id=Compressed Class Space
-area=nonheap  id=CodeHeap 'profiled nmethods'
-...
-```
-
-没有 `area="metaspace"` 这个值 —— 查它是**语法合法但语义不存在**。
-
-**正确写法**
-
-```promql
-jvm_memory_used_bytes{area="nonheap", id="Metaspace"}
-```
-
-**教训**
-
-> **PromQL 查不到数据时，先确认「这个 label 组合是否存在」，
-> 而不是立刻怀疑采集出了问题。**
->
-> 最快的验证：`GET /api/v1/query?query=jvm_memory_used_bytes`，
-> 把返回的**所有** label 组合看一遍。
->
-> ⚠️ 这条尤其重要：本项目第 5 周要用 Metaspace 曲线做长稳排查 ——
-> 如果查询写错，得到的会是「空曲线」，而空曲线**看起来像「没有泄漏」**，
-> 结论会完全反过来。
-
----
-
----
-
-### T-021 Docker Compose v2 在 Secret 文件**缺失**时不报错（静默故障）
-
-**现象**
-
-新 clone 的仓库跑 `docker compose up -d`，**一切正常**：
-
-```
-linkforge-app          Up (healthy)
-linkforge-prometheus   Up (healthy)
-linkforge-grafana      Up (healthy)
-```
-
-但：
-- Grafana 登不进去（admin 密码为空）；
-- Prometheus 的 Basic Auth 永远 401（连 healthcheck 都过不了，
-  但如果 healthcheck 没带凭据，它反而「正常」）。
-
-**根因**
-
-Compose v2 的 `secrets: { file: ./path }` 在文件**不存在**时**不报错**——
-它会挂一个**空目录**到 `/run/secrets/<name>`，容器照常启动。
-
-实测（最小复现）：
-
-```yaml
-services:
-  dummy:
-    image: busybox:1.36
-    secrets: [my_secret]
-secrets:
-  my_secret:
-    file: ./secrets/my_secret.txt   # ← 文件不存在
-```
-
-```
-$ docker compose up -d
- Container clonetest2-dummy-1 Started     ← 成功！
-```
-
-⚠️ **危害在于它是静默的**：容器状态全是 healthy，没有任何日志提示。
-`docker compose config` 也不会报错（它只校验 YAML 结构，不检查文件存在性）。
-
-**解决**
-
-`scripts/setup-local.sh` 在启动前**显式生成** secret 文件（从 `.example` 模板），
-并做三项校验：
-
-1. Prometheus 的「明文密码」与「web.config.yml 里的 bcrypt 哈希」是否匹配；
-2. Grafana 的数据源健康检查是否 OK；
-3. secret 文件是否为纯明文单行（见 T-023）。
-
-> **教训**
->
-> **「容器全绿」不等于「服务可用」。**
->
-> 这个故障最难发现的地方在于：任何**只检查存在性**的验证都会通过
-> （容器在跑、端口在听、healthcheck 通过）。
-> 唯一可靠的验证是**检查功能**——真的拿凭据去请求一次。
-
----
-
-### T-022 Grafana 的 `secureJsonData` **不会**被 upsert 覆盖（改密码必踩）
-
-**现象**
-
-改了 Prometheus 的密码并重建了 Prometheus：
-
-```
-$ curl -u "linkforge:新密码" http://localhost:9090/-/healthy
-HTTP 200                                    ← Prometheus 侧正常
-$ curl -u "admin:xxx" http://localhost:3000/api/datasources/1/health
-{"status":"ERROR", ...}                     ← Grafana 数据源失败
-```
-
-而且 Grafana 日志里 **provisioning 一切正常**，看板全是 No data。
-
-**根因**
-
-Grafana 的 datasource provisioning 对 `secureJsonData` 的处理是：
-**仅当数据源不存在时才写入密码**。
-
-这是 Grafana 的**刻意设计** —— 避免每次容器启动都用明文去覆盖已加密的密码
-（已存储的是密文，provisioning 里的是明文）。
-
-于是数据源已存在时（存在 Grafana 的数据卷里）：
-- `basicAuth: true` / `basicAuthUser` 会被 upsert 更新；
-- `secureJsonData.basicAuthPassword` **保持旧值不动**。
-
-⚠️ **迷惑性**：`GET /api/datasources/1` 显示
-`"secureJsonFields": {"basicAuthPassword": true}` —— 字段**确实存在**，
-只是内容是**旧密码**。看字段是否存在无法判断密码对不对。
-
-**解决**
-
-`scripts/reset-grafana-datasource.sh`（幂等）：
-
-1. 先试 API 删除数据源 —— provisioning 创建的是 `readOnly` 数据源，会 **403**；
-2. 403 则降级为「删 Grafana 数据卷重建」。
-
-⚠️ 降级会丢失**手工改过**的看板；本项目的看板全部是 provisioning 的
-（`docker/grafana/dashboards/*.json`），重建后自动恢复，所以对本项目无损。
-
-**改密码的完整流程**（`scripts/gen-prometheus-hash.sh` 的输出里也写了）：
-
-```bash
-bash scripts/gen-prometheus-hash.sh '新密码'      # 同步哈希 + 明文
-docker compose up -d --force-recreate prometheus  # ① Prometheus 加载新哈希
-bash scripts/reset-grafana-datasource.sh           # ② 重置 Grafana 数据源
-```
-
-> **教训**
->
-> **「改了密码」是跨两个系统的操作，而配置同步往往不是自动的。**
->
-> Prometheus 用哈希（进 git），Grafana 用密文（存数据库），
-> 明文只在 secret 文件里 —— 三份数据，必须显式同步。
-> 脚本化的价值不只是「省几行命令」，而是**把顺序写死**（漏了第 ② 步的后果极隐蔽）。
-
----
-
-### T-023 Secret 文件必须是**纯明文单行**（注释会被当成密码）
-
-**现象**
-
-`docker/secrets/grafana_admin_password.txt` 是从带注释的模板复制的：
-
-```
-# Grafana admin 密码
-# 复制为 grafana_admin_password.txt 后修改。
-# ⚠️ 真实文件被 .gitignore 排除，不会进 git。
-change_me_grafana_admin_password
-```
-
-用户 `cat` 出这个文件，把**最后一行**当密码输入 → 登录失败。
-
-**根因**
-
-`GF_SECURITY_ADMIN_PASSWORD__FILE` 会把 secret 文件的**整个内容**当成密码，
-**包括每一行注释和中间的换行**。
-
-于是「用户看到的明文」与「程序实际使用的密码」**根本不是同一个字符串**。
-
-同样的问题会影响 Prometheus：
-- healthcheck 用 `$(cat /run/secrets/prometheus_basic_auth)` 构造 Basic Auth，
-  多行内容会让认证头畸形 → healthcheck 永远失败。
-
-**解决**
-
-**secret 真实文件 = 纯明文单行，一行不多。**
-
-- `.example` 模板也只放纯明文（说明文字移到 `setup-local.sh` 的输出与 README）；
-- `setup-local.sh` 复制时**剥离注释行**（兼容手写的带注释模板）。
-
-> **教训**
->
-> **「给人看的文件」与「给程序用的文件」不是一回事。**
->
-> 模板文件里加一行说明 seemed 很人性，但对「整文件即值」的消费者来说，
-> 那行说明就是密码的一部分。
-> 判据：**只要一个文件被整体当作配置值读取，它就只能有一个值。**
-
----
-
-### T-024 Windows 的 CRLF 会让 **Secret 密码多一个 `\r`**（Windows 专有）
-
-**现象**
-
-在 Windows 上按 README 手工复制模板：
-
-```bash
-cp docker/secrets/grafana_admin_password.txt.example docker/secrets/grafana_admin_password.txt
-```
-
-然后 Grafana 登录失败。用户 `cat` 出来的密码**肉眼完全正确**，
-但用 `curl -u "admin:$(cat ...)"` 也是 401。
-
-**根因**
-
-Windows 检出的 `.example` 文件是 **CRLF** 行尾（除非 `.gitattributes` 规定 LF）。
-`cp` 是二进制复制，**保留源文件的行尾** → 真实 secret 文件也是 CRLF。
-
-而 `GF_SECURITY_ADMIN_PASSWORD__FILE` 把文件内容**原样**当密码（只去掉末尾换行，
-中间的 `\r` 留着）→ 实际密码 = `change_me_grafana_admin_password\r`。
-
-于是：
-- 用户输入的密码（复制粘贴，通常不带 `\r`）→ 不匹配；
-- `curl -u "admin:$(cat file)"` —— `$(...)` **会去掉尾部换行**，但**保留 `\r`** →
-  恰好匹配！所以 **curl 能通、浏览器登不进去**。
-
-⚠️ 这个「curl 能通但浏览器不通」的现象极具迷惑性：
-它让人以为「密码是对的，是 Grafana 的问题」。
-
-**解决**
-
-`.gitattributes` 明确指定这些文件必须是 LF：
-
-```
-.env.example            text eol=lf
-*.example                text eol=lf
-.env                     text eol=lf
-docker/secrets/*.txt     text eol=lf
-```
-
-加上 `scripts/setup-local.sh` 的**双重保险**：复制时用 `printf '%s\n'` 重写
-（而不是 `cp`），并剥离注释行 —— 生成的文件一定是 LF + 纯明文单行。
-
-**教训**
-
-> **行尾问题不只影响脚本。**
->
-> T-019 里 CRLF 让 `/bin/sh` 崩在第一行（语法错误，很显眼）。
-> 而这里 CRLF 让**密码多一个字符**（语义错误，不显眼）——
-> 同样一个根因，两种完全不同的表现形式。
->
-> 判据：**凡是「整文件即值」的文件**（secret、配置、密码、token），
-> 行尾必须是 LF，而且要在**生成环节**保证，而不是指望用户复制时不出错。
 
 ---
 
@@ -1221,3 +1373,4 @@ docker tag docker.m.daocloud.io/grafana/grafana:12.1.0 grafana/grafana:12.1.0
 > 看到反复停在同一个字节数，就是限速，换方式比反复重试有效得多。
 >
 > 另一个纪律：**不要和 build 同时跑** —— 构建本身也在拉依赖层，两边抢带宽。
+
