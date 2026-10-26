@@ -468,6 +468,7 @@ curl.exe -s -o NUL -w "%{http_code}" http://localhost:8080/admin/links/<shortCod
 | **V2-2** | **统计 HLL key TTL 收敛到当天 + 落库删除 UV key** | Redis 内存上界 1.2GB → 42GB（高 35 倍） | 活跃链路数达到 PRD 量级 | 落库后主动删 UV key；TTL 改「当天结束 + 余量」；补内存上界监控 | DATABASE §9.2 / T-028 |
 | **V2-3** | **统计 90 天保留的批量清理任务** | 统计表无限增长 | 统计行数上来 | 按 `stat_date` 分批 DELETE（索引已建好）；或 range 分区 + drop 分区 | DATABASE §7.3 / §12 D-5 |
 | **V2-4** | **readiness 纳入 MySQL / Redis / 布隆** | 「readiness 通过」不代表依赖可用 | 引入多实例部署 | `group.readiness.include=readinessState,db,redis` + 自定义布隆 `HealthIndicator` | ARCHITECTURE §15.2 |
+| **V2-5** | ⚠️ **自定义短码长度与跳转路径不一致** —— 创建接受 4~8 位，跳转只认 7 位，**非 7 位是「创建 201 但永久 404」的死链** | ⚠️ **本项严重性最高**：按对外文档正常使用就会踩到（4/8 的允许长度是死链）。主路径（自动 7 位码）不受影响 | 契约改写时 | **首选契约收窄**：`customCode` 正则改为 `^[a-zA-Z0-9]{7}$`；备选：跳转路径放宽 / 前缀路由分流。**必须同时补「创建出来的短码一定可访问」的参数化测试** | **DR-063** / API.md §5.2 / T-029 |
 
 ### v2 的其它既有待办（非本次审计新增）
 

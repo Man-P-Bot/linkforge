@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | **技术栈** | Java 17 · Spring Boot 3 · MyBatis · MySQL 8.4 · Redis 7.4 · Caffeine · Docker Compose · Prometheus · Grafana |
-| **工程约束** | Maven 5 模块 + ArchUnit 强制依赖边界 · JUnit 5 + Testcontainers 真实 MySQL 集成测试 · **62 条决策记录** · 24 条排障条目 |
+| **工程约束** | Maven 5 模块 + ArchUnit 强制依赖边界 · JUnit 5 + Testcontainers 真实 MySQL 集成测试 · **63 条决策记录** · **25 条排障条目** |
 | **实测结论** | 跳转 **29,388 QPS / P99 11.00ms**（同口径 3×30s 中位）· 8 小时长稳 **0 次 Full GC** · 后端拐点 **c=400~800** |
 
 ---
@@ -24,7 +24,7 @@
 | Redis | `redis:7.4`（宿主机 6379，已启用 RDB） |
 | 监控 | Prometheus `v3.5.0` + Grafana `12.1.0`（全声明式 provisioning） |
 | 部署 | Docker Compose **一键起全套 5 个容器** |
-| 测试 | **611 全绿**（含 58 个真实 MySQL 容器测试 + 20 个真实 Redis 集成测试） |
+| 测试 | **611 全绿 / 0 失败 / 0 跳过**（含 **68** 个真实 MySQL 容器测试 + **20** 个真实 Redis 集成测试 + 3 个 ArchUnit 架构约束测试） |
 
 **前置需求**：Docker Desktop 已启动；`JAVA_HOME` 指向 **JDK 17**。
 
@@ -423,13 +423,13 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块边界、缓存分层、降级矩阵、监控栈 |
 | [DATABASE.md](docs/DATABASE.md) | 表设计、索引意图、保留策略 |
 | [API.md](docs/API.md) | 接口契约、错误码、版本策略 |
-| [DECISIONS.md](docs/DECISIONS.md) | **决策记录 DR-001 ~ DR-062**（含按主题分组的总目录） |
+| [DECISIONS.md](docs/DECISIONS.md) | **决策记录 DR-001 ~ DR-063**（含按主题分组的总目录） |
 | [PROGRESS.md](docs/PROGRESS.md) | 进度台账 |
 | [PERFORMANCE.md](docs/PERFORMANCE.md) | **压测数据、口径声明、资源水位**（含章节目录） |
 | [DESIGN-W4.md](docs/DESIGN-W4.md) | 第 4 周设计（过期清理 + Testcontainers 改造） |
 | [DESIGN-W5.md](docs/DESIGN-W5.md) | 第 5 周设计（监控栈 + 压测框架 + 8 小时长稳报告） |
 | [BENCH-W4.md](docs/BENCH-W4.md) | 第 4 周压测记录 |
-| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | **排障手册：24 条踩过的坑**（现象 → 根因 → 解法，按主题分节 + 带索引） |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | **排障手册：25 条踩过的坑**（现象 → 根因 → 解法，按主题分节 + 带索引） |
 | [PITFALLS.md](docs/PITFALLS.md) | **防呆清单**：Docker 部署静默故障的共性判据 + 自动化防线 + 一分钟自检 |
 | [RESUME-DRAFT.md](docs/RESUME-DRAFT.md) | 简历素材草稿（STAR 法则，3 个可追问的技术故事） |
 
@@ -438,14 +438,14 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 - [docs/RESUME-DRAFT.md](docs/RESUME-DRAFT.md) —— 3 个可追问的技术故事（每条含「追问链」）。
 - [docs/PITFALLS.md](docs/PITFALLS.md) —— 本项目沉淀的**通用工程方法**，不只是短链知识：
   口径预注册、静默故障的识别与自动化、长稳实验的因果链拆解。
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) —— 24 条真实踩坑，含
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) —— 25 条真实踩坑，含
   「Compose 在 secret 缺失时不报错」「CRLF 让容器内 `/bin/sh` 崩在第一行」
   「压测期间动手 = 自己污染自己的数据」这类**通用陷阱**。
 
 ### ⚠️ 已知缺口与 v2 Roadmap（**刻意不修**，已归档）
 
 第 6 周收尾审计逐条比对了「文档写了什么」与「代码做了什么」，
-找出 4 处**文档与实现不一致**或**设计未落地**的地方。
+找出 5 处**文档与实现不一致**或**设计未落地**的地方。
 
 **决策：全部保留为 v2 事项，本次一律不改代码。**
 
@@ -455,18 +455,23 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 | **2** | **统计 HLL key 驻留 35 天**（设计要求「当天」）<br/>落库只 `PFCOUNT` 不删 UV key，TTL 是 `Duration.ofDays(35)` | Redis 内存上界比设计高约 **35 倍**（1.2GB → **42GB**）。「量还没到」不等于「设计对了」 | 同上；且当前真实活跃链路数远低于 PRD 的 10 万假设，压测语料只有 1 万条 | flush 成功后**主动删除**当日 UV key（对齐 PV 的「取走即删」）；TTL 改为「当天结束 + 余量」，35 天仅作兜底；补 HLL key 数量与 `used_memory` 的监控。<br/>📄 [T-028](docs/TROUBLESHOOTING.md) · [DATABASE §9.2](docs/DATABASE.md) |
 | **3** | **统计 90 天保留的批量清理任务未实现**<br/>只有短链过期清理，没有按 `stat_date` 的批量 DELETE | 数据量上来后 `link_stats_daily` 无限增长 | 当前行数远低于 900 万上界，不实现是可接受的；但**上生产前必须补** | 索引 `idx_stat_date` 已建好；补一个按 `stat_date` 区间分批 DELETE 的低峰期定时任务（v2 可退化为 range 分区 + drop 分区）。<br/>📄 [DATABASE §7.3](docs/DATABASE.md) · §12 D-5 |
 | **4** | **readiness 不含 MySQL / Redis / 布隆**<br/>无自定义 `HealthIndicator`，readiness 组默认只有 `readinessState` | 「readiness 通过」=「进程起来了」，**不代表依赖可用** | Compose 侧已用各自容器的 healthcheck 保证启动顺序，缺口不影响本地与当前部署 | 补 `management.endpoint.health.group.readiness.include=readinessState,db,redis`，并新增一个布隆 `HealthIndicator`。<br/>📄 [ARCHITECTURE §15.2](docs/ARCHITECTURE.md) |
+| **5** | ⚠️ **自定义短码长度与跳转路径不一致**<br/>创建接口接受 `^[a-zA-Z0-9]{4,8}$`，跳转接口 `GET /{code}` 只接受**恰好 7 位** | ⚠️ **本项严重性最高**：4/5/6/8 位的自定义短码**创建返回 201，但永久 404** —— 「按文档正常使用就会踩到」。**主路径（自动 7 位码）不受影响** | 同上；且改的是**跳转路径的校验分支**（压测热路径），且 DR-037「长度不符 = 一定不存在」这条契约推理会被推翻 | **首选契约收窄**：把 `customCode` 正则改为 `^[a-zA-Z0-9]{7}$`；备选是放宽跳转路径或前缀路由分流。**必须同时补「创建出来的短码一定可访问」的参数化测试**。<br/>📄 [DR-063](docs/DECISIONS.md) · [T-029](docs/TROUBLESHOOTING.md) · [API §5.2](docs/API.md) |
 
-> ⚠️ **这四条都不是「没想到」**，而是**当时判断过并延后、或实现漏了**。
+> ⚠️ **这五条都不是「没想到」**，而是**当时判断过并延后、或实现漏了**。
 > 每一条在文档里都能找到它**被发现的那一刻**与**当时的取舍理由**
-> （T-027 / T-028 是本次新写的复盘；#3 / #4 在 `docs/DATABASE.md` §12 与
+> （T-027 / T-028 / T-029 是本次新写的复盘；#3 / #4 在 `docs/DATABASE.md` §12 与
 > `docs/ARCHITECTURE.md` §16bis 里有原始记录）。
 >
 > 📌 **为什么不修**（Trade-off 记录）：
 > ① **第 5 周的性能数据已冻结** —— 任何代码改动都会让
 > 「29,387 QPS / P99 11.00ms」这组数字失去可复现性，
 > 而这组数字是本项目最有价值的产出；
-> ② 这 4 条**都不是当前部署形态下的阻塞问题**（量没到 / 单实例 / 索引已备）；
-> ③ **把它们明确写下来，比默默留着或草率改掉更有价值** ——
+> ② 前 4 条**在当前部署形态下都不是阻塞问题**（量没到 / 单实例 / 索引已备）；
+> ③ ⚠️ **第 5 条是例外**：它**按对外文档正常使用就会踩到**，
+>    所以本次**额外做了纯文档的披露**（API.md §5.2 + §13 P-6），
+>    让调用方知道「只应用 7 位自定义短码」——
+>    **不修代码，但不能不告知**；
+> ④ **把它们明确写下来，比默默留着或草率改掉更有价值** ——
 > 「知道自己没做什么、为什么不做、什么时候做」本身就是工程判断力。
 >
 > 📌 **v1 的边界**：本项目是一个**求职作品**，不是生产系统。
