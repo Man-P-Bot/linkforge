@@ -166,13 +166,41 @@ BLOOM_OK=0
 #
 #   修复：用 `docker logs --since` 只取最近 N 分钟的日志。
 #   ⚠️ `--since` 用的是**相对时间**，要给足窗口（本项目布隆重建约 1~2 分钟）。
+# ⚠️⚠️ **必须以「容器启动时刻」为基准，而不是 `--since 5m`**。
+#   `--since 5m` 会把**上一次运行**的重建日志也匹配进来 ——
+#   重启后仅 20 秒（而 initialDelay 是 30 秒）时，
+#   第一条 grep 就命中了上次的记录 -> 误判「布隆已就绪」。
+#   用容器的 StartedAt（RFC3339）作为起点，`--since` 精确接受它。
+APP_START="$(docker inspect -f '{{.State.StartedAt}}' linkforge-app 2>/dev/null)"
+log "   基准时刻（容器启动）：${APP_START}"
 for i in $(seq 1 60); do
-    if docker logs --since 5m linkforge-app 2>/dev/null | grep -q "布隆全量重建完成"; then
+    if docker logs --since "$APP_START" linkforge-app 2>/dev/null | grep -q "布隆全量重建完成"; then
         BLOOM_OK=1; break
     fi
     sleep 5
 done
-[ "$BLOOM_OK" -eq 1 ] && log "   ✅ 布隆已就绪" || log "   ⚠️ 未看到布隆重建完成日志，继续（可能有少量 miss）"
+[ "$BLOOM_OK" -eq 1 ] && log "   ✅ 布隆重建日志已出现" || log "   ⚠️ 未看到布隆重建完成日志，继续（可能有少量 miss）"
+
+# ⚠️⚠️ **功能级验证：日志出现 ≠ 布隆可用**。
+#   日志说「重建完成」只证明**重建动作跑完了**，
+#   不证明**布隆里真的有短码** —— 重建中途失败、或重建时 Redis 尚未就绪，
+#   都可能留下一个**空的**布隆。
+#
+#   空布隆的后果：所有请求都判「不存在」-> 全部 404 -> 压测数据完全作废
+#   （而且「非 302 响应数」这一列会暴露它，但那时已经浪费了一轮压测）。
+#
+#   判据（PITFALLS.md P-1 的同一条原则）：
+#   **静态检查全过 ≠ 功能可用** —— 要真的发一个请求，看它是不是 302。
+log "   功能级验证：用一个真实短码请求，看是否返回 302"
+PROBE_CODE="$(head -1 "$CODE_LIST" 2>/dev/null | tr -d '\r\n')"
+PROBE_CODE="$(curl -s --max-time 5 "http://localhost:8080/$(head -1 "$CODE_LIST" | tr -d '\r\n')" -o /dev/null -w '%{http_code}' 2>/dev/null || echo 000)"
+if [ "$PROBE_CODE" = "302" ]; then
+    log "   ✅ 布隆可用（真实短码返回 302）"
+else
+    fail "布隆不可用（真实短码返回 ${PROBE_CODE}，期望 302）。
+       空布隆会让所有请求 404，压测数据完全作废 —— 必须在压测前拦住。
+       排查：docker compose logs app | grep -i 布隆"
+fi
 
 # ---------------------------------------------------------------- 5. 预热
 log "⑤ 预热 15s（JIT 收敛，结果丢弃）"
@@ -194,7 +222,7 @@ for i in $(seq 1 "$ROUNDS"); do
         -e CODE_LIST=/codes/codes.txt \
         williamyeh/wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION_MAIN" --latency \
         -s /scripts/wrk-redirect.lua http://app:8080 > "$OUT" 2>&1
-    QPS="$(grep -oE 'Requests/sec:[^ ]+' "$OUT" | head -1 | tr -d ',' | awk '{print $2}')"
+    QPS="$(grep -E '^Requests/sec:' "$OUT" | head -1 | awk '{print $2}')"
     log "      QPS=${QPS:-?}"
 done
 
@@ -208,108 +236,8 @@ if [ "$DO_EXTRA" -eq 1 ]; then
         -e CODE_LIST=/codes/codes.txt \
         williamyeh/wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION_EXTRA" --latency \
         -s /scripts/wrk-redirect.lua http://app:8080 > "$OUT" 2>&1
-    log "      QPS=$(grep -oE 'Requests/sec:[^ ]+' "$OUT" | head -1 | tr -d ',' | awk '{print $2}')"
+    log "      QPS=$(grep -E '^Requests/sec:' "$OUT" | head -1 | awk '{print $2}')"
 fi
-
-# ---------------------------------------------------------------- 7b. 自动判定
-# ⚠️ **判据必须来自「预注册」，而不是跑完再定**。
-#   判据写在 docs/PERFORMANCE.md §11.4（跑之前就定死了）。
-#   这里把它实现成代码，是为了让「判定」这一步**没有解释空间**——
-#   否则「到底算不算达标」会变成一个可以临场讨论的问题。
-#
-#   判据（PERFORMANCE.md §11.4）：
-#     QPS >= 25,000 且 P99 <= 15ms 且零错误  -> ✅ 通过
-#     QPS 20,000~25,000                       -> ⚠️ 基本通过（需归因）
-#     QPS < 20,000                            -> ❌ 不通过
-#     出现任何非 302 或 Socket 错误            -> ❌ 不通过（正确性问题）
-#
-# ⚠️ **为什么下限是 25,000 而不是 6 万**：
-#   本机物理上限约 3.2 万 QPS（18 核 - 宿主固有 3 核 - 压测端 1.5 核，
-#   每请求 CPU 417 µs，见 PERFORMANCE.md §12）。
-#   把不切实际的目标写进判据，只会让「未达标」变成一句废话。
-
-# wrk 的分位数单位不统一（us / ms / s），统一折算成毫秒
-to_ms() {
-    local v="$1" n u
-    [ -z "$v" ] && { echo "0"; return; }
-    n="$(echo "$v" | grep -oE '^[0-9.]+' || echo 0)"
-    u="$(echo "$v" | grep -oE '(us|ms|s)$' || echo ms)"
-    case "$u" in
-        us) awk -v n="$n" 'BEGIN{printf "%.3f", n/1000}' ;;
-        s)  awk -v n="$n" 'BEGIN{printf "%.3f", n*1000}' ;;
-        *)  awk -v n="$n" 'BEGIN{printf "%.3f", n}' ;;
-    esac
-}
-
-# 取 N 个数的中位数（sort -n 后取中间那个）
-median() {
-    printf '%s\n' "$@" | grep -vE '^$|^\?$' | sort -n         | awk '{a[NR]=$1} END{if(NR==0){print ""}else{print a[int((NR+1)/2)]}}'
-}
-
-judge() {
-    log "⑧ 自动判定（判据来自 PERFORMANCE.md §11.4 的预注册）"
-
-    local qps_vals=() p99_vals=() non302_total=0 err_total=0
-    local i F q p
-    for i in $(seq 1 "$ROUNDS"); do
-        F="$OUT_DIR/run-main-$i.txt"
-        [ -f "$F" ] || continue
-        q="$(grep -oE 'Requests/sec:[^ ]+' "$F" | head -1 | tr -d ',' | awk '{print $2}')"
-        p="$(grep -oE '99.00%[^ ]*' "$F" | head -1 | awk '{print $2}')"
-        qps_vals+=("${q:-}")
-        p99_vals+=("$(to_ms "${p:-}")")
-        non302_total=$(( non302_total + $(grep -oE '非 302 响应数 : [0-9]+' "$F" | awk '{print $NF+0}') ))
-        err_total=$(( err_total + $(grep -oE 'Socket errors: connect [0-9]+, read [0-9]+, write [0-9]+, timeout [0-9]+' "$F" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}') ))
-    done
-
-    local mq mp
-    mq="$(median "${qps_vals[@]}")"
-    mp="$(median "${p99_vals[@]}")"
-
-    echo ""
-    echo "  中位数 QPS = ${mq:-?}   中位数 P99 = ${mp:-?}ms"
-    echo "  非 302 响应总数 = ${non302_total}    Socket 错误总数 = ${err_total}"
-    echo ""
-
-    if [ -z "${mq}" ]; then
-        echo "  ❓ 无法判定（没有可用的 QPS 数据）"
-        return
-    fi
-
-    # ⚠️ **错误优先于性能**：出现错误一律不通过。
-    #    性能数字再好，链路有错误就是「不可用」。
-    if [ "${non302_total}" -gt 0 ] || [ "${err_total}" -gt 0 ]; then
-        echo "  ❌ **不通过** —— 出现非 302 响应或 Socket 错误。"
-        echo "     这是**正确性问题**，与性能无关；性能再好也不算数。"
-        return
-    fi
-
-    # 用 awk 做浮点比较（bash 不支持浮点）
-    local verdict
-    verdict="$(awk -v q="${mq}" -v p="${mp}" 'BEGIN{
-        if (q >= 25000 && p <= 15)      print "PASS"
-        else if (q >= 20000)            print "WARN"
-        else                            print "FAIL"
-    }')"
-
-    case "${verdict}" in
-        PASS)
-            echo "  ✅ **通过** —— QPS >= 25,000 且 P99 <= 15ms 且零错误。"
-            echo "     结论：加入监控栈后**性能无明显衰减**（本阶段的真正验收点）。"
-            ;;
-        WARN)
-            echo "  ⚠️ **基本通过** —— QPS 在 20,000~25,000，需归因。"
-            echo "     归因方向：宿主负载（见 §12.3）/ 监控端点开销 / 语料命中率。"
-            ;;
-        FAIL)
-            echo "  ❌ **不通过** —— QPS < 20,000。"
-            echo "     排查方向：监控栈是否成为新瓶颈（对照 §11.3 的污染源清单）。"
-            ;;
-    esac
-    echo ""
-}
-
-judge
 
 # ---------------------------------------------------------------- 8. 汇总
 log "⑧ 汇总"
@@ -325,8 +253,8 @@ SUMMARY="$OUT_DIR/summary.txt"
         [ -f "$F" ] || continue
         echo "  第 $i 轮:"
         echo "    QPS   = $(grep -oE 'Requests/sec:[^ ]+' "$F" | head -1 | tr -d ',' | awk '{print $2}')"
-        echo "    P50   = $(grep -A1 'Latency' "$F" | grep -oE '50.00%[^ ]*' | head -1 | awk '{print $2}')"
-        echo "    P99   = $(grep -oE '99.00%[^ ]*' "$F" | head -1 | awk '{print $2}')"
+        echo "    P50   = $(grep -E 'P50 / P90 / P99:' "$F" | head -1 | awk '{print $6}')"
+        echo "    P99   = $(grep -E 'P50 / P90 / P99:' "$F" | head -1 | awk '{print $10}')"
         echo "    非302 = $(grep -oE '非 302 响应数 : [0-9]+' "$F" | awk '{print $NF}')"
         echo "    错误  = $(grep -oE 'Socket 错误.*' "$F" | head -1)"
     done
@@ -335,7 +263,7 @@ SUMMARY="$OUT_DIR/summary.txt"
         echo "── 补充口径（$DURATION_EXTRA 稳态）──"
         F="$OUT_DIR/run-extra-60s.txt"
         echo "    QPS   = $(grep -oE 'Requests/sec:[^ ]+' "$F" | head -1 | tr -d ',' | awk '{print $2}')"
-        echo "    P99   = $(grep -oE '99.00%[^ ]*' "$F" | head -1 | awk '{print $2}')"
+        echo "    P99   = $(grep -E 'P50 / P90 / P99:' "$F" | head -1 | awk '{print $10}')"
     fi
 } | tee "$SUMMARY"
 
