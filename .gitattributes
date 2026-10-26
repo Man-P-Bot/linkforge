@@ -29,6 +29,11 @@
 *.json  text eol=lf
 *.md    text eol=lf
 *.py    text eol=lf
+# 忽略规则文件也统一 LF：它们要被 Docker / Git 逐行解析，
+# CRLF 会让「以 # 开头」这类判断在某些工具里意外失配。
+.gitignore   text eol=lf
+.dockerignore text eol=lf
+.gitattributes text eol=lf
 
 # ⚠️ 环境与凭据文件必须 LF（不只是脚本）：
 #   .example 是 Docker Secret 的**模板**，会被复制成真实 secret 文件。

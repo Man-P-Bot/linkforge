@@ -16,6 +16,17 @@ bin/
 *.orig
 *.rej
 
+# 原子写入的临时文件。
+# ⚠️ setup-local.sh 生成 secret 时先写 <name>.tmp 再 mv —— 中途 Ctrl-C
+#    会留下一个半截文件。这种文件绝不能进 git。
+*.tmp
+
+# Windows 路径里混进分号产生的空壳目录（如 `scripts;D/`、`results;D/`）。
+# 根因：命令行里 `-v "D:/path;D:/path"` 这类写法被 shell 拆成了两段。
+# 它们是空目录（git 本来就不跟踪），但会让 `ls` 与 `find` 变得莫名其妙，
+# 也会让「哪些文件属于项目」这件事失去说服力。
+*;*/
+
 # --- IDE / editor ---
 .idea/
 *.iml

@@ -20,6 +20,16 @@ target/
 docker/mysql/data/
 docker/redis/data/
 
+# ⚠️ Docker Secrets：真实凭据**绝不进构建上下文**
+#
+#   Dockerfile 的 builder 阶段有一句 `COPY . .`（缓存友好但会把整个上下文
+#   拷进 builder 镜像层）。若 docker/secrets/ 不排除，
+#   真实的 Grafana / Prometheus 口令就会留在 **builder 层与构建缓存**里。
+#   最终 runtime 阶段只 COPY 了 jar，所以最终镜像本身是干净的 ——
+#   但中间层与 build cache 仍能被 `docker history` / cache 导出看到。
+#   secret 是**运行时**通过 compose secrets 挂载的，构建期完全不需要。
+docker/secrets/
+
 # 文档与脚本：运行镜像不需要
 docs/
 scripts/
