@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | **技术栈** | Java 17 · Spring Boot 3 · MyBatis · MySQL 8.4 · Redis 7.4 · Caffeine · Docker Compose · Prometheus · Grafana |
-| **工程约束** | Maven 5 模块 + ArchUnit 强制依赖边界 · JUnit 5 + Testcontainers 真实 MySQL 集成测试 · 61 条决策记录 · 24 条排障条目 |
+| **工程约束** | Maven 5 模块 + ArchUnit 强制依赖边界 · JUnit 5 + Testcontainers 真实 MySQL 集成测试 · **62 条决策记录** · 24 条排障条目 |
 | **实测结论** | 跳转 **29,388 QPS / P99 11.00ms**（同口径 3×30s 中位）· 8 小时长稳 **0 次 Full GC** · 后端拐点 **c=400~800** |
 
 ---
@@ -423,7 +423,7 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块边界、缓存分层、降级矩阵、监控栈 |
 | [DATABASE.md](docs/DATABASE.md) | 表设计、索引意图、保留策略 |
 | [API.md](docs/API.md) | 接口契约、错误码、版本策略 |
-| [DECISIONS.md](docs/DECISIONS.md) | **决策记录 DR-001 ~ DR-061**（含总目录） |
+| [DECISIONS.md](docs/DECISIONS.md) | **决策记录 DR-001 ~ DR-062**（含按主题分组的总目录） |
 | [PROGRESS.md](docs/PROGRESS.md) | 进度台账 |
 | [PERFORMANCE.md](docs/PERFORMANCE.md) | **压测数据、口径声明、资源水位**（含章节目录） |
 | [DESIGN-W4.md](docs/DESIGN-W4.md) | 第 4 周设计（过期清理 + Testcontainers 改造） |
@@ -442,17 +442,34 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
   「Compose 在 secret 缺失时不报错」「CRLF 让容器内 `/bin/sh` 崩在第一行」
   「压测期间动手 = 自己污染自己的数据」这类**通用陷阱**。
 
-### ⚠️ 已知缺口（第 6 周收尾审计新发现，**已定位未修复**）
+### ⚠️ 已知缺口与 v2 Roadmap（**刻意不修**，已归档）
 
-诚实地把「文档写了但代码没做」的地方标出来，比只展示做对的部分更有说服力：
+第 6 周收尾审计逐条比对了「文档写了什么」与「代码做了什么」，
+找出 4 处**文档与实现不一致**或**设计未落地**的地方。
 
-| 缺口 | 影响 | 状态 |
-|---|---|---|
-| **布隆重建窗口内写穿没有双写** → 新建短码偶发 404 | 窄窗口（分钟级），但用户感知是「刚生成的链接打不开」 | DR-007 设计要求双写，实现未做；DR-055 已记录但延到 v2。修复方案见 [T-027](docs/TROUBLESHOOTING.md) |
-| **统计 HLL key 驻留 35 天**（设计要求「当天」） | Redis 内存上界比设计高约 35 倍（1.2GB → 42GB） | 「量还没到」而非「设计对了」。修复方案见 [T-028](docs/TROUBLESHOOTING.md) |
-| **统计 90 天保留的批量清理任务未实现** | 数据量上来后统计表无限增长 | 索引已建好，任务待补（DATABASE.md §7.3 / §12 D-5） |
-| **readiness 不含 MySQL / Redis / 布隆** | 「readiness 通过」只代表进程起来了 | v2 事项（ARCHITECTURE.md §15.2） |
+**决策：全部保留为 v2 事项，本次一律不改代码。**
 
-> ⚠️ 这四条都**不是**「没想到」，而是**当时判断过、延后处理、或实现漏了**。
-> 每一条在文档里都能找到它被发现的那一刻与当时的取舍理由 ———
-> 这比「全部一次做对」更接近真实工程。
+| # | 缺口 | 实际影响 | 为什么现在不修 | 修复方向 |
+|---|---|---|---|---|
+| **1** | **布隆重建窗口内写穿没有双写**<br/>`put()` 只写现行 key，`rebuild()` 的 `RENAME` 覆盖现行 key | 重建期间（分钟级）新建的短码 → 布隆假阴性 → **首次访问 404**。用户感知是「刚生成的链接打不开」 | 第 5 周压测数据已冻结；改代码必须重测。DR-007 设计要求双写、DR-055 第 3 周已实测到，但当时判断「v1 先绕过」 | 引入 `rebuilding` 状态标志，标志为真时 `put()` **同时写现行 key 与 `:building`**；或改用 `BITOP` 把现行 key 的位并入 `:building` 再切换。<br/>📄 [T-027](docs/TROUBLESHOOTING.md) · [ARCHITECTURE §7.1](docs/ARCHITECTURE.md) |
+| **2** | **统计 HLL key 驻留 35 天**（设计要求「当天」）<br/>落库只 `PFCOUNT` 不删 UV key，TTL 是 `Duration.ofDays(35)` | Redis 内存上界比设计高约 **35 倍**（1.2GB → **42GB**）。「量还没到」不等于「设计对了」 | 同上；且当前真实活跃链路数远低于 PRD 的 10 万假设，压测语料只有 1 万条 | flush 成功后**主动删除**当日 UV key（对齐 PV 的「取走即删」）；TTL 改为「当天结束 + 余量」，35 天仅作兜底；补 HLL key 数量与 `used_memory` 的监控。<br/>📄 [T-028](docs/TROUBLESHOOTING.md) · [DATABASE §9.2](docs/DATABASE.md) |
+| **3** | **统计 90 天保留的批量清理任务未实现**<br/>只有短链过期清理，没有按 `stat_date` 的批量 DELETE | 数据量上来后 `link_stats_daily` 无限增长 | 当前行数远低于 900 万上界，不实现是可接受的；但**上生产前必须补** | 索引 `idx_stat_date` 已建好；补一个按 `stat_date` 区间分批 DELETE 的低峰期定时任务（v2 可退化为 range 分区 + drop 分区）。<br/>📄 [DATABASE §7.3](docs/DATABASE.md) · §12 D-5 |
+| **4** | **readiness 不含 MySQL / Redis / 布隆**<br/>无自定义 `HealthIndicator`，readiness 组默认只有 `readinessState` | 「readiness 通过」=「进程起来了」，**不代表依赖可用** | Compose 侧已用各自容器的 healthcheck 保证启动顺序，缺口不影响本地与当前部署 | 补 `management.endpoint.health.group.readiness.include=readinessState,db,redis`，并新增一个布隆 `HealthIndicator`。<br/>📄 [ARCHITECTURE §15.2](docs/ARCHITECTURE.md) |
+
+> ⚠️ **这四条都不是「没想到」**，而是**当时判断过并延后、或实现漏了**。
+> 每一条在文档里都能找到它**被发现的那一刻**与**当时的取舍理由**
+> （T-027 / T-028 是本次新写的复盘；#3 / #4 在 `docs/DATABASE.md` §12 与
+> `docs/ARCHITECTURE.md` §16bis 里有原始记录）。
+>
+> 📌 **为什么不修**（Trade-off 记录）：
+> ① **第 5 周的性能数据已冻结** —— 任何代码改动都会让
+> 「29,387 QPS / P99 11.00ms」这组数字失去可复现性，
+> 而这组数字是本项目最有价值的产出；
+> ② 这 4 条**都不是当前部署形态下的阻塞问题**（量没到 / 单实例 / 索引已备）；
+> ③ **把它们明确写下来，比默默留着或草率改掉更有价值** ——
+> 「知道自己没做什么、为什么不做、什么时候做」本身就是工程判断力。
+>
+> 📌 **v1 的边界**：本项目是一个**求职作品**，不是生产系统。
+> 它证明的是「能做出可量化的优化、能识别自己的问题、能说清取舍」，
+> 而不是「生产级完备」。**把已知限制摆在明面上，比藏起来更可信。**
+
