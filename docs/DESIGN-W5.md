@@ -18,7 +18,7 @@
 |---|---|---|
 | **监控与部署** | `docker compose up -d` 一键起全套（App + MySQL + Redis + Prometheus + Grafana），凭据不落明文 | ✅ 完成 |
 | **长稳排查** | 验证 DR-057 记录的「19 小时 Metaspace 涨到 74MB」是不是泄漏 | ✅ 完成（**证伪**） |
-| **终极压测** | 与第 1/2/3 周**同口径**的最终数据 + 阶梯加压找拐点 | ⏳ 阶段 4 待跑 |
+| **终极压测** | 与第 1/2/3 周**同口径**的最终数据 + 阶梯加压找拐点 | ✅ 完成（组 A / 组 C，组 B 有意不做） |
 
 ---
 
@@ -236,7 +236,10 @@ JVM **自己**检测到元数据增长，触发了一次元空间专用 GC；
 
 ---
 
-## 4. 终极压测（第 5 周阶段 4，待跑）
+## 4. 终极压测（第 5 周阶段 4，✅ 已完成）
+
+> ✅ **实测结果见 `docs/PERFORMANCE.md` §11.4（组 A）/ §11.6（组 C）与 §13（收尾结论）**。
+> 组 B（调优版）**有意未跑**，理由见 `docs/PERFORMANCE.md` §11.5。
 
 ### 4.1 三个防线
 
@@ -278,5 +281,5 @@ QPS < 20,000                         -> ❌ 不通过
 | 监控 | Prometheus + Grafana 全声明式；`shortlink.meter.count` Gauge |
 | 文档 | 本文件、`PITFALLS.md`（防呆清单）、`RESUME-DRAFT.md`（简历素材） |
 | 决策 | DR-060（过期清理）、**DR-061（推翻 Metaspace 泄漏伪 bug）** |
-| 排障 | `TROUBLESHOOTING.md` 新增 T-015 ~ T-024（10 条） |
+| 排障 | `TROUBLESHOOTING.md` 新增 T-015 ~ T-026（12 条）；第 6 周收尾再补 T-027 / T-028 |
 | 工具 | `final-bench.sh`（含自动判定）、`staircase-bench.sh`、`longrun-{load,collect,watch}.sh` |
