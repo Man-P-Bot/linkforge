@@ -38,6 +38,18 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      # ⚠️ **必须用独立的逻辑库（DB 15）**，与本机运行中的应用（DB 0）隔离。
+      #
+      # 原因（DR-065）：集成测试会**真实地全量重建布隆过滤器**，
+      # 而重建的产物是全局 key `shortlink:bloom`（RENAME 原子切换）。
+      # 若测试与应用共用 DB 0，测试里的一次重建就会把
+      # **本机应用已积累的真实短码的布隆整个覆盖掉**——
+      # 表现为「跑完 mvn test 后，应用里自己创建的短码突然全 404」，
+      # 而且要等应用的下一次定时重建（1 小时）才自愈。
+      #
+      # 用同一个 Redis 服务的不同逻辑库，既拿到了隔离，又保留了
+      # 「连的是不是生产同款 Redis 7.4」这个属性。
+      database: ${TEST_REDIS_DATABASE:15}
       # ⚠️ 测试环境放宽到 1000ms：冷连接 + 上下文初始化会打满 50ms
       #    （实测 SpringBootTest 首条命令即RedisCommandTimeoutException）
       #    ⚠️ **生产 application.yml 保持 50ms 不动**（DR-011）：
@@ -76,6 +88,18 @@ SHORTLINK_BASE_URL: http://localhost:8080
 #    ⚠️ 这**不是**在生产配置里放宽校验——生产仍然走环境变量，
 #    缺失时依然 fail-fast（见 AdminAuthConfig 的构造器）。
 ADMIN_API_TOKEN: test_only_admin_token_for_integration_tests
+
+# ⚠️ 测试环境放宽限流阈值（生产值见 .env / .env.example）。
+#
+# 原因：集成测试会在**同一个应用上下文**里连着创建十几条短链、连发 20 次跳转，
+# 而生产阈值是「创建 10 次/分钟、跳转 20 次/秒」——
+# 于是测试会随机地撞上 429（TOO_MANY_REQUESTS），
+# 表现为「单跑一个测试类是绿的，跑全量就红」——
+# 这是最难查的那种 flaky（限流器自己还有独立的单元测试覆盖，阈值不影响被测行为）。
+RATE_LIMIT_REDIRECT_PER_SEC: 1000
+RATE_LIMIT_CREATE_PER_MIN: 1000
+RATE_LIMIT_QUERY_PER_SEC: 1000
+RATE_LIMIT_ADMIN_PER_MIN: 1000
 
 logging:
   level:

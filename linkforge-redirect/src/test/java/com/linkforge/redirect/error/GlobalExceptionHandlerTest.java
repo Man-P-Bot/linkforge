@@ -115,7 +115,7 @@ class GlobalExceptionHandlerTest {
         assertThat(resp.getBody()).containsEntry("code", "LINKFORGE-404-01");
     }
 
-    // ------------------------------------------------------------ DR-064 噪声
+    // ------------------------------------------------------------ DR-065 噪声
 
     @Test
     @DisplayName("⭐⭐ favicon.ico → 状态码照给，但**不刷错误日志**（浏览器噪声）")

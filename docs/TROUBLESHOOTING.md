@@ -809,6 +809,11 @@ org.springframework.web.HttpRequestMethodNotSupportedException: Request method '
 
 ### T-027 布隆重建的「原子切换」覆盖了重建期间新建的短码 → 假阴性 404
 
+> ✅ **已修复（2026-10-27，DR-065）**：采用下表的**方案 A（双写）**，
+> 并额外做了三件事：启动即重建、重建提速 8 倍、批量写用独立的 Redis 超时预算。
+> 回归测试见本节末尾与 `docs/DECISIONS.md` DR-065。
+> 下面是**修复前**的原始记录（保留：排查思路比结论更值得复用）。
+
 **现象**
 
 一个**刚创建**的短码，第一次访问就返回 **404**。
@@ -860,20 +865,41 @@ t5  访问 id=1001 → 布隆判「不存在」→ 404
 
 **解决**
 
-⚠️ **本条尚未修复**，是第 6 周收尾审计新发现的问题。三种修法：
+⚠️ **本条已于 2026-10-27 修复**（DR-065），采用**方案 A（双写）**。三种修法对比：
 
-| 方案 | 做法 | 代价 |
-|---|---|---|
-| **A（推荐）** | 引入 `rebuilding` 状态标志；标志为真时 `put()` **同时写现行 key 与 `:building`** | 需要一个跨实例可见的状态（Redis key 或 DB 标志） |
-| B | 重建结束时不做覆盖式 `RENAME`，而是把**现行 key 的位并入** `:building` 再切换 | `SETBIT` 逐位并集成本高（9500 万位），需要改用 `BITOP` |
-| C | 缩短重建间隔，缩小窗口 | 只降低概率，不消除问题；且重建本身有开销 |
+| 方案 | 做法 | 代价 | 结论 |
+|---|---|---|---|
+| **A（推荐，已采用）** | 引入 `rebuilding` 状态标志；标志为真时 `put()` **同时写现行 key 与 `:building`** | 需要一个状态标志（单实例用本地 `AtomicBoolean` 即可） | ✅ 已实现 |
+| B | 重建结束时不做覆盖式 `RENAME`，而是把**现行 key 的位并入** `:building` 再切换 | `SETBIT` 逐位并集成本高（9500 万位），需要改用 `BITOP` | 未采用 |
+| C | 缩短重建间隔，缩小窗口 | 只降低概率，不消除问题；且重建本身有开销 | 未采用 |
 
-**推荐的验证方式**（修复后必须补）：
+**已实现的修复要点**（细节见 DR-065）：
 
-1. 在测试里**卡住**重建（mock 住扫描，让它停在游标中间）；
-2. 期间创建一个新短码；
-3. 放行重建完成；
-4. 断言该短码**仍能被布隆判为存在**（或至少：跳转不返回 404）。
+1. **双写**：`RedisBloomFilter.beginRebuild()` 打开写穿窗口 → 窗口期内 `put()`
+   同时写现行 key 与 `:building` → RENAME 切换后新短码不丢。
+2. **顺序约束**（写反就复发）：窗口与 `:building` 的删除都必须在**数据库扫描之前**。
+   已用 `BloomFilterMaintenanceTest` 的 `InOrder` 断言把顺序锁死。
+3. **空快照不切换**：库里没有有效短码时跳过重建——
+   **空布隆的 key 是存在的**，会让全站请求被判「一定不存在」→ 全站 404。
+4. **启动即重建**：`ApplicationReadyEvent` 触发，不再依赖定时任务的 `initialDelay`。
+5. **重建提速 8 倍**：逐条 7 次 SETBIT → 批量 pipeline，2 万条从 **28 秒降到 3.5 秒**。
+   窗口越短，「窗口期内新建短码丢失」的概率越低。
+6. **批量写用独立的 Redis 超时**：跳转路径的 50ms 预算（DR-011）不能被批量写撑爆，
+   批量维护另给一个 5s 预算的连接。
+
+**已补的回归测试**：
+
+| 测试 | 锁住什么 |
+|---|---|
+| `RedirectEndToEndTest#writeThroughDuringRebuildSurvivesSwitch` | 重建窗口期写穿的短码，RENAME 切换后**不丢**（已用「关掉修复 → 该测试变红」验证过它真的会抓） |
+| `RedirectEndToEndTest#newlyCreatedShortCodeRedirectsImmediately` | 创建后**立刻**跳转必须 302，且布隆里 7 个位都为 1 |
+| `RedirectEndToEndTest#existingShortCodeSurvivesRestartRebuild` | 模拟重启（清空布隆 → 全量重建）后旧短码仍 302 |
+| `BloomFilterMaintenanceTest#opensWriteThroughWindowBeforeScanning` | 「开窗口 → 扫描 → 切换」的**顺序**不可颠倒 |
+| `RedisBloomFilterTest#emptySnapshotDoesNotCreateEmptyBloom` | 空快照绝不创建空布隆 |
+
+⚠️ **测试自身的一个坑**（顺手修掉了）：原 E2E 的 `createLink()` 会**手工**把短码的位写进布隆，
+等于**替应用把写穿做了**——写穿坏掉时所有 E2E 用例照样全绿。
+现在位由应用的写穿负责，E2E 才真的在验证它。
 
 **教训**
 

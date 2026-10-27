@@ -45,7 +45,7 @@ public class GlobalExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     /**
-     * 浏览器噪声路径（DR-064）。
+     * 浏览器噪声路径（DR-065）。
      *
      * <p>这些路径由浏览器自动请求，与业务无关：
      * 命中时一律<b>降级为 DEBUG 日志</b>，不刷 WARN/ERROR。
@@ -84,7 +84,7 @@ public class GlobalExceptionHandler {
     /**
      * 是否属于「浏览器噪声请求」。
      *
-     * <p>⚠️ <b>为什么需要它</b>（DR-064）：
+     * <p>⚠️ <b>为什么需要它</b>（DR-065）：
      * {@code /favicon.ico} 会落到跳转路径 {@code /{code}} 上，
      * 而 {@code favicon.ico} 不是合法短码（含 {@code .}）→ 400。
      * 浏览器每个标签页都会请求一次 favicon，于是错误日志里全是
@@ -186,7 +186,7 @@ public class GlobalExceptionHandler {
             HttpRequestMethodNotSupportedException e, HttpServletRequest request) {
         String method = e.getMethod();
         if (isNoisePath(request)) {
-            // ⚠️ 噪声路径不刷 WARN（DR-064）：浏览器自动请求而已，不是故障
+            // ⚠️ 噪声路径不刷 WARN（DR-065）：浏览器自动请求而已，不是故障
             log.debug("噪声请求方法不被支持：{} {}", method, e.getSupportedHttpMethods());
         } else {
             log.warn("方法不被支持：{} {}", method, e.getSupportedHttpMethods());

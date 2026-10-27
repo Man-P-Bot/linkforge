@@ -125,7 +125,7 @@ flowchart LR
 | 主题 | 指标 |
 |---|---|
 | 缓存 | `shortlink.cache.local.hit` · `shortlink.cache.redis.hit` · `shortlink.cache.miss` · `shortlink.cache.evict.failed` |
-| 布隆 | `shortlink.bloom.blocked` · `shortlink.bloom.put.failed` · `shortlink.bloom.rebuild` |
+| 布隆 | `shortlink.bloom.blocked` · `shortlink.bloom.put.failed` · `shortlink.bloom.rebuild` · `shortlink.bloom.rebuild.failed` |
 | 限流 | `shortlink.ratelimit.rejected` · `shortlink.ratelimit.degraded` · `shortlink.ratelimit.bypassed` |
 | 统计 | `shortlink.stats.offered` / `dropped` / `flushed` / `queue.size` / `flush.duration` / `dlq.*` |
 | 过期清理 | `shortlink.cleanup.scanned` / `cleared` / `cache.evicted` / `duration` / `failed` |

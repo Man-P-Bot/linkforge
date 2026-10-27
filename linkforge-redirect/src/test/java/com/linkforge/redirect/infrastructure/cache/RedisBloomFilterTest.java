@@ -137,6 +137,7 @@ class RedisBloomFilterTest {
     @Test
     @DisplayName("⭐⭐ 场景 4 / DR-007：重建**从不删除现行 key**，只 RENAME 切换")
     void rebuildNeverDeletesLiveKey() {
+        bloom.beginRebuild();
         bloom.rebuild(List.of("0Q1A2b3", "0Q1A2b4"));
 
         // ⚠️ 核心断言：DEL 的对象只能是 :building，绝不能是 shortlink:bloom。
@@ -149,9 +150,67 @@ class RedisBloomFilterTest {
     @Test
     @DisplayName("⭐⭐ 场景 4：重建时先写 :building，读路径仍指向现行 key")
     void rebuildWritesOnlyBuildingKey() {
+        bloom.beginRebuild();
         bloom.rebuild(List.of("0Q1A2b3"));
 
         verify(valueOps, never()).setBit(eq(BloomHash.PREFIX), anyLong(), anyBoolean());
+    }
+
+    // ------------------------------------------------------------ DR-065 回归
+
+    @Test
+    @DisplayName("⭐⭐⭐ DR-065：重建窗口期内的写穿**必须同时**写现行 key 与 :building")
+    void writeThroughDuringRebuildAlsoWritesBuildingKey() {
+        // ⚠️ 这是本次事故的根因：重建期间新建的短码，写穿只落现行 key，
+        //    随后的 RENAME 把它一起丢掉 → 该短码永久 404。
+        bloom.beginRebuild();
+
+        bloom.put(CODE);
+
+        // 现行 key：保证重建期间的新短码立刻可跳转
+        for (int bit : indexes()) {
+            verify(valueOps).setBit(BloomHash.PREFIX, bit, true);
+        }
+        // :building：保证 RENAME 切换后不丢
+        for (int bit : indexes()) {
+            verify(valueOps).setBit(BloomHash.PREFIX + BloomHash.BUILDING_SUFFIX, bit, true);
+        }
+    }
+
+    @Test
+    @DisplayName("⭐ DR-065：非重建窗口期的写穿**不碰** :building")
+    void writeThroughOutsideRebuildWindowDoesNotTouchBuildingKey() {
+        bloom.put(CODE);
+
+        verify(valueOps, never())
+                .setBit(eq(BloomHash.PREFIX + BloomHash.BUILDING_SUFFIX), anyLong(), anyBoolean());
+    }
+
+    @Test
+    @DisplayName("⭐⭐⭐ DR-065：空快照**绝不**创建空布隆（空布隆 = 全站 404）")
+    void emptySnapshotDoesNotCreateEmptyBloom() {
+        bloom.beginRebuild();
+
+        long written = bloom.rebuild(List.of());
+
+        assertThat(written).isZero();
+        // ⚠️ 核心断言：不能 RENAME 一个空 key 上去。
+        //    现行 key 存在但一位都是 0 时，检查脚本会判「一定不存在」→ 全站 404。
+        verify(redis, never()).rename(anyString(), anyString());
+        verify(redis, never()).delete(BloomHash.PREFIX);
+    }
+
+    @Test
+    @DisplayName("⭐ DR-065：endRebuild 清理 RENAME 后残留的 :building")
+    void endRebuildCleansLeftoverBuildingKey() {
+        bloom.beginRebuild();
+        bloom.rebuild(List.of("0Q1A2b3"));
+
+        bloom.endRebuild();
+
+        // beginRebuild 删一次 + endRebuild 再删一次
+        verify(redis, org.mockito.Mockito.times(2))
+                .delete(BloomHash.PREFIX + BloomHash.BUILDING_SUFFIX);
     }
 
     @Test

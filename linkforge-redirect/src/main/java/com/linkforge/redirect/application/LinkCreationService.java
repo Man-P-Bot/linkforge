@@ -135,18 +135,39 @@ public class LinkCreationService {
      * 把布隆写穿挂到<b>事务提交后</b>。
      *
      * <p>⚠️ 没有事务时（理论上不会，{@code @Transactional} 保证有）立即执行。
+     *
+     * <p>⚠️ <b>提交后写穿失败绝不能变成接口失败</b>（DR-065）：
+     * 事务此时<b>已经提交</b>，短码已经在库里了——此时把异常抛出去，
+     * 调用方看到的是 500，而库里那条记录却真实存在。
+     * 「接口报失败但数据已落库」比「接口成功但布隆没写穿」糟糕得多：
+     * 前者会诱使调用方重试创建（产生重复短链），后者只是多查一次库。
+     * 所以这里兜住所有异常，只记日志。
      */
     private void registerBloomWriteThrough(String shortCode) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            bloomMaintenance.writeThrough(shortCode);
+            writeThroughSafely(shortCode);
             return;
         }
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                bloomMaintenance.writeThrough(shortCode);
+                writeThroughSafely(shortCode);
             }
         });
+    }
+
+    /**
+     * 执行写穿，吞掉所有异常（理由见 {@link #registerBloomWriteThrough}）。
+     */
+    private void writeThroughSafely(String shortCode) {
+        try {
+            bloomMaintenance.writeThrough(shortCode);
+        } catch (RuntimeException e) {
+            // ⚠️ 布隆是优化不是正确性来源：写失败的后果只是这个新短码
+            //    要等下次全量重建才被布隆放行，不会丢数据。
+            log.warn("布隆写穿异常（不影响创建，短码已落库，重建后自愈）: code={} {}",
+                    shortCode, e.toString(), e);
+        }
     }
 
     private Link insertCustom(String customCode, String targetUrl, LocalDateTime expireAtUtc) {

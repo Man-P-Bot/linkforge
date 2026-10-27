@@ -103,6 +103,22 @@ public abstract class MySqlContainerSupport {
                 + "&characterEncoding=utf8");
         registry.add("spring.datasource.username", MYSQL::getUsername);
         registry.add("spring.datasource.password", MYSQL::getPassword);
+
+        // ⚠️ 放宽限流阈值（DR-065 的副产品）。
+        //
+        // 背景：集成测试会在**同一个应用上下文**里连着创建十几条短链、连发 20 次跳转，
+        // 而生产阈值是「创建 10 次/分钟、跳转 20 次/秒」——
+        // 于是测试会随机撞上 429，表现为「单跑一个测试类是绿的，跑全量就红」。
+        // 这是最难查的那种 flaky：报错与被测行为毫无关系。
+        //
+        // ⚠️ 为什么放在这里（而不是只写在 application-test.yml）：
+        // @DynamicPropertySource 的属性源优先级**高于环境变量**，
+        // 所以即使本机 export 了 RATE_LIMIT_CREATE_PER_MIN=10，测试里也一定是宽松值。
+        // 限流器本身有独立单元测试覆盖，阈值不影响任何被测行为。
+        registry.add("RATE_LIMIT_REDIRECT_PER_SEC", () -> 1000);
+        registry.add("RATE_LIMIT_CREATE_PER_MIN", () -> 1000);
+        registry.add("RATE_LIMIT_QUERY_PER_SEC", () -> 1000);
+        registry.add("RATE_LIMIT_ADMIN_PER_MIN", () -> 1000);
     }
 
     /**

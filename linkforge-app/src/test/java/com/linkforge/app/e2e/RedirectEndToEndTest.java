@@ -73,6 +73,9 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
     /** 本类专用短码前缀，与其它测试不冲突。 */
     private static final String PREFIX = "e2e";
 
+    /** 布隆的全局 key（与生产同 key 名，但测试走独立逻辑库，见 application-test.yml）。 */
+    private static final String BLOOM_KEY = "shortlink:bloom";
+
     /**
      * 真实 HTTP 客户端。
      *
@@ -137,6 +140,22 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
     @Autowired
     private io.micrometer.core.instrument.MeterRegistry meterRegistry;
 
+    /**
+     * 布隆维护（启动重建 / 定时重建的编排层）。
+     *
+     * <p>用于「模拟重启后的初始化重建」这一场景（DR-065）。
+     */
+    @Autowired
+    private com.linkforge.redirect.infrastructure.cache.BloomFilterMaintenance bloomMaintenance;
+
+    /**
+     * 布隆过滤器本体（真实 Redis）。
+     *
+     * <p>用于「重建窗口期内的写穿不丢」这一回归场景（DR-065）。
+     */
+    @Autowired
+    private com.linkforge.redirect.infrastructure.cache.RedisBloomFilter bloomFilter;
+
     private final List<String> created = new ArrayList<>();
 
     /**
@@ -190,8 +209,8 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
         // 恢复布隆：场景 5 会 DEL 它，后续测试不能受影响。
         // 置一个远处的位即可——布隆只需「存在」，不需内容正确
         // （下个定时重建会用 RENAME 从库里重建出真实内容）。
-        if (!Boolean.TRUE.equals(redis.hasKey("shortlink:bloom"))) {
-            redis.opsForValue().setBit("shortlink:bloom", 1, true);
+        if (!Boolean.TRUE.equals(redis.hasKey(BLOOM_KEY))) {
+            redis.opsForValue().setBit(BLOOM_KEY, 1, true);
         }
     }
 
@@ -211,12 +230,31 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
         String code = json.path("data").path("shortCode").asText();
         assertThat(code).isNotBlank();
         created.add(code);
-        // ⚠️ 必须写**全部 k 个位**：只设第0 位的话，布隆查另外 6 位时会判否，
-        // 于是刚创建的短码立刻 404——这是测试自己造的假故障。
-        for (int bit : bitsOf(code)) {
-            redis.opsForValue().setBit("shortlink:bloom", bit, true);
-        }
+        // ⚠️⚠️ **刻意不手工置位**（DR-065）：
+        //    旧版本这里手工把短码的 7 个位写进布隆，等于**替应用把写穿做了**——
+        //    于是「写穿到底有没有生效」这条链路在 E2E 层完全没被验证：
+        //    写穿坏掉时，所有 E2E 用例照样全绿（这正是本次事故的成因）。
+        //    现在位由应用的写穿负责，E2E 才真的在验证它。
         return code;
+    }
+
+    /**
+     * 断言「布隆里确实有这个短码的每一位」。
+     *
+     * <p>⚠️ <b>为什么必须断言位，而不只是断言 302</b>：
+     * 布隆 key 不存在时，检查脚本会**放行**（未初始化 → 查库），
+     * 此时即使写穿完全失效，GET 也会返回 302 —— <b>假通过</b>。
+     * 只有断言「7 个位都为 1」，才真的证明了写穿执行过。
+     */
+    private void assertBloomContains(String shortCode) {
+        assertThat(redis.hasKey(BLOOM_KEY))
+                .as("布隆 key 应存在。若不存在，检查脚本会放行，下面的 302 就成了假通过")
+                .isTrue();
+        for (int bit : bitsOf(shortCode)) {
+            assertThat(redis.opsForValue().getBit(BLOOM_KEY, bit))
+                    .as("布隆的第 %d 位应为 1（写穿漏了这一位 → 该短码会被判「一定不存在」）", bit)
+                    .isTrue();
+        }
     }
 
     private int[] bitsOf(String shortCode) {
@@ -317,7 +355,7 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
         redis.delete(CacheKeys.code(code));
 
         // 模拟首次部署前 / 重建窗口期：布隆不存在
-        redis.delete("shortlink:bloom");
+        redis.delete(BLOOM_KEY);
 
         ResponseEntity<String> resp = get("/" + code);
 
@@ -337,7 +375,7 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
 
         // 把该短码的全部位清零 → 布隆必判「不存在」
         for (int bit : bitsOf(code)) {
-            redis.opsForValue().setBit("shortlink:bloom", bit, false);
+            redis.opsForValue().setBit(BLOOM_KEY, bit, false);
         }
 
         ResponseEntity<String> resp = get("/" + code);
@@ -379,6 +417,94 @@ class RedirectEndToEndTest extends MySqlContainerSupport {
         assertThat(registryCounter("shortlink.stats.offered") - offeredBefore)
                 .as("404 不该被计为 PV——统计必须放在跳转判定之后")
                 .isZero();
+    }
+
+    // -------------------------------------------------------------- 场景 9（DR-065）
+
+    @Test
+    @DisplayName("9️⃣⭐⭐⭐ DR-065：创建后**立刻**跳转 → 302（验证真实写穿）")
+    void newlyCreatedShortCodeRedirectsImmediately() throws Exception {
+        String target = "https://example.com/e2e/write-through";
+        String code = createLink(target);
+
+        // ⚠️ 先证明写穿真的发生了（布隆里 7 个位都是 1）。
+        //    只断言 302 是不够的：布隆 key 不存在时脚本会放行 → 302 → 假通过。
+        assertBloomContains(code);
+
+        // ⚠️ **立刻**发起跳转请求，不做任何等待
+        ResponseEntity<String> resp = get("/" + code);
+
+        assertThat(resp.getStatusCode())
+                .as("新建短码必须立刻可跳转。404 说明写穿没落到位，"
+                        + "该短码会被布隆判「一定不存在」→ 真实用户 404（DR-065）")
+                .isEqualTo(HttpStatus.FOUND);
+        assertThat(resp.getHeaders().getFirst(HttpHeaders.LOCATION)).isEqualTo(target);
+    }
+
+    // -------------------------------------------------------------- 场景 10（DR-065）
+
+    @Test
+    @DisplayName("10️⃣⭐⭐⭐ DR-065：模拟重启（清空布隆 → 全量重建）→ 旧短码仍 302")
+    void existingShortCodeSurvivesRestartRebuild() throws Exception {
+        String target = "https://example.com/e2e/restart";
+        String code = createLink(target);
+        // 模拟「重启」：布隆被清空（Redis 重启 / 新实例 / 重建前）
+        redis.delete(BLOOM_KEY);
+        redis.delete(CacheKeys.code(code));
+
+        // 模拟启动时的初始化重建（与 BloomFilterMaintenance 启动路径同一条代码）
+        long rebuilt = bloomMaintenance.rebuild();
+
+        assertThat(rebuilt)
+                .as("重建应把库里的有效短码写回布隆")
+                .isPositive();
+        assertBloomContains(code);
+
+        ResponseEntity<String> resp = get("/" + code);
+
+        assertThat(resp.getStatusCode())
+                .as("重启重建后，已有短码必须仍然可跳转")
+                .isEqualTo(HttpStatus.FOUND);
+        assertThat(resp.getHeaders().getFirst(HttpHeaders.LOCATION)).isEqualTo(target);
+    }
+
+    // -------------------------------------------------------------- 场景 11（DR-065）
+
+    @Test
+    @DisplayName("11️⃣⭐⭐⭐ DR-065：重建窗口期写穿的短码，RENAME 切换后**不丢**")
+    void writeThroughDuringRebuildSurvivesSwitch() throws Exception {
+        String target = "https://example.com/e2e/rebuild-race";
+        String code = createLink(target);
+        redis.delete(CacheKeys.code(code));
+
+        // 复现事故时序：重建窗口期内新建的短码，写穿后立刻被 RENAME 切换覆盖。
+        // 修复前：写穿只落现行 key → RENAME 把它一起丢掉 → 该短码从此 404。
+        bloomFilter.beginRebuild();
+        bloomFilter.put(code);
+        bloomFilter.rebuild(java.util.List.of("e2eOld1"));
+        bloomFilter.endRebuild();
+
+        // ⚠️ 核心断言：切换之后，这个短码的位仍在现行 key 上
+        assertBloomContains(code);
+
+        ResponseEntity<String> resp = get("/" + code);
+
+        assertThat(resp.getStatusCode())
+                .as("重建窗口期创建的短码不能被 RENAME 丢掉（DR-065 的根因）")
+                .isEqualTo(HttpStatus.FOUND);
+        assertThat(resp.getHeaders().getFirst(HttpHeaders.LOCATION)).isEqualTo(target);
+    }
+
+    // -------------------------------------------------------------- 场景 12（DR-065）
+
+    @Test
+    @DisplayName("12️⃣⭐ favicon.ico → 204 且不产生错误日志（浏览器噪声）")
+    void faviconRequestIsSilent() {
+        ResponseEntity<String> resp = get("/favicon.ico");
+
+        assertThat(resp.getStatusCode())
+                .as("favicon.ico 不该走跳转用例，更不该产生 400 业务异常噪声")
+                .isEqualTo(HttpStatus.NO_CONTENT);
     }
 
     /** 读 Micrometer 计数器（actuator 或直接 registry 均可）。 */

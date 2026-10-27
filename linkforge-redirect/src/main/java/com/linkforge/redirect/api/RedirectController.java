@@ -96,6 +96,23 @@ public class RedirectController {
     }
 
     /**
+     * 浏览器自动请求的图标：<b>静默返回 204</b>（DR-065）。
+     *
+     * <p>⚠️ <b>为什么必须显式映射</b>：{@code /favicon.ico} 会落到 {@link #redirect} 的
+     * {@code /{code}} 上，而 {@code favicon.ico} 不是合法短码（含 {@code .}）→ 400。
+     * 浏览器<b>每个标签页都会请求一次</b>，于是错误日志里全是
+     * 「短码只能包含 Base62 字符: favicon.ico」——
+     * 噪声把真故障淹没了（D6 实测教训：一次真实缺陷能在 2 分钟内刷出 12 万条日志）。
+     *
+     * <p>显式映射后 Spring 优先匹配字面量路径，{@code favicon.ico} 不再进入跳转用例：
+     * 没有业务异常、没有错误日志、没有限流计数。
+     */
+    @GetMapping("/favicon.ico")
+    public ResponseEntity<Void> favicon() {
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
      * 尾斜杠一律 400，<b>不做重定向纠正</b>（API.md §4.1）。
      *
      * <p>自动纠正会让一个短码对应多个可访问 URL，破坏一一对应关系，

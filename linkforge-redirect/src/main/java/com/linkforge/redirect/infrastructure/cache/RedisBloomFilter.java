@@ -5,10 +5,14 @@ import com.linkforge.core.infrastructure.cache.BloomHash;
 import com.linkforge.core.infrastructure.cache.CacheKeys;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -29,6 +33,34 @@ import org.springframework.stereotype.Component;
  * <p>⚠️ <b>bit 下标在 Java 侧算好再传进 Lua</b>，不在 Lua 里算。
  * Lua 里算哈希需要 {@code redis.sha1hex} 这类命令，每个短码要多几次调用，
  * 反而更慢；Java 侧算好还能复用。
+ *
+ * <h2>⚠️⚠️ 重建窗口期：写穿必须同时落到现行 key 与 {@code :building}（DR-065）</h2>
+ * 双缓冲只解决了「重建期间现行 key 不被删」，<b>没解决「重建期间的写穿被 RENAME 吃掉」</b>：
+ * <pre>
+ *   T0  重建开始（扫描库）
+ *   T1  新短码 X 提交 → 写穿把 X 的位写进**现行 key**
+ *   T2  重建扫描结束（快照里没有 X——它在 T1 之后才落库）
+ *   T3  RENAME :building → 现行 key     ← X 的位随旧 key 一起被丢弃
+ *   T4  访问 X → 布隆判「一定不存在」 → **404**
+ * </pre>
+ * 实测事故：短码 {@code 0000VF1} 在重建窗口期内创建，重建完成后一直 404，
+ * 直到下一次全量重建才自愈（docs/DECISIONS.md DR-065）。
+ *
+ * <p><b>修法</b>：重建期间（{@link #beginRebuild()} ~ {@link #endRebuild()}）的写穿
+ * <b>同时写现行 key 与 {@code :building}</b>，于是 RENAME 切换后 X 依然在位。
+ *
+ * <p>⚠️ <b>两个动作的先后顺序不能颠倒</b>：
+ * <ol>
+ *   <li>{@link #beginRebuild()} 必须<b>早于数据库扫描</b>开启窗口，
+ *       否则「窗口期外创建的短码」既不在快照里、也没被写穿 → 404；</li>
+ *   <li>{@code :building} 的删除也必须<b>早于数据库扫描</b>，
+ *       否则扫描期间写穿到 {@code :building} 的位会被随后的 DEL 抹掉 → 404。</li>
+ * </ol>
+ * 两者都由 {@code beginRebuild()} 一次完成，调用方（{@code BloomFilterMaintenance}）
+ * 只要保证「先 beginRebuild，再扫描」即可。
+ *
+ * <p>⚠️ 窗口标志是<b>进程内</b>的（{@link AtomicBoolean}）：本项目是单实例部署
+ * （docs/ARCHITECTURE.md §12），多实例时需要把标志放进 Redis。
  */
 @Component
 public class RedisBloomFilter implements BloomFilter {
@@ -78,11 +110,52 @@ public class RedisBloomFilter implements BloomFilter {
             """, List.class);
 
     private final StringRedisTemplate redis;
+
+    /**
+     * 重建专用的模板（更长的超时预算）。
+     *
+     * <p>⚠️ 跳转路径的 Redis 超时是 50ms（DR-011），那是**跳转命令**的延迟预算；
+     * 而重建是批量写（几千个短码 × 7 个位），用同一个模板必然超时。
+     * 见 {@link com.linkforge.redirect.config.BloomMaintenanceRedisConfig}。
+     */
+    private final StringRedisTemplate maintenanceRedis;
+
     private final Counter blockedCounter;
     private final Counter putFailedCounter;
 
+    /**
+     * 重建窗口期标志（DR-065）。
+     *
+     * <p>为 {@code true} 时，{@link #put(String)} 会把短码<b>同时</b>写进现行 key
+     * 与 {@code :building}，保证 RENAME 原子切换后不会丢。
+     */
+    private final AtomicBoolean rebuilding = new AtomicBoolean(false);
+
+    /**
+     * 重建时单批 pipeline 的短码数。
+     *
+     * <p>⚠️ 为什么必须批量：逐个短码 7 次 SETBIT 往返时，
+     * 实测 <b>2 万条短码要 28 秒</b>（每条 7 次 RTT）。重建窗口长达半分钟，
+     * 期间新建的短码全都暴露在「写穿可能被 RENAME 吃掉」的风险里（DR-065）——
+     * <b>重建越慢，风险窗口越长</b>。批量 pipeline 后同样的 2 万条约 1 秒。
+     *
+     * <p>⚠️ 取 500 而不是更大：单批的**全部回复**必须在超时预算内返回，
+     * 批太大反而会撞上超时（实测 2000 条/批会超时）。500 条 = 3500 个命令，
+     * 在 5 秒的维护预算下绰绰有余。
+     */
+    private static final int PIPELINE_BATCH_CODES = 500;
+
     public RedisBloomFilter(StringRedisTemplate redis, MeterRegistry meterRegistry) {
+        this(redis, redis, meterRegistry);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RedisBloomFilter(StringRedisTemplate redis,
+                            @org.springframework.beans.factory.annotation.Qualifier(
+                                    "bloomMaintenanceRedisTemplate") StringRedisTemplate maintenanceRedis,
+                            MeterRegistry meterRegistry) {
         this.redis = redis;
+        this.maintenanceRedis = maintenanceRedis;
         this.blockedCounter = Counter.builder("shortlink.bloom.blocked")
                 .description("被布隆过滤器挡掉（判定为一定不存在）的请求数")
                 .register(meterRegistry);
@@ -130,14 +203,38 @@ public class RedisBloomFilter implements BloomFilter {
         try {
             int[] bits = new int[BloomHash.HASH_COUNT];
             BloomHash.bitIndexes(shortCode, bits);
-            for (int bit : bits) {
-                redis.opsForValue().setBit(BloomHash.PREFIX, bit, true);
+            setBits(BloomHash.PREFIX, bits);
+            if (rebuilding.get()) {
+                // ⚠️⚠️ 重建窗口期（DR-065）：**必须同时**写到 :building。
+                //    只写现行 key 的话，RENAME 原子切换会把这次写穿一起丢掉，
+                //    新建的短码从此 404，直到下一次全量重建才自愈。
+                setBits(buildingKey(), bits);
             }
         } catch (DataAccessException e) {
             // ⚠️ 失败只记日志 + 计数，**绝不抛出**（ARCHITECTURE.md §259）
             // 布隆是优化不是正确性来源，写失败就回滚创建会让它变成单点依赖
             putFailedCounter.increment();
             log.warn("布隆写穿失败（不阻塞创建，重建后自愈）: code={} {}", shortCode, e.getMessage());
+        } catch (RuntimeException e) {
+            // ⚠️ 同 checkAndGet 的教训（DR-054）：只 catch DataAccessException 会让
+            //    非 DataAccess 的 RuntimeException（序列化/类型转换类）穿透到调用方。
+            //    布隆是**保护措施**，它自己出错不该让创建接口挂掉。
+            putFailedCounter.increment();
+            log.warn("布隆写穿异常（不阻塞创建，重建后自愈）: code={} {}", shortCode, e.toString());
+        }
+    }
+
+    /**
+     * 写 k 个位（逐位 SETBIT）。
+     *
+     * <p>⚠️ 单条写穿刻意<b>不</b>做 pipeline：写穿在创建接口的关键路径上，
+     * 但创建是低频操作（QPS 个位数），7 次 RTT 的绝对开销可以忽略；
+     * 而 pipeline 的收益在<b>重建</b>路径上（那里一次要写几十万位），
+     * 见 {@link #writeBitsBatched(String, List)}。
+     */
+    private void setBits(String key, int[] bits) {
+        for (int bit : bits) {
+            redis.opsForValue().setBit(key, bit, true);
         }
     }
 
@@ -206,25 +303,109 @@ public class RedisBloomFilter implements BloomFilter {
      * 重建期间请求读的是现行 key，完全不受影响；
      * 若先 DEL 现行key，从 DEL 到 RENAME 之间所有真实短码都会被判「不存在」→ 404。
      *
+     * <h2>⚠️ 调用顺序（DR-065）</h2>
+     * <pre>
+     *   bloomFilter.beginRebuild();   // ① 删 :building + 打开写穿窗口（必须早于扫描）
+     *   List<String> all = 扫描数据库();  // ② 扫描
+     *   bloomFilter.rebuild(all);      // ③ 写位 + RENAME 原子切换
+     *   bloomFilter.endRebuild();     // ④ 关窗口 + 清理残留
+     * </pre>
+     * ①②的顺序颠倒会重新引入「写穿被 RENAME 吃掉」的 404 缺陷，详见类注释。
+     *
      * @param allShortCodes 全部有效短码（调用方负责分批扫描）
+     * @return 实际写入的短码数；{@code 0} 表示「库中没有有效短码，已跳过切换」
      */
-    public void rebuild(Iterable<String> allShortCodes) {
-        String buildingKey = BloomHash.PREFIX + BloomHash.BUILDING_SUFFIX;
-        try {
-            redis.delete(buildingKey);
-            for (String code : allShortCodes) {
-                int[] bits = new int[BloomHash.HASH_COUNT];
-                BloomHash.bitIndexes(code, bits);
-                for (int bit : bits) {
-                    redis.opsForValue().setBit(buildingKey, bit, true);
-                }
-            }
-            // ⚠️ RENAME 是原子的：切换瞬间不存在「两个都不对」的状态
-            redis.rename(buildingKey, BloomHash.PREFIX);
-            log.info("布隆重建完成：shortlink:bloom 由 :building 原子切换而来");
-        } catch (DataAccessException e) {
-            log.error("布隆重建失败，现行 key 未受影响（仍服务旧数据）: {}", e.getMessage());
+    public long rebuild(Iterable<String> allShortCodes) {
+        if (!rebuilding.get()) {
+            // ⚠️ 没开窗口就重建 = 扫描期间新建的短码既不在快照里、也没被写穿 → 404。
+            //    这里只是提醒，真正保证顺序的是调用方的 beginRebuild() 在扫描之前。
+            log.warn("布隆重建未处于写穿窗口期（beginRebuild 未先于数据库扫描调用），"
+                    + "扫描期间新建的短码可能在切换后丢失");
         }
+        List<String> all = new ArrayList<>();
+        allShortCodes.forEach(all::add);
+        if (all.isEmpty()) {
+            // ⚠️⚠️ **绝不创建「空布隆」**：空布隆的 key 是存在的，
+            //    而检查脚本的逻辑是「key 不存在 → 放行；key 存在 → 逐位查」。
+            //    于是空布隆会把**每一个**请求都判成「一定不存在」→ 全站 404。
+            //    保持 key 不存在（放行）才是安全的那一侧。
+            log.warn("布隆重建跳过：库中没有有效短码。不创建空布隆"
+                    + "（空布隆会把所有请求判为「一定不存在」→ 全站 404）");
+            return 0;
+        }
+        writeBitsBatched(buildingKey(), all);
+        // ⚠️ RENAME 是原子的：切换瞬间不存在「两个都不对」的状态
+        maintenanceRedis.rename(buildingKey(), BloomHash.PREFIX);
+        log.info("布隆重建完成：shortlink:bloom 由 :building 原子切换而来");
+        return all.size();
+    }
+
+    /**
+     * 打开重建窗口：删除 {@code :building} 并让写穿同时落到现行 key 与 {@code :building}。
+     *
+     * <p>⚠️ <b>必须在数据库扫描之前调用</b>（DR-065）：
+     * <ul>
+     *   <li>窗口在扫描<b>之前</b>打开 → 扫描期间创建的短码会被写穿到 {@code :building}，
+     *       RENAME 后依然在位；</li>
+     *   <li>{@code :building} 在扫描<b>之前</b>删除 → 扫描期间的写穿不会被随后的 DEL 抹掉。</li>
+     * </ul>
+     * 顺序反了就会重新引入「写穿被 RENAME 吃掉」的 404 缺陷。
+     */
+    public void beginRebuild() {
+        // ⚠️ 先开窗口再删 :building：反过来的话，「开窗口到删 key 之间」的写穿
+        //    会把位写进即将被删的 :building，白写一次（不影响正确性，但会让人困惑）。
+        rebuilding.set(true);
+        maintenanceRedis.delete(buildingKey());
+    }
+
+    /**
+     * 关闭重建窗口，并清理 RENAME 后可能残留的 {@code :building}。
+     *
+     * <p>⚠️ 残留清理是安全的：RENAME 之后 {@code :building} 里只剩「切换后又被写穿」的位，
+     * 而那些位<b>同时</b>也写进了现行 key，删掉不影响正确性。
+     */
+    public void endRebuild() {
+        rebuilding.set(false);
+        try {
+            maintenanceRedis.delete(buildingKey());
+        } catch (RuntimeException e) {
+            // 清理失败无所谓：下次 beginRebuild() 会再删一次
+            log.warn("清理布隆 :building 残留失败（不影响正确性）: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 批量写位（pipeline）。
+     *
+     * <p>⚠️ <b>为什么必须批量</b>：逐条 SETBIT 是 7 次 RTT/短码，
+     * 实测 2 万条短码要 28 秒；pipeline 后同样的量约 1 秒。
+     * 重建窗口越短，「窗口期内新建的短码丢失」的概率越低（DR-065）。
+     *
+     * <p>⚠️ key 的序列化在这里手工做（UTF-8 字节）而不是走模板的 keySerializer：
+     * {@code RedisCallback} 拿到的是<b>底层连接</b>，不经过模板的序列化链。
+     * {@code StringRedisSerializer} 产出的正是 UTF-8 字节，两者等价。
+     */
+    private void writeBitsBatched(String key, List<String> codes) {
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+        for (int from = 0; from < codes.size(); from += PIPELINE_BATCH_CODES) {
+            int to = Math.min(from + PIPELINE_BATCH_CODES, codes.size());
+            List<String> chunk = codes.subList(from, to);
+            maintenanceRedis.executePipelined((RedisCallback<Object>) connection -> {
+                for (String code : chunk) {
+                    int[] bits = new int[BloomHash.HASH_COUNT];
+                    BloomHash.bitIndexes(code, bits);
+                    for (int bit : bits) {
+                        connection.stringCommands().setBit(keyBytes, bit, true);
+                    }
+                }
+                return null;
+            });
+        }
+    }
+
+    /** 重建用的缓冲 key。 */
+    private static String buildingKey() {
+        return BloomHash.PREFIX + BloomHash.BUILDING_SUFFIX;
     }
 
     @Override
