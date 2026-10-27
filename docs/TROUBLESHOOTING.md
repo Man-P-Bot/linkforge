@@ -49,6 +49,9 @@
   - [T-016 `docker compose pull` 会被 Docker Hub 限速卡住（几分钟到几十分钟）](#t-016-docker-compose-pull-会被-docker-hub-限速卡住几分钟到几十分钟)
   - [T-025 从带标签的输出里取数：**不要用「会匹配到标签本身」的正则**](#t-025-从带标签的输出里取数不要用会匹配到标签本身的正则)
   - [T-026 用 Docker 镜像加速拉取，绕开 Docker Hub 限速](#t-026-用-docker-镜像加速拉取绕开-docker-hub-限速)
+  - [T-031 E2E 测试之间**共享 IP 限流配额** → 后跑的类全 429](#t-031-e2e-测试之间共享-ip-限流配额--后跑的类全-429)
+  - [T-032 `RestTemplate` 在 **401** 响应上读不到 body —— 用错客户端会误判成服务端 bug](#t-032-resttemplate-在-401-响应上读不到-body--用错客户端会误判成服务端-bug)
+  - [T-033 共享 Redis key 上的**绝对长度断言** → 随「当天第几次跑」飘红](#t-033-共享-redis-key-上的绝对长度断言--随当天第几次跑飘红)
 
 ---
 
@@ -1600,3 +1603,186 @@ docker tag docker.m.daocloud.io/grafana/grafana:12.1.0 grafana/grafana:12.1.0
 
 
 
+
+### T-031 E2E 测试之间**共享 IP 限流配额** → 后跑的类全 429
+
+**现象**
+
+新加了一个 E2E 测试类（8 个用例，每个用例都建一条短链）之后，
+**另一个**原本一直绿的 E2E 类（`RedirectEndToEndTest`，12 个用例）**全挂**：
+
+```
+[ERROR] RedirectEndToEndTest.uncachedShortCodeReturns302:291->createLink:228
+        [创建短链应返回 201，实际 {}，body={}]
+```
+
+⚠️ **最迷惑的地方**：那个类**单独跑是绿的**（12/12），
+只有**全量跑**才挂 —— 报错还与被测行为毫无关系（它压根没测到跳转）。
+
+**根因**
+
+创建接口的限流是**按 IP** 的 `RATE_LIMIT_CREATE_PER_MIN`（默认 10 次/分钟），
+而**所有测试都来自 `127.0.0.1`** ⇒ **配额是所有测试类共享的**。
+
+| | 创建请求数 |
+|---|---|
+| 我的新 E2E 类 | 8 |
+| `RedirectEndToEndTest` | ~7 |
+| 合计 | **15 > 10** ⇒ 后跑的那个类全拿 429 |
+
+⚠️ 429 的响应体是**极简体**（API.md §3.4），于是断言里看到的是「空 body」。
+
+**解决**
+
+两条，**按场景选**：
+
+| 做法 | 适用 | 说明 |
+|---|---|---|
+| **A（推荐给「被测对象不是创建」的测试）** | 鉴权类、校验类测试 | **直接写库造数**，不占用创建接口的配额。`JdbcTemplate.insert(...)` 一行搞定 |
+| **B（推荐给集成测试套件）** | 整个 E2E 套件 | 在 `MySqlContainerSupport` 的 `@DynamicPropertySource` 里**统一放宽阈值**：`registry.add("RATE_LIMIT_CREATE_PER_MIN", () -> 1000)` |
+
+⚠️ **B 为什么必须写在 `@DynamicPropertySource` 里**（而不是 `application-test.yml`）：
+`@DynamicPropertySource` 的属性源优先级**高于环境变量**，
+所以即使本机 `export` 了 `RATE_LIMIT_CREATE_PER_MIN=10`，测试里也一定是宽松值 ——
+**否则「我本机明明放宽了」会成为下一个查半天的谜团。**
+
+⚠️ **限流器本身有独立单元测试覆盖**，放宽集成测试里的阈值不影响任何被测行为。
+
+**教训**
+
+> **限流按 IP 计 ⇒ 测试之间共享配额 ⇒ 测试不再独立。**
+>
+> 这类「跨测试的隐性耦合」是 flaky 里最难查的一类：
+> 单跑绿、全量红，且**失败的那个用例根本没做错什么**。
+>
+> 泛化地说：**任何全局状态的资源（限流计数器、Redis key、DB 序列）在测试里都不是「每个测试一份」**。
+> 要么显式隔离（独立 DB / 独立 key / 直接写库），要么把断言写成**增量**而不是绝对值（见 T-033）。
+
+---
+
+### T-032 `RestTemplate` 在 **401** 响应上读不到 body —— 用错客户端会误判成服务端 bug
+
+**现象**
+
+写后台鉴权的 E2E 测试时，断言 401 的错误体拿不到：
+
+```java
+ResponseEntity<String> resp = rest.exchange(path, HttpMethod.DELETE, ..., String.class);
+assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);   // ✅ 过了
+JsonNode json = mapper.readTree(resp.getBody());
+//                                              ^^^^^^^ null！
+```
+
+⚠️ 而**服务端明明返回了 body** —— 响应头里清清楚楚：
+`Content-Type: application/json;charset=UTF-8`、**`Content-Length: 117`**。
+
+**根因**
+
+本项目没有 Apache HttpClient 依赖，测试用
+`RestTemplate` + `SimpleClientHttpRequestFactory`（底层是 `HttpURLConnection`）。
+而 **`HttpURLConnection` 在 401 响应上的鉴权处理路径会把错误流吃掉**，
+于是 `getErrorStream()` 拿到的是空流。
+
+⚠️ **诡异之处**：同一个测试类里，**GET 的 401 能读到 body，DELETE 的读不到** ——
+所以「看起来像服务端只对某些方法返回空 body」，极具误导性。
+
+**解决**
+
+改用 JDK 自带的 **`java.net.http.HttpClient`**（JDK 11+）：
+
+```java
+HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + path))
+        .header("Authorization", rawAuthHeader)
+        .method("DELETE", HttpRequest.BodyPublishers.noBody())
+        .build();
+HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+resp.statusCode();  // 401
+resp.body();        // ✅ 稳定拿到完整 JSON
+```
+
+三个好处：① 任意方法、任意状态码都能稳定读到 body；
+② 默认**不跟随重定向**（`Redirect.NEVER`），断言 302 + Location 的前提天然成立；
+③ JDK 自带，**不引新依赖**（与本项目「不引 Apache HttpClient」的选择一致）。
+
+**⚠️ 判定「服务端 bug」还是「客户端 bug」的一招**
+
+> **用 `curl` 对照一次即可区分。**
+>
+> ```bash
+> curl -s -D - "http://localhost:8080/admin/api/v1/links/xxx" -H "Authorization: Bearer garbage"
+> ```
+>
+> - curl **能**读到 body ⇒ **服务端没问题**，是你的 HTTP 客户端的问题；
+> - curl **也**读不到 ⇒ 才是服务端的问题。
+>
+> 这一步能省掉「改本来正确的服务端代码」这种最坏结果。
+
+**教训**
+
+> **测试工具出错时，失败会长成「被测行为出错」的样子。**
+>
+> 本项目的 DR-054 已经栽过一次同款（组件级验证全绿、链路其实断了），
+> 这次是它的**镜像版本**：组件级与端到端都「绿」，但绿的原因是**没读到东西**。
+>
+> 泛化地说：**当断言失败在一个「看起来不相关的点」上时，先怀疑工具链**——
+> 尤其当响应头说「有 body」而你说「没 body」的时候。
+
+---
+
+### T-033 共享 Redis key 上的**绝对长度断言** → 随「当天第几次跑」飘红
+
+**现象**
+
+全量构建偶发挂在一个统计模块的用例上：
+
+```
+[ERROR] StatsRedisIntegrationTest.redisWriteFailureGoesToDlqAndConsumerSurvives:294 [2 条进死信]
+```
+
+⚠️ **单跑这个类绿（7/7），全量跑挂** —— 又是那种「与被测行为毫无关系」的 flaky。
+
+**根因**
+
+该用例断言死信队列的**绝对长度**：
+
+```java
+assertThat(redis.opsForList().size(dlqKey)).as("2 条进死信").isEqualTo(2L);
+```
+
+但那个 key 是**按日期**的**共享** Redis list：
+
+- 同模块的 `StatsFlushRedisIntegrationTest` 也会往**同一个** key 里塞数据；
+- 两者**都不清理**（DLQ 的语义本来就是「留着等人处理」）；
+- 于是「绝对值 == 2」只在**当天第一次跑**时成立 —— 当天第二次跑就变成 4。
+
+**实测**：11:46 那轮写入 2 条，17:15 那轮又写 2 条 → 断言看到 4 → 挂。
+
+**解决**
+
+断言**增量**而不是绝对值：
+
+```java
+long dlqSizeBefore = redis.opsForList().size(dlqKey);   // 写入**之前**先记
+...（触发写入）...
+assertThat(redis.opsForList().size(dlqKey)).isEqualTo(dlqSizeBefore + 2);
+```
+
+增量断言后，**无论 key 里先前有多少条，本用例的语义都不受影响**，
+而且**不破坏**其它测试留在 key 里的数据
+（比「`@BeforeEach` 直接删 key」更安全 —— 删 key 可能踩到并行跑的另一个用例）。
+
+⚠️ 采集「之前的值」必须发生在**写入之前**，否则增量恒为 0。
+
+**教训**
+
+> **断言绝对值 = 断言「环境是干净的」—— 而测试环境通常不干净。**
+>
+> 共享的、有累积语义的状态（Redis list / Set / 计数器 / 文件）
+> 上，**绝对值断言天然会随运行次数飘红**。
+>
+> 判据：
+> - 断言的是**本用例产生的东西** ⇒ 断言增量；
+> - 断言的是**环境状态** ⇒ 先清理（且清理范围要精确，别误伤别人）；
+> - 两者都不做 ⇒ 这条测试迟早会以「莫名其妙」的方式挂。
+
+---
