@@ -263,6 +263,15 @@ class StatsRedisIntegrationTest {
         badScript.setResultType(Long.class);
 
         AsyncStatsQueue q = AsyncStatsQueue.withScripts(registry, redis, 1000, badScript, badScript);
+        // ⚠️ **先记下 DLQ 的初始长度**：DLQ key 是**按日期**的**共享** Redis list，
+        //    同模块的 StatsFlushRedisIntegrationTest 也会往同一个 key 里塞数据，
+        //    且两者都不清理 —— 于是「绝对值 == 2」只在「当天第一次跑」时成立，
+        //    当天第二次跑就变成 4 → **随运行次数飘红的 flaky**。
+        //    （实测：单跑这个类绿，全量跑挂。）
+        //    断言**增量**后，无论 key 里先前有多少条，本用例的语义都不受影响。
+        String dlqKeyForCount = "shortlink:stats:dl:"
+                + java.time.LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+        long dlqSizeBefore = redis.opsForList().size(dlqKeyForCount);
         try {
             q.offer(new StatsEvent("0Q1A2b3", null, System.currentTimeMillis()));
             q.offer(new StatsEvent("0Q1A2b3", null, System.currentTimeMillis()));
@@ -290,8 +299,8 @@ class StatsRedisIntegrationTest {
             String dlqKey = "shortlink:stats:dl:"
                     + java.time.LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
             assertThat(redis.opsForList().size(dlqKey))
-                    .as("2 条进死信")
-                    .isEqualTo(2L);
+                    .as("2 条进死信（相对本用例开始前的增量）")
+                    .isEqualTo(dlqSizeBefore + 2);
         } finally {
             q.stop();
         }
