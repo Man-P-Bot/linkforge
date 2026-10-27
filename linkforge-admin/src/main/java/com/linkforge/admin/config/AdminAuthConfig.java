@@ -1,8 +1,12 @@
 package com.linkforge.admin.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.ZoneId;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
 
 /**
  * 后台鉴权配置。
@@ -36,5 +40,33 @@ public class AdminAuthConfig {
     @Bean
     public AdminToken adminToken() {
         return new AdminToken(token);
+    }
+
+    /**
+     * 注册后台鉴权过滤器。
+     *
+     * <h2>⚠️ 为什么用 {@link FilterRegistrationBean} 而不是 {@code @Component}</h2>
+     * {@code @Component} 声明的 {@code Filter} 会被容器注册到<b>所有</b>路径上，
+     * 于是过滤器自己必须判断「这个路径要不要鉴权」——
+     * 而那正是最容易出错的判断（漏一个前缀 = 漏一个接口的防护）。
+     *
+     * <p>用 {@code FilterRegistrationBean} 把 <b>URL 模式</b>交给容器：
+     * 只有 {@code /admin/*} 会进入过滤器，其余路径连方法都不会被调用。
+     * 「哪些路径受保护」由容器保证，不依赖运行期判断。
+     *
+     * <h2>⚠️ 为什么顺序要显式指定</h2>
+     * {@code Ordered.HIGHEST_PRECEDENCE + 10}：让鉴权<b>尽可能早</b>执行 ——
+     * 越早拒绝，越少资源被消耗在「注定要 401 的请求」上。
+     */
+    @Bean
+    public FilterRegistrationBean<AdminAuthFilter> adminAuthFilterRegistration(AdminToken adminToken,
+                                                                                ZoneId displayZone,
+                                                                                ObjectMapper objectMapper) {
+        FilterRegistrationBean<AdminAuthFilter> registration = new FilterRegistrationBean<>();
+        registration.setFilter(new AdminAuthFilter(adminToken, displayZone, objectMapper));
+        registration.addUrlPatterns("/admin/*");
+        registration.setName("adminAuthFilter");
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
+        return registration;
     }
 }

@@ -15,7 +15,7 @@
 
 ## 目录
 
-> 共 **63 条**决策（DR-001 ~ DR-063）。
+> 共 **64 条**决策（DR-001 ~ DR-064）。
 > 编号**连续无缺口**，按编号排列；决策一经记入即生效，
 > 修改必须**追加新记录**（含变更原因），不得直接改历史条目。
 
@@ -76,6 +76,7 @@
   - [DR-044 未匹配路由映射 404（NoResourceFoundException）](#dr-044-未匹配路由映射-404noresourcefoundexception)
   - [DR-049 异常日志必须去重或限流](#dr-049-异常日志必须去重或限流)
   - [DR-050 targetUrl 显式拒绝 C0 控制字符（U+0000~U+001F）](#dr-050-targeturl-显式拒绝-c0-控制字符u0000u001f)
+  - [DR-064 后台鉴权前移为 Servlet 过滤器；「方法不被支持」映射 405 而非 500](#dr-064-后台鉴权前移为-servlet-过滤器方法不被支持映射-405-而非-500)
 - **异步统计链路**
   - [DR-058 统计与跳转的单向解耦（异步队列 + 不可反压）](#dr-058-统计与跳转的单向解耦异步队列--不可反压)
   - [DR-059 统计落库的「取走即删」与 PV/UV 双通道分离](#dr-059-统计落库的取走即删与-pvuv-双通道分离)
@@ -2694,3 +2695,117 @@ hidden class 的贡献很小（后期那几 KB 才是）。
 ### 触发场景
 
 第 6 周封板自检：功能冒烟逐个长度验证自定义短码时发现。
+
+## DR-064 后台鉴权前移为 Servlet 过滤器；「方法不被支持」映射 405 而非 500
+
+### 背景
+
+2026-10-27 本地验收实测到一个**真实缺陷**：
+
+```
+GET /admin/api/v1/links/0000VF0   Authorization: Bearer <错误的 Token>
+→ 500 {"code":"LINKFORGE-500-01","message":"internal server error"}
+```
+
+契约（API.md §7.3）要求「缺失、格式错误、值不匹配**一律返回 401**，无例外」。
+
+### 根因分析（⚠️ 与最初的猜测不同）
+
+最初的猜测是「Token 比对时抛了 NPE / `MessageDigest.isEqual` 遇到 null 炸了」。
+**实测排除了这个猜测**：
+
+| 验证 | 结果 |
+|---|---|
+| `AdminToken.matches(null)` / `matches("")` | 早已被挡住，返回 false，**不抛异常** |
+| `DELETE` + 错误 Token | **401** ✅ 一直是对的 |
+| `GET` + 错误 Token / 无 Token | **500** ❌ |
+| 应用日志 | `HttpRequestMethodNotSupportedException: Request method 'GET' is not supported` |
+
+**真实根因有两层，都与「Token 比对」无关**：
+
+1. **鉴权的位置错了**：`/admin/api/v1/links/{code}` 只定义了 `DELETE`。
+   Spring 在**路由解析阶段**就抛出 `HttpRequestMethodNotSupportedException`，
+   而鉴权检查写在 **Controller 方法体内**，**根本没被执行到**。
+2. **异常没有映射**：该异常没有被任何 `@ExceptionHandler` 映射，
+   于是掉进兜底分支 → **500**。
+
+> 换句话说：**只要鉴权在 Controller 里，「路由不匹配」这个分支就永远绕过鉴权**，
+> 而绕过鉴权的表现不是「放行」，是「500」——
+> 一个**客户端问题**被伪装成**服务故障**，会污染错误率指标与告警。
+
+### 决策
+
+1. **鉴权前移为 Servlet 过滤器**（`AdminAuthFilter`，注册在 `/admin/*`）。
+   Servlet 过滤器在 `DispatcherServlet` 之前执行，因此**先于路由解析**。
+2. **判定逻辑集中到唯一入口**：`AdminToken.matchesAuthorizationHeader(String)`。
+   它对 null / 空串 / 缺 `Bearer ` 前缀 / 乱码 / 长度不符 一律返回 `false`，
+   **永不抛异常**。Controller 内保留同样的调用作为**纵深防御**。
+3. **`HttpRequestMethodNotSupportedException` → 405**（新增 `LINKFORGE-405-01`），
+   响应带 `Allow` 头。不再让它落进兜底分支。
+4. **错误体构造下沉到 core**（`ErrorBody`）：过滤器在 Servlet 链上，
+   **不在** `@RestControllerAdvice` 的处理范围内，必须自己写响应体；
+   若两处各写一份，格式迟早漂移成「有些接口的错误体少一个 timestamp」。
+
+### 理由
+
+- **500 的语义是「服务有 bug，需要人介入」**。把「客户端用错了 HTTP 方法」
+  报成 500 会让运维去查代码，而问题在调用方。405 是 HTTP 的标准语义。
+- **过滤器比拦截器更早**：HandlerInterceptor 的 `preHandle` 在**路由解析之后**才执行，
+  解析失败时它根本不会被调用 —— 解决不了本问题。Filter 在 `DispatcherServlet` 之前，是唯一能保证
+  「先鉴权、后路由」的位置。
+- **URL 模式交给容器**（`FilterRegistrationBean.addUrlPatterns("/admin/*")`）
+  而不是 `@Component` + 运行期判断路径前缀：
+  后者要求过滤器自己判断「哪些路径要鉴权」，漏一个前缀就是漏一个接口的防护。
+- **core 保持零 web 依赖**（DR-021）：`ErrorBody` 只用 `Map` 与 `OffsetDateTime`。
+
+### 代价与影响
+
+- ⚠️ **新增一个错误码** `LINKFORGE-405-01`（契约的加法，不改变任何既有行为）。
+- ⚠️ **过滤器与 Controller 各有一次检查**（纵深防御的代价：一次极廉情的
+  `MessageDigest.isEqual`，可忽略）。
+- ✅ **性能无影响**：过滤器只在 `/admin/*` 上运行，跳转热路径完全不受影响。
+  ⚠️ 这也意味着**第 5 周冻结的性能基线依然有效**（本次改动不触碰跳转链路）。
+
+### 验证
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `GET /admin/...` + 错误 Token | **500** | **401** `LINKFORGE-401-01` |
+| `GET /admin/...` + 无 Token | **500** | **401** `LINKFORGE-401-01` |
+| `DELETE /admin/...` + 错误 Token | 401 | 401（不变） |
+| `GET /admin/...` + 正确 Token | **500** | **405** `LINKFORGE-405-01` + `Allow: DELETE` |
+| `DELETE /admin/...` + 正确 Token | 200 | 200（不变） |
+| 鉴权失败后短链是否还在 | — | **仍在**（`status=0`） |
+
+新增测试：`AdminAuthFilterTest`（9 个，单元）、`GlobalExceptionHandlerTest`（8 个，单元）、
+`AdminAuthEndToEndTest`（8 个，真实 HTTP + 真实 MySQL 容器）。
+
+### 教训
+
+> **「守卫要站在被保护的资源之前」，而不是「站在它的某个分支里」。**
+>
+> 写在 Controller 里的鉴权，看起来「在任何业务逻辑之前」—— 事实上只在
+> 「路由能匹配上」的前提下才在业务逻辑之前。
+> **路由解析失败是一条独立的路径**，它绕过了你写在方法体里的所有前置检查。
+>
+> 泛化地说：**任何「先检查再执行」的守卫，都要问一句「检查失败时会不会走到另一个分支」。**
+> 这里的另一个分支就是「没有匹配的 handler」。
+>
+> ⚠️ 附带的客户端教训：本类第一次用 `RestTemplate` 写，**DELETE 的 401 响应体读不出来**
+> （`getBody()` 返回 null，而响应头里明明有 `Content-Length: 117`）——
+> 是 `SimpleClientHttpRequestFactory` 底层的 `HttpURLConnection`
+> 在 401 上的鉴权处理路径把错误流吃掉了。
+> **用错 HTTP 客户端，断言会失败在「读不到 body」上，而那与服务端行为无关** ——
+> 极易被误判成「服务端的 bug」，从而去改本来正确的服务端代码。
+> 改用 JDK 的 `HttpClient` 后稳定读到全部响应体。
+
+### 与其它决策的关系
+
+- **API.md §7.3 / §8**：本条对应的契约落点（新增 405 错误码 + 鉴权顺序表）；
+- **DR-013**（接口契约层决策）与 **PRD A-7**（缺 Token 一律拒绝）；
+- **DR-054**（「验证两层 ≠ 验证链路」）—— 本条是它在**异常处理边界**上的同款陷阱；
+- **DR-021**：core 零 web 依赖 —— `ErrorBody` 因此只放 JDK 类型。
+
+### 触发场景
+
+第 6 周封板后的本地验收：手动 curl 后台接口时发现错误 Token 返回 500。

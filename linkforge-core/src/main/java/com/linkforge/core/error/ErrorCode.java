@@ -54,6 +54,7 @@ public enum ErrorCode {
 
     /** 短码不存在：从未创建 / 已删除（status = DELETED）/ 布隆判不存在（D5 使用）。 */
     LINK_NOT_FOUND("LINKFORGE-404-01", 404, "short code not found"),
+    METHOD_NOT_ALLOWED("LINKFORGE-405-01", 405, "method not allowed"),
 
     /** 自定义短码已被占用（**不静默覆盖**）。 */
     SHORT_CODE_CONFLICT("LINKFORGE-409-01", 409, "short code already taken"),

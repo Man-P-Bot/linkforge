@@ -59,7 +59,7 @@
 | `linkforge-core` | 领域模型（`Link` / `Base62` / `IdSpace` / `ReservedCodes`）、错误码、**缓存与布隆契约**、**MyBatis 数据访问实现**（DR-021） | 仓储与缓存接口（被 redirect/stats/admin 调用） |
 | `linkforge-redirect` | 跳转链路：限流、布隆、缓存查找、回源、异步计数触发、302 | 跳转 Controller |
 | `linkforge-stats` | 统计：计数、按天聚合、定时落库 | 统计服务接口（被 redirect/admin 调用） |
-| `linkforge-admin` | 后台：短链查询、删除、**过期短链清理**；Token 鉴权 | `/admin/api/v1/**` |
+| `linkforge-admin` | 后台：短链查询、删除、**过期短链清理**；**Token 鉴权（Servlet 过滤器 + Controller 双保险，DR-064）** | `/admin/api/v1/**` |
 | `linkforge-app` | 装配与启动：配置、Bean 装配、健康检查、监控端点 | 可执行程序 |
 
 > ⚠️ `linkforge-core` **不是**「纯领域层」——它同时承载 MyBatis Mapper 与 XML
@@ -514,11 +514,40 @@ v1 **不引入 MQ**（PRD §5.2）。「Redis 计数 + 定时批量落库」已�
 | MySQL 不可用 | 未命中缓存的请求失败；命中的仍可 302 | 503 | 数据源错误计数 |
 | 统计投递/落库失败 | **完全不影响跳转** | 302 | `shortlink.stats.dropped`、`shortlink.stats.dlq.*` |
 | 后台不可用 | 不影响跳转 | 503 | admin 错误计数 |
+| 后台 Token 缺失 / 格式错 / 不匹配 | **在路由解析之前**被过滤器拒绝，不碰业务与数据 | **401** | `LINKFORGE-401-01`（DR-064） |
+| 后台路径能匹配但 HTTP 方法不对 | 路由解析阶段被拒 | **405**（带 `Allow` 头） | `LINKFORGE-405-01`（DR-064） |
 
 **降级实现要点**：
 
 - 降级判断必须**廉价**（本地的熔断标记 + 超时），不能为了判断依赖是否可用而再发一次远程调用。
 - 每条降级路径都**必须先于**对应功能实现（例如限流放行路径先于限流上线），否则故障时会变成 500。
+
+**⚠️ 鉴权必须在「路由解析之前」（DR-064）**
+
+后台鉴权由 Servlet 过滤器 `AdminAuthFilter` 执行，注册在 `/admin/*`：
+
+```
+请求 → [AdminAuthFilter] → DispatcherServlet → 路由解析 → Controller（再查一次）
+          ↑ 先于路由解析                ↑ 解析失败抛 HttpRequestMethodNotSupportedException
+          └─ 不通过 → 401，根本走不到路由解析
+```
+
+⚠️ **为什么不能只写在 Controller 里**：
+`/admin/api/v1/links/{code}` 只定义了 `DELETE`，
+对 `GET` 的请求会在**路由解析阶段**就抛 `HttpRequestMethodNotSupportedException`，
+写在方法体里的鉴权**根本没被执行到**，
+而该异常若无映射就落进兜底分支 → **500**（客户端问题被伪装成服务故障）。
+
+⚠️ **为什么不用 HandlerInterceptor**：它的 `preHandle` 在**路由解析之后**才执行，
+解析失败时根本不会被调用 —— 解决不了本问题。
+
+**降级实现要点**：
+
+- 降级判断必须**廉价**（本地的熔断标记 + 超时），不能为了判断依赖是否可用而再发一次远程调用。
+- 每条降级路径都**必须先于**对应功能实现（例如限流放行路径先于限流上线），否则故障时会变成 500。
+- ⚠️ **凡是「客户端问题」类的异常，都必须有明确映射**，
+  不许落进兜底分支 —— 500 的语义是「服务有 bug，需要人介入」，
+  把它用在「Token 错了」「方法用错了」上会污染错误率指标与告警。
 
 ---
 
@@ -656,6 +685,7 @@ wrk 压测容器                      （第 5 周）
 | 压测与口径 | DR-003、DR-004、DR-019、DR-038、DR-052、DR-057 | 容器内 wrk；口径预注册；GC 日志统一 `-Xlog:gc*`；**宿主被抢占即作废数据** |
 | 长稳与可观测 | **DR-061**、DR-055 | 8 小时长稳证伪「Metaspace 泄漏」；**Metaspace 是类加载，动态 Tag 涨的是堆** |
 | 部署与凭据 | DR-016、DR-017、DR-038 | 阿里云 Maven 仓库；MySQL 宿主机映射 3307；Prometheus 凭据走 Docker Secrets |
+| 接口鉴权与错误边界 | **DR-064** | 后台鉴权前移为 Servlet 过滤器（**先于路由解析**）；方法不被支持 → **405** 而非 500；错误体构造下沉到 core 的 `ErrorBody` |
 
 > ⚠️ **本表是索引，不是副本** —— 决策的**完整理由、选项与代价**只在 `docs/DECISIONS.md` 里。
 

@@ -89,13 +89,23 @@ public class AdminController {
         return ResponseEntity.ok(body);
     }
 
-    /** @param authHeader {@code Authorization: Bearer <token>} */
+    /**
+     * 鉴权（纵深防御的第二道）。
+     *
+     * <p>⚠️ **第一道是 {@link com.linkforge.admin.config.AdminAuthFilter}**，
+     * 它在路由解析<b>之前</b>执行 —— 那才是修复「GET 后台接口返回 500」的关键（DR-064）。
+     * 这里保留第二次检查，是为了在「过滤器被误配置 / 被绕过」时仍不失去防护。
+     *
+     * <p>两处调用<b>同一个</b> {@code matchesAuthorizationHeader}，
+     * 判定口径不可能不一致。
+     *
+     * @param authHeader {@code Authorization: Bearer <token>}
+     */
     private void requireAuthorized(String authHeader) {
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            throw unauthorized();
-        }
-        // ⚠️ 常量时间比较（AdminToken 内部用 MessageDigest.isEqual）
-        if (!adminToken.matches(authHeader.substring("Bearer ".length()))) {
+        // ⚠️ 判定逻辑集中在 AdminToken.matchesAuthorizationHeader：
+        //    null / 空串 / 缺 Bearer 前缀 / 乱码 / 长度不符 —— 全部得到确定的 false，
+        //    **永不抛异常**（异常会穿透成 500，把调用方问题伪装成服务故障）。
+        if (!adminToken.matchesAuthorizationHeader(authHeader)) {
             throw unauthorized();
         }
     }

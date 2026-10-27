@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | **技术栈** | Java 17 · Spring Boot 3 · MyBatis · MySQL 8.4 · Redis 7.4 · Caffeine · Docker Compose · Prometheus · Grafana |
-| **工程约束** | Maven 5 模块 + ArchUnit 强制依赖边界 · JUnit 5 + Testcontainers 真实 MySQL 集成测试 · **63 条决策记录** · **25 条排障条目** |
+| **工程约束** | Maven 5 模块 + ArchUnit 强制依赖边界 · JUnit 5 + Testcontainers 真实 MySQL 集成测试 · **64 条决策记录** · **26 条排障条目** |
 | **实测结论** | 跳转 **29,388 QPS / P99 11.00ms**（同口径 3×30s 中位）· 8 小时长稳 **0 次 Full GC** · 后端拐点 **c=400~800** |
 
 ---
@@ -423,13 +423,13 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块边界、缓存分层、降级矩阵、监控栈 |
 | [DATABASE.md](docs/DATABASE.md) | 表设计、索引意图、保留策略 |
 | [API.md](docs/API.md) | 接口契约、错误码、版本策略 |
-| [DECISIONS.md](docs/DECISIONS.md) | **决策记录 DR-001 ~ DR-063**（含按主题分组的总目录） |
+| [DECISIONS.md](docs/DECISIONS.md) | **决策记录 DR-001 ~ DR-064**（含按主题分组的总目录） |
 | [PROGRESS.md](docs/PROGRESS.md) | 进度台账 |
 | [PERFORMANCE.md](docs/PERFORMANCE.md) | **压测数据、口径声明、资源水位**（含章节目录） |
 | [DESIGN-W4.md](docs/DESIGN-W4.md) | 第 4 周设计（过期清理 + Testcontainers 改造） |
 | [DESIGN-W5.md](docs/DESIGN-W5.md) | 第 5 周设计（监控栈 + 压测框架 + 8 小时长稳报告） |
 | [BENCH-W4.md](docs/BENCH-W4.md) | 第 4 周压测记录 |
-| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | **排障手册：25 条踩过的坑**（现象 → 根因 → 解法，按主题分节 + 带索引） |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | **排障手册：26 条踩过的坑**（现象 → 根因 → 解法，按主题分节 + 带索引） |
 | [PITFALLS.md](docs/PITFALLS.md) | **防呆清单**：Docker 部署静默故障的共性判据 + 自动化防线 + 一分钟自检 |
 | [RESUME-DRAFT.md](docs/RESUME-DRAFT.md) | 简历素材草稿（STAR 法则，3 个可追问的技术故事） |
 
@@ -438,7 +438,7 @@ redirect → admin   ❌ 禁止        admin → redirect ❌ 禁止
 - [docs/RESUME-DRAFT.md](docs/RESUME-DRAFT.md) —— 3 个可追问的技术故事（每条含「追问链」）。
 - [docs/PITFALLS.md](docs/PITFALLS.md) —— 本项目沉淀的**通用工程方法**，不只是短链知识：
   口径预注册、静默故障的识别与自动化、长稳实验的因果链拆解。
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) —— 25 条真实踩坑，含
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) —— 26 条真实踩坑，含
   「Compose 在 secret 缺失时不报错」「CRLF 让容器内 `/bin/sh` 崩在第一行」
   「压测期间动手 = 自己污染自己的数据」这类**通用陷阱**。
 

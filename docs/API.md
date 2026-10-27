@@ -439,6 +439,25 @@ Location: http://localhost:8080/abc1234   ← 见 §4.3，此处应为目标地�
 - **缺失、格式错误、值不匹配一律返回 401**，无例外、无匿名放行。
 - 后台**独立限流**（独立 Key 前缀、阈值更严），避免后台被刷影响跳转（ARCHITECTURE §9）。
 
+#### ⚠️ 鉴权**先于路由解析**（DR-064）
+
+| 请求 | 响应 | 说明 |
+|---|---|---|
+| `/admin/**` + Token 缺失 / 格式错 / 不匹配 | **401** `LINKFORGE-401-01` | 鉴权在 **Servlet 过滤器**里执行，**早于** Spring 的路由解析 |
+| `/admin/**` + Token 正确，但 HTTP 方法不被支持 | **405** `LINKFORGE-405-01`（带 `Allow` 头） | 路由能匹配上但方法不对 |
+| `/admin/**` + Token 正确 + 方法正确 | 正常业务响应 | — |
+
+⚠️ **为什么「鉴权先于路由解析」是契约的一部分**：
+鉴权若写在 Controller 方法体内，**路由不匹配的请求就绕过了鉴权**。
+2026-10-27 本地验收实测过这个缺陷：
+`GET /admin/api/v1/links/{code}`（Token 是错的）→ **500**，
+因为该路径只定义了 `DELETE`，Spring 在路由解析阶段就抛了
+`HttpRequestMethodNotSupportedException`，而鉴权代码**根本没被执行到**。
+
+> 修复方式：鉴权前移为 Servlet 过滤器（`AdminAuthFilter`，注册在 `/admin/*`），
+> 判定逻辑集中在 `AdminToken.matchesAuthorizationHeader`（**永不抛异常**），
+> Controller 内保留一次同样的检查作为纵深防御。详见 DR-064 / T-030。
+
 ---
 
 ## 8. 错误码表（A-4，本文档核心交付物）
@@ -466,6 +485,7 @@ LINKFORGE-400-01
 | `LINKFORGE-400-05` | 400 | `expireAt` 不合法 | 时间点**不是将来**（含恰好等于当前时间） |
 | `LINKFORGE-401-01` | 401 | 未鉴权或 Token 无效 | 后台接口缺 `Authorization` 头、格式错误、Token 不匹配 |
 | `LINKFORGE-404-01` | 404 | 短码不存在 | 从未创建 / **已删除（`status = DELETED`）** / 布隆判不存在 |
+| `LINKFORGE-405-01` | 405 | 方法不被支持 | 路径能匹配上，但 HTTP 方法不被支持（如对只支持 `DELETE` 的 `/admin/api/v1/links/{code}` 发 `GET`）。**响应带 `Allow` 头**。⚠️ 修复前会落进兜底分支变成 **500**（DR-064） |
 | `LINKFORGE-409-01` | 409 | 短码冲突 | 自定义短码已被占用（**不静默覆盖**） |
 | `LINKFORGE-410-01` | 410 | 短码已过期 | `status = ACTIVE` 但 `expire_at <= now` |
 | `LINKFORGE-429-01` | 429 | 触发限流 | 超过该接口的 IP/Token 阈值；**响应含 `Retry-After`** |

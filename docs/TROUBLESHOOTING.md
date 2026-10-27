@@ -30,6 +30,7 @@
   - [T-028 统计的 HLL key 驻留 35 天，而不是「当天」→ 内存上界比设计高 35 倍](#t-028-统计的-hll-key-驻留-35-天而不是当天-内存上界比设计高-35-倍)
 - [接口契约](#接口契约)
   - [T-029 自定义短码「创建 201 但跳转永远 404」—— 契约两端长度不一致](#t-029-自定义短码创建-201-但跳转永远-404-契约两端长度不一致)
+  - [T-030 后台接口传了错误 Token 却返回 500 —— 鉴权写在 Controller 里，被路由解析绕过](#t-030-后台接口传了错误-token-却返回-500--鉴权写在-controller-里被路由解析绕过)
 - [缓存与布隆](#缓存与布隆)
   - [T-027 布隆重建的「原子切换」覆盖了重建期间新建的短码 → 假阴性 404](#t-027-布隆重建的原子切换覆盖了重建期间新建的短码--假阴性-404)
 - [监控与可观测性](#监控与可观测性)
@@ -703,6 +704,99 @@ void 创建出来的短码必须可访问(String customCode) {
 > 本项目里 `IdSpace.SHORT_CODE_LENGTH = 7` 是发号侧的长度，
 > 但**自定义短码的长度范围（4~8）是另一条独立规则**，
 > 两者从没被放在一起验证过。
+
+---
+
+---
+
+### T-030 后台接口传了错误 Token 却返回 500 —— 鉴权写在 Controller 里，被路由解析绕过
+
+**现象**
+
+本地验收时手动 curl 后台接口，**故意传错的 Token**，结果拿到 500：
+
+```
+GET /admin/api/v1/links/0000VF0   Authorization: Bearer 你的ADMIN_API_TOKEN
+→ 500 {"code":"LINKFORGE-500-01","message":"internal server error"}
+```
+
+按契约（API.md §7.3）应该是 **401** `LINKFORGE-401-01`。
+
+**⚠️ 关键对照：同一个错误 Token，`DELETE` 却是对的**
+
+```
+DELETE /admin/api/v1/links/0000VF0   Authorization: Bearer 错误的中文Token
+→ 401 {"code":"LINKFORGE-401-01","message":"缺少或无效的后台 Token"}   ✅
+```
+
+**同一个 Token，比对逻辑同一份，只是方法不同，结果一个 401 一个 500。**
+
+**根因**
+
+⚠️ **不是 Token 比对抛异常** —— 最初的猜测是「`MessageDigest.isEqual` 遇到 null 炸了」，
+实测排除了：`AdminToken.matches(null)` 早就被挡住，`DELETE` 也一直返回 401。
+
+真实根因有两层：
+
+| 层 | 事实 |
+|---|---|
+| **1. 鉴权的位置错了** | `/admin/api/v1/links/{code}` **只定义了 `DELETE`**。Spring 在**路由解析阶段**就抛了 `HttpRequestMethodNotSupportedException`；而鉴权检查写在 **Controller 方法体内**，**根本没被执行到** |
+| **2. 异常没有映射** | 该异常没有被任何 `@ExceptionHandler` 映射 → 掉进兜底分支 → **500** |
+
+应用日志里的实锤：
+```
+ERROR GlobalExceptionHandler : 未预期异常
+org.springframework.web.HttpRequestMethodNotSupportedException: Request method 'GET' is not supported
+```
+
+> **只要鉴权在 Controller 里，「路由不匹配」这条分支就永远绕过鉴权** ——
+> 而绕过鉴权的表现不是「放行」，是「500」。
+
+**解决**
+
+✅ **已修复（DR-064）**：
+
+1. 鉴权前移为 **Servlet 过滤器** `AdminAuthFilter`（注册在 `/admin/*`）——
+   Filter 在 `DispatcherServlet` 之前执行，**先于路由解析**；
+2. 判定集中到 `AdminToken.matchesAuthorizationHeader(String)`，
+   对 null / 空串 / 缺 `Bearer ` 前缀 / 乱码 / 长度不符 **一律返回 false，永不抛异常**；
+   Controller 内保留同样的调用作为纵深防御；
+3. `HttpRequestMethodNotSupportedException` → **405** `LINKFORGE-405-01`（带 `Allow` 头）；
+4. 错误体构造下沉到 core 的 `ErrorBody`，
+   让过滤器与全局异常处理器产出**完全一致**的结构。
+
+修复后的行为：
+
+| 请求 | 响应 |
+|---|---|
+| `/admin/**` + Token 缺失 / 格式错 / 不匹配 | **401** `LINKFORGE-401-01` |
+| `/admin/**` + Token 正确但方法不对 | **405** `LINKFORGE-405-01` + `Allow: DELETE` |
+| `/admin/**` + Token 正确 + 方法正确 | 正常响应 |
+
+**⚠️ 附带的客户端坑（排查时浪费了时间，值得单独记）**
+
+用 `RestTemplate` + `SimpleClientHttpRequestFactory` 写端到端测试时，
+**DELETE 的 401 响应体读不出来**（`getBody()` 返回 null，
+而响应头里明明有 `Content-Length: 117`）——
+是底层 `HttpURLConnection` 在 401 响应上的鉴权处理路径把错误流吃掉了。
+
+> ⚠️ **用错 HTTP 客户端，断言会失败在「读不到 body」上，而那与服务端行为无关** ——
+> 极易被误判成「服务端的 bug」，从而去改本来正确的服务端代码。
+> 用 `curl` 对照一次即可区分：**curl 能读到 body ⇒ 服务端没问题，是客户端的问题。**
+> 本项目改用 JDK 的 `HttpClient`（默认不跟随重定向，对任意方法/状态码都能稳定读到 body）。
+
+**教训**
+
+> **「守卫要站在被保护的资源之前」，而不是「站在它的某个分支里」。**
+>
+> 写在 Controller 里的鉴权，看起来「在任何业务逻辑之前」——
+> 事实上只在「路由能匹配上」的前提下才在业务逻辑之前。
+> **路由解析失败是一条独立的路径**，它绕过了你写在方法体里的所有前置检查。
+>
+> 泛化地说：**任何「先检查再执行」的守卫，都要问一句「检查失败时会不会走到另一个分支」。**
+>
+> ⚠️ 同款陷阱的另一个版本（DR-054）：「验证两层 ≠ 验证链路」。
+> 组件级测试全绿，链路照样断 —— 这次是**客户端**在骗你。
 
 ---
 
@@ -1477,5 +1571,6 @@ docker tag docker.m.daocloud.io/grafana/grafana:12.1.0 grafana/grafana:12.1.0
 > 看到反复停在同一个字节数，就是限速，换方式比反复重试有效得多。
 >
 > 另一个纪律：**不要和 build 同时跑** —— 构建本身也在拉依赖层，两边抢带宽。
+
 
 

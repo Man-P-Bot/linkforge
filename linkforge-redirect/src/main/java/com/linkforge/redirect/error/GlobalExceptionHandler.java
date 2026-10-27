@@ -1,18 +1,23 @@
 package com.linkforge.redirect.error;
 
+import com.linkforge.core.error.ErrorBody;
 import com.linkforge.core.error.ErrorCode;
 import com.linkforge.core.error.LinkForgeException;
 import com.linkforge.core.repository.ShortCodeGenerator.ShortCodeGenerationException;
+import jakarta.servlet.http.HttpServletRequest;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -39,6 +44,14 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    /**
+     * 浏览器噪声路径（DR-064）。
+     *
+     * <p>这些路径由浏览器自动请求，与业务无关：
+     * 命中时一律<b>降级为 DEBUG 日志</b>，不刷 WARN/ERROR。
+     */
+    private static final Set<String> NOISE_PATHS = Set.of("/favicon.ico", "/robots.txt");
+
     private final ZoneId displayZone;
 
     public GlobalExceptionHandler(ZoneId displayZone) {
@@ -47,8 +60,17 @@ public class GlobalExceptionHandler {
 
     /** 业务异常：状态码取错误码自带的 httpStatus。 */
     @ExceptionHandler(LinkForgeException.class)
-    public ResponseEntity<Map<String, Object>> handleLinkForge(LinkForgeException e) {
+    public ResponseEntity<Map<String, Object>> handleLinkForge(LinkForgeException e,
+                                                               HttpServletRequest request) {
         ErrorCode code = e.errorCode();
+        // ⚠️ 浏览器噪声请求（favicon.ico 等）不该在错误日志里刷屏：
+        //    它们是「每个浏览器标签页都会发一次」的正常流量，不是故障。
+        if (isNoisePath(request)) {
+            log.debug("噪声请求被拒绝：path={} code={} message={}",
+                    request.getRequestURI(), code.code(), e.getMessage());
+            return ResponseEntity.status(code.httpStatus())
+                    .body(errorBody(code, e.getMessage(), null));
+        }
         // 4xx 是调用方问题，记 WARN 即可；5xx 是自身问题，记 ERROR 带栈
         if (code.httpStatus() >= 500) {
             log.error("业务异常（{}）：{}", code.code(), e.getMessage(), e);
@@ -57,6 +79,27 @@ public class GlobalExceptionHandler {
         }
         return ResponseEntity.status(code.httpStatus())
                 .body(errorBody(code, e.getMessage(), null));
+    }
+
+    /**
+     * 是否属于「浏览器噪声请求」。
+     *
+     * <p>⚠️ <b>为什么需要它</b>（DR-064）：
+     * {@code /favicon.ico} 会落到跳转路径 {@code /{code}} 上，
+     * 而 {@code favicon.ico} 不是合法短码（含 {@code .}）→ 400。
+     * 浏览器每个标签页都会请求一次 favicon，于是错误日志里全是
+     * 「短码只能包含 Base62 字符: favicon.ico」——<b>噪声淹没了真故障</b>
+     * （D6 实测教训：一次真实缺陷能在 2 分钟内刷出 12 万条 ERROR）。
+     *
+     * <p>这类请求<b>静默处理</b>：状态码照给（日志与排障仍然看得到），
+     * 但不占用 WARN/ERROR 级别——它是流量的一部分，不是故障。
+     */
+    private boolean isNoisePath(HttpServletRequest request) {
+        if (request == null) {
+            return false;
+        }
+        String uri = request.getRequestURI();
+        return NOISE_PATHS.contains(uri);
     }
 
     /**
@@ -113,6 +156,54 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 路径能匹配上，但 HTTP 方法不被支持（{@code HttpRequestMethodNotSupportedException}）。
+     *
+     * <h2>⚠️ 这是一个真实的 500 缺陷（DR-064）</h2>
+     * 2026-10-27 本地验收实测：
+     * <pre>
+     *   GET /admin/api/v1/links/0000VF0  （Token 是错的）
+     *   → 500 {"code":"LINKFORGE-500-01","message":"internal server error"}
+     * </pre>
+     *
+     * <p>根因有两层：
+     * <ol>
+     *   <li>该路径只定义了 {@code DELETE}，Spring 在<b>路由解析阶段</b>就抛了这个异常；</li>
+     *   <li>异常<b>没有被任何 {@code @ExceptionHandler} 映射</b>，
+     *       于是掉进兜底分支 → 500。</li>
+     * </ol>
+     *
+     * <p>⚠️ <b>500 的语义是「服务有 bug，需要人介入」</b>，
+     * 而这里只是「客户端用错了 HTTP 方法」——
+     * 把它报成 500 会污染错误率指标与告警，让运维去查代码，而问题在调用方。
+     * 正确的语义是 <b>405 Method Not Allowed</b>，并带上 {@code Allow} 头告知支持哪些方法。
+     *
+     * <p>⚠️ 顺带说明：后台路径的<b>鉴权</b>已前移到 Servlet 过滤器（{@code AdminAuthFilter}），
+     * 所以「Token 不对」现在一律 401（早于路由解析）；
+     * 只有「Token 正确但方法不对」才会走到这里 → 405。
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<Map<String, Object>> handleMethodNotSupported(
+            HttpRequestMethodNotSupportedException e, HttpServletRequest request) {
+        String method = e.getMethod();
+        if (isNoisePath(request)) {
+            // ⚠️ 噪声路径不刷 WARN（DR-064）：浏览器自动请求而已，不是故障
+            log.debug("噪声请求方法不被支持：{} {}", method, e.getSupportedHttpMethods());
+        } else {
+            log.warn("方法不被支持：{} {}", method, e.getSupportedHttpMethods());
+        }
+        ResponseEntity.BodyBuilder builder = ResponseEntity.status(ErrorCode.METHOD_NOT_ALLOWED.httpStatus());
+        // ⚠️ RFC 7231：405 必须带 Allow 头，说明该资源支持哪些方法
+        if (e.getSupportedHttpMethods() != null && !e.getSupportedHttpMethods().isEmpty()) {
+            // ⚠️ HttpMethod 不是 CharSequence，不能直接 String.join —— 要先取 name()
+            builder.header(HttpHeaders.ALLOW, e.getSupportedHttpMethods().stream()
+                    .map(HttpMethod::name)
+                    .collect(java.util.stream.Collectors.joining(", ")));
+        }
+        return builder.body(errorBody(ErrorCode.METHOD_NOT_ALLOWED,
+                ErrorCode.METHOD_NOT_ALLOWED.defaultMessage(), null));
+    }
+
+    /**
      * 未匹配到任何路由（{@code NoResourceFoundException}）。
      *
      * <p>映射到 404 {@code LINKFORGE-404-01}，与短码查询路径的「短码不存在」用同一个错误码——
@@ -146,15 +237,19 @@ public class GlobalExceptionHandler {
                 .body(errorBody(ErrorCode.INTERNAL_ERROR, ErrorCode.INTERNAL_ERROR.defaultMessage(), null));
     }
 
+    /**
+     * 错误体构造（委托给 core 的 {@link ErrorBody}）。
+     *
+     * <p>⚠️ **为什么下沉到 core**（DR-064）：
+     * 后台鉴权过滤器 {@code AdminAuthFilter} 在 Servlet 过滤链上，
+     * <b>不在</b> {@code @RestControllerAdvice} 的处理范围内，
+     * 必须自己写 401 响应体。若两处各写一份，格式迟早漂移。
+     * core 里的 {@code ErrorBody} 是<b>唯一</b>的错误体构造处，
+     * 且只用 JDK 类型，不给 core 引入 web 依赖（DR-021）。
+     */
     private Map<String, Object> errorBody(ErrorCode code, String message, Map<String, Object> details) {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", code.code());
-        body.put("message", message == null ? code.defaultMessage() : message);
-        body.put("timestamp", OffsetDateTime.now(displayZone).toString());
-        if (details != null && !details.isEmpty()) {
-            body.put("details", details);
-        }
-        return body;
+        // ⚠️ details 的「为空则不出现该字段」规则也下沉到 ErrorBody —— 两处各判一次会漂移
+        return ErrorBody.of(code, message, details, OffsetDateTime.now(displayZone));
     }
 
     /** 供 429 使用：极简 body（只含 code/message/retryAfter）+ {@code Retry-After} 头（DR-013）。 */
